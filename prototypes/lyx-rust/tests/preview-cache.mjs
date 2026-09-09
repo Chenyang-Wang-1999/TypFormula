@@ -81,9 +81,9 @@ console.log('Preview cache passed: stable SVG URLs, shifted ranges, context edit
 // A global refresh retires both kinds of SVG and discards an earlier response.
 change({action:'input',text:'\\cancel(w)'});change({action:'key',key:'Enter'});
 const stale=context.runPreviews(), staleRequest=requests.at(-1);
-attachments.set('old',{status:'ready',base:{url:'blob:old-stretch'}});
+attachments.set('old',{status:'ready',upper:'limits',lower:null});
 context.refreshAllSvg();
-assert.equal(attachments.size,0);assert.ok(revoked.includes('blob:old-stretch'));
+assert.equal(attachments.size,0);
 assert.equal(previews.get('cancel(x)').status,'waiting');
 const beforeStale=urls;finish(staleRequest);await stale;assert.equal(urls,beforeStale);
 const fresh=context.runPreviews(), freshRequest=requests.at(-1);
@@ -114,11 +114,11 @@ edit({action:'click',cursor:script.children[2].children[0].cursor});
 assert.equal(previews.get(baseName),baseRecord);
 edit({action:'input',text:'y'});
 const key=context.attachmentKey(find(context.state.view,'script').attachment,context.state.formula_definitions,context.state.display);
-attachments.set(key,{status:'ready',base:{url:'blob:obsolete-stretch'}});
+attachments.set(key,{status:'ready',upper:'limits',lower:null});
 edit({action:'click',cursor:context.state.view.children.at(-1).cursor});
 assert.equal(previews.get(baseName).status,'waiting');
 assert.equal(attachments.has(key),false);
-assert.ok(revoked.includes('blob:stretch-base'));assert.ok(revoked.includes('blob:obsolete-stretch'));
+assert.ok(revoked.includes('blob:stretch-base'));
 assert.equal(previews.get('cancel(x)').url,unrelated);
 
 // Real DOM focus loss uses the same rule; no keyboard movement is required.
@@ -139,7 +139,7 @@ context.updateAttachmentEdits(context.state,false);
 assert.equal(previews.get(baseName).url,'blob:unchanged');
 console.log('SVG refresh passed: global refresh, obsolete responses, edited script exits, DOM blur, unchanged visits and cancelled drafts.');
 
-// Attachment SVGs also refresh across inactive formulas, and never update
+// Attachment placement also refreshes across inactive formulas, and never updates
 // continuously while a script slot is being edited.
 context.attachmentReady=true;context.attachmentBusy=false;context.attachmentTimer=undefined;
 vm.runInContext(app.slice(app.indexOf('function attachmentKey('),app.indexOf('async function api(')),context);
@@ -157,7 +157,7 @@ context.updateAttachmentEdits(context.state,false);
 const discarded=context.runAttachments();assert.equal(attachmentRequests.length,1);
 context.refreshAllSvg();
 const beforeAttachment=urls;
-const attachmentResult={upper:'limits',lower:null,base:{svg:'<svg/>',width:40,height:12}};
+const attachmentResult={upper:'limits',lower:null};
 attachmentRequests[0].resolve(structuredClone(attachmentResult));await discarded;
 assert.equal(urls,beforeAttachment);
 const activeAttachment=context.runAttachments();attachmentRequests[1].resolve(structuredClone(attachmentResult));await activeAttachment;

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Visual Typst</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<header><div><span class="logo">∑</span><strong>Visual Typst</strong><span class="badge">连接中</span></div><span class="header-note">源码写作 · 结构公式</span></header>
+<main class="app-shell">
+<aside class="sidebar"><h2>项目</h2><p id="project-root"></p><button id="new-file">新建文件</button><nav id="files" aria-label="项目文件"></nav><details open><summary>Typst 包</summary><form id="packages-form"><label for="package-query">搜索 Typst Universe</label><div class="search"><input id="package-query" placeholder="例如 cetz"><button>搜索</button></div></form><p id="package-status">检索版本，安装并插入 import。</p><div id="package-results"></div></details></aside>
+<section class="workspace">
+<div class="filebar"><strong id="filename">main.typ</strong><div><button id="save">保存</button><button id="download">下载 .typ</button><button id="format">格式化</button></div></div>
+<div class="toolbar"><button id="undo" title="撤销">↶</button><button id="redo" title="重做">↷</button><button id="insert-inline">行内公式</button><button id="insert-display">行间公式</button><button id="edit-formula">编辑光标处公式</button><button id="source-mode">查看纯源码</button></div>
+<div id="math-tools" hidden><span>公式模式 · \ 命令 · Tab 槽位 · Esc 返回源码</span><button id="row">加一行</button><button id="column">加一列</button><button id="refresh-svg">刷新 SVG</button><button id="finish-formula">完成公式</button></div>
+<div id="editor" aria-label="Typst 代码编辑器"></div>
+<div class="editor-footer"><span id="status" role="status">正在加载编辑器…</span><span id="attachment-status" hidden></span><span id="position"></span></div>
+<details class="problems-panel" open><summary id="problem-count">诊断</summary><p id="lsp-detail"></p><div id="problems"></div></details>
+</section>
+</main>
+<div id="formula-parking" hidden><span id="formula-host"><span id="canvas" role="group" aria-label="可编辑公式"></span></span></div>
+<textarea id="keyboard" aria-label="公式输入" autocapitalize="off" autocomplete="off" spellcheck="false"></textarea><div id="caret" hidden></div><div id="completions" role="listbox" hidden></div>
+<dialog id="new-dialog"><form id="new-form"><h2>新建项目文件</h2><label for="new-name">文件名（已有子目录可用 / 分隔）</label><input id="new-name" value="untitled.typ" required><div class="actions"><button type="submit">创建编辑缓冲区</button></div><p>Ctrl+S 保存到项目；同名文件不会被覆盖。</p></form></dialog>
+<script type="module" src="/editor.bundle.js"></script>
+</body></html>

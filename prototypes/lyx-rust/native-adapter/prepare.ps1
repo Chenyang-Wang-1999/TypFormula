@@ -20,22 +20,35 @@ $originalMathSource = $mathSource
 $offset = $mathSource.IndexOf($marker)
 if ($offset -ge 0) { $mathSource = $mathSource.Substring(0, $offset) }
 $entry = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'layout-entry.rs'))
-$boxHook = '    let frame = crate::inline::layout_box('
 $mappedHook = @'
     if let Some(frame) = editor_mapped_box(item, ctx, styles)? {
         ctx.push(FrameFragment::new(props, styles, frame));
         return Ok(());
     }
 '@
-if (!$mathSource.Contains('editor_mapped_box(item, ctx, styles)?')) {
-    if (!$mathSource.Contains($boxHook)) { throw 'Typst box bridge anchor missing' }
-    $mathSource = $mathSource.Replace($boxHook, $mappedHook + "`n" + $boxHook)
-}
+# Migrate the old mapping-box bridge without touching ordinary box layout.
+$mathSource = $mathSource.Replace("`r`n", "`n")
+$mathSource = $mathSource.Replace($mappedHook.Replace("`r`n", "`n") + "`n", '')
 $patchedMathSource = $mathSource.TrimEnd() + "`n`n$marker`n" + $entry
 if ($patchedMathSource -ne $originalMathSource) {
     [IO.File]::WriteAllText($mathPath, $patchedMathSource)
 }
 $libSource = [IO.File]::ReadAllText($libPath)
-if (!$libSource.Contains('pub use self::math::editor_math_frame;')) {
-    [IO.File]::WriteAllText($libPath, $libSource + "`n$marker`npub use self::math::editor_math_frame;`n")
+if ($libSource.Contains('pub use self::math::editor_math_frame;')) {
+    [IO.File]::WriteAllText($libPath, $libSource.Replace('pub use self::math::editor_math_frame;', ''))
+}
+# Small, checked patches against the pinned revision. Repeated runs are no-ops.
+$patches = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'engine-patches.json') | ConvertFrom-Json
+foreach ($patch in $patches) {
+    $path = Join-Path $engineRoot $patch.file
+    $original = [IO.File]::ReadAllText($path)
+    $content = $original.Replace("`r`n", "`n")
+    if (!$content.Contains($patch.after)) {
+        $first = $content.IndexOf($patch.before)
+        if ($first -lt 0 -or $content.IndexOf($patch.before, $first + $patch.before.Length) -ge 0) {
+            throw "Typst mapping bridge anchor missing or ambiguous: $($patch.file)"
+        }
+        $content = $content.Replace($patch.before, $patch.after)
+    }
+    if ($content -ne $original) { [IO.File]::WriteAllText($path, $content) }
 }

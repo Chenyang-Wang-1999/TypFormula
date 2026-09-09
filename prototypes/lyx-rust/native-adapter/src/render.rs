@@ -1,7 +1,8 @@
 //! One in-memory document compile, then source-range → labelled frame → SVG.
 use super::*;
 use std::collections::HashMap;
-use typst::layout::{Frame, FrameItem, Point};
+use typst::layout::{Abs, Frame, FrameItem, Point, Sides};
+use typst::foundations::Smart;
 use typst::syntax::{SyntaxKind, SyntaxNode};
 
 #[derive(Deserialize)]
@@ -32,8 +33,8 @@ pub fn render(req: RenderRequest, world: &mut FormulaWorld) -> Result<Value, Str
         end = r.end;
     }
     let mut source = req.source.clone();
-    // These boxes only belong to the compiler projection, never the saved source.
-    // Their math layout hook preserves the parent's size and display style.
+    // Labelled equations are transparent source markers in math IR. Their body
+    // keeps native glyph/stretch/attachment semantics until final frame export.
     let mut labels = HashMap::new(); let mut edits = vec![]; let mut formula_labels = HashMap::new();
     for (i,r) in req.formulas.iter().enumerate() {
         if r.start >= r.end || req.source.get(r.start..r.end).is_none_or(|s| !s.starts_with('$') || !s.ends_with('$')) { return Err("公式源码区间无效".into()); }
@@ -42,7 +43,7 @@ pub fn render(req: RenderRequest, world: &mut FormulaWorld) -> Result<Value, Str
     }
     for (i,r) in ranges.into_iter().rev() {
         let label = format!("visual-typst-raw-{i}"); labels.insert(label.clone(),r);
-        edits.push((r.start,r.end,format!("#[#box(${}$)<{label}>]",&req.source[r.start..r.end])));
+        edits.push((r.start,r.end,format!("#[${}$<{label}>]",&req.source[r.start..r.end])));
     }
     edits.sort_by_key(|(start,end,_)|(*start,*end));
     for (start,end,replacement) in edits.into_iter().rev() { source.replace_range(start..end,&replacement); }
@@ -123,5 +124,32 @@ mod tests {
         assert!(large["items"][0]["width"].as_f64().unwrap() > 2.9*small["items"][0]["width"].as_f64().unwrap());
         assert!(render(RenderRequest {source:"$undefined(x)$".into(),raw:vec![],formulas:vec![]},&mut world).is_err());
         assert_eq!(compile(&mut world,"$dif$", &["dif"])["items"].as_array().unwrap().len(),1);
+    }
+    #[test]
+    fn stretch_document_probe() {
+        let mut world = world().unwrap();
+        let short = compile(&mut world,"$ stretch(arrow.r)^(\"a\") $", &["stretch(arrow.r)"]);
+        let long = compile(&mut world,"$ stretch(arrow.r)^(\"a much longer label\") $", &["stretch(arrow.r)"]);
+        let short_width = short["items"][0]["width"].as_f64().unwrap();
+        let long_width = long["items"][0]["width"].as_f64().unwrap();
+        eprintln!("document-mapped stretch: short={short_width:.4}pt, long={long_width:.4}pt");
+        fn arrow_width(frame: &Frame) -> f64 {
+            frame.items().map(|(_,item)| match item {
+                FrameItem::Group(group) => arrow_width(&group.frame),
+                FrameItem::Text(text) if text.text.contains('→') => text.width().to_pt(),
+                _ => 0.0,
+            }).fold(0.0,f64::max)
+        }
+        let mut direct = vec![];
+        for label in ["a","a much longer label"] {
+            world.source.replace(&format!("#set text(size: 24pt)\n$ stretch(arrow.r)^(\"{label}\") $"));
+            let document = typst::compile::<typst_layout::PagedDocument>(&world).output.unwrap();
+            direct.push(arrow_width(&document.pages()[0].frame));
+        }
+        eprintln!("unwrapped document arrow: short={:.4}pt, long={:.4}pt",direct[0],direct[1]);
+        assert!(direct[1] > direct[0], "control: native Typst stretch should grow");
+        assert!(long_width > short_width, "stretch should grow with its attachment");
+        assert!((short_width-direct[0]).abs() < 1e-6);
+        assert!((long_width-direct[1]).abs() < 1e-6, "mapped SVG must use the native stretched glyph");
     }
 }

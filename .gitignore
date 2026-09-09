@@ -2,3 +2,10 @@
 target
 prototypes/lyx-rust/upstream
 *.otf
+/node_modules/
+/web/core.wasm
+/web/editor.bundle.js
+/workspace/
+!/Cargo.lock
+!/native-adapter/Cargo.lock
+!/web/fonts/*.otf

@@ -1,0 +1,67 @@
+[
+  {
+    "file": "crates/typst-realize/src/lib.rs",
+    "before": "        if let Some(elem) = content.to_packed::<EquationElem>() {\n            visit(s, &elem.body, styles)?;",
+    "after": "        if let Some(elem) = content.to_packed::<EquationElem>() {\n            // Editor markers carry identity only; resolve their body in math IR.\n            if content.label().is_some_and(|l| l.resolve().starts_with(\"visual-typst-raw-\")) {\n                s.sink.push((content, styles));\n                return Ok(true);\n            }\n            visit(s, &elem.body, styles)?;"
+  },
+  {
+    "file": "crates/typst-library/src/math/ir/resolve.rs",
+    "before": "    if let Some(elem) = elem.to_packed::<SymbolElem>() {\n        resolve_symbol(elem, ctx, styles)?;",
+    "after": "    if let Some(equation) = elem.to_packed::<EquationElem>() {\n        let mut item = ctx.resolve_into_item(&equation.body, styles)?;\n        if let MathItem::Component(comp) = &mut item {\n            comp.props.editor_label = elem.label();\n        }\n        ctx.push(item);\n    } else if let Some(elem) = elem.to_packed::<SymbolElem>() {\n        resolve_symbol(elem, ctx, styles)?;"
+  },
+  {
+    "file": "crates/typst-library/src/math/ir/resolve.rs",
+    "before": "    while let Some(equation) = base_elem.to_packed::<EquationElem>() {\n        base_elem = &equation.body;",
+    "after": "    while let Some(equation) = base_elem.to_packed::<EquationElem>() {\n        if base_elem.label().is_some_and(|l| l.resolve().starts_with(\"visual-typst-raw-\")) { break; }\n        base_elem = &equation.body;"
+  },
+  {
+    "file": "crates/typst-library/src/math/ir/item.rs",
+    "before": "pub struct MathProperties {",
+    "after": "pub struct MathProperties {\n    /// Editor source identity, without introducing a layout boundary.\n    pub editor_label: Option<crate::foundations::Label>,"
+  },
+  {
+    "file": "crates/typst-library/src/math/ir/item.rs",
+    "before": "            limits: Limits::Never,\n            class,",
+    "after": "            limits: Limits::Never,\n            editor_label: None,\n            class,"
+  },
+  {
+    "file": "crates/typst-layout/src/math/fragment/glyph.rs",
+    "before": "pub struct GlyphFragment {",
+    "after": "pub struct GlyphFragment {\n    pub(super) editor_label: Option<typst_library::foundations::Label>,"
+  },
+  {
+    "file": "crates/typst-layout/src/math/fragment/glyph.rs",
+    "before": "        let mut fragment = Self {\n            item,",
+    "after": "        let mut fragment = Self {\n            editor_label: None,\n            item,"
+  },
+  {
+    "file": "crates/typst-layout/src/math/fragment/glyph.rs",
+    "before": "        frame.modify(&self.modifiers);\n        frame",
+    "after": "        frame.modify(&self.modifiers);\n        if let Some(label) = self.editor_label { frame.label(label); }\n        frame"
+  },
+  {
+    "file": "crates/typst-layout/src/math/fragment/mod.rs",
+    "before": "impl MathFragment {",
+    "after": "impl MathFragment {\n    /// Keep glyph metrics available to attachments until final frame conversion.\n    pub(super) fn editor_label(&mut self, label: typst_library::foundations::Label) {\n        match self {\n            Self::Glyph(glyph) => glyph.editor_label = Some(label),\n            Self::Frame(fragment) => fragment.frame.label(label),\n            _ => {}\n        }\n    }\n"
+  },
+  {
+    "file": "crates/typst-layout/src/math/mod.rs",
+    "before": "        let outer_styles = item.styles().unwrap_or(styles);",
+    "after": "        let editor_start = self.fragments.len();\n        let outer_styles = item.styles().unwrap_or(styles);"
+  },
+  {
+    "file": "crates/typst-layout/src/math/mod.rs",
+    "before": "        Ok(())\n    }\n}\n\n/// Lays out a single math item.",
+    "after": "        // Groups are flattened above; retain their source identity afterwards.\n        if let MathItem::Component(comp) = item\n            && matches!(comp.kind, MathKind::Group(_))\n            && let Some(label) = comp.props.editor_label\n        {\n            editor_label_fragments(self, editor_start, label, &comp.props, outer_styles);\n        }\n        Ok(())\n    }\n}\n\n/// Lays out a single math item."
+  },
+  {
+    "file": "crates/typst-layout/src/math/mod.rs",
+    "before": "    // Dispatch based on item kind to the appropriate layout function.",
+    "after": "    let editor_start = ctx.fragments.len();\n    // Dispatch based on item kind to the appropriate layout function."
+  },
+  {
+    "file": "crates/typst-layout/src/math/mod.rs",
+    "before": "    // Insert right spacing.",
+    "after": "    if !matches!(comp.kind, MathKind::Group(_))\n        && let Some(label) = props.editor_label\n    {\n        editor_label_fragments(ctx, editor_start, label, props, styles);\n    }\n\n    // Insert right spacing."
+  }
+]

@@ -1,0 +1,22 @@
+[package]
+name = "visual-typst-layout"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-2.0-or-later"
+
+# The pinned engine and mapping changes are checked in under vendor/typst.
+# Keeping the adapter separate prevents compiler/layout dependencies entering WASM.
+[dependencies]
+typst = { path = "../vendor/typst/crates/typst" }
+typst-eval = { path = "../vendor/typst/crates/typst-eval" }
+typst-layout = { path = "../vendor/typst/crates/typst-layout" }
+typst-svg = { path = "../vendor/typst/crates/typst-svg" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+debug = 0
+
+[workspace]
+

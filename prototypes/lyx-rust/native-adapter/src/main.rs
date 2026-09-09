@@ -7,9 +7,8 @@ use typst::{Library, LibraryExt, World};
 use typst::comemo::Track;
 use typst::diag::{FileError, FileResult};
 use typst::engine::{Engine, Route, Sink, Traced};
-use typst::foundations::{Bytes, Content, Datetime, Duration, Packed, SequenceElem, Smart, StyleChain, StyledElem};
+use typst::foundations::{Bytes, Content, Datetime, Duration, Packed, SequenceElem, StyleChain, StyledElem};
 use typst::introspection::{EmptyIntrospector, Locator};
-use typst::layout::{Abs, Axis, Sides};
 use typst::math::{EquationElem, MathSize};
 use typst::math::ir::{MathItem, MathKind, ScriptsItem, resolve_equation};
 use typst::routines::Arenas;
@@ -101,23 +100,11 @@ fn resolve(req: Request) -> Result<Value, String> {
     let introspector = EmptyIntrospector;
     let mut engine = Engine { world: world_ref.track(), library: &world.library, introspector: Protected::new(introspector.track()), traced: traced.track(), sink: sink.track_mut(), route: Route::default() };
     let item = resolve_equation(equation, &mut engine, Locator::root(), &arenas, styles).map_err(diagnostics)?;
-    let (script, script_styles) = outer_script(&item).ok_or("分支未解析成单个上下标对象")?;
+    let (script, _) = outer_script(&item).ok_or("分支未解析成单个上下标对象")?;
     if script.top_left.is_some() || script.bottom_left.is_some() { return Err("暂不支持左侧附件的槽位映射".into()); }
     let upper = placement(&script.top, &script.top_right)?;
     let lower = placement(&script.bottom, &script.bottom_right)?;
-    let stretch = matches!(&script.base, MathItem::Component(comp) if matches!(&comp.kind, MathKind::Glyph(glyph) if glyph.stretch.get().is_explicit(Axis::X)));
-    let mut base = Value::Null;
-    if stretch {
-        // The first pass invokes Typst's layout_scripts: attachment measurement
-        // sets the base's shared stretch reference. Reuse it to export only the
-        // base frame. No SVG/source reverse mapping and no reimplemented policy.
-        let _ = typst_layout::editor_math_frame(&mut engine, &item, script_styles).map_err(diagnostics)?;
-        let frame = typst_layout::editor_math_frame(&mut engine, &script.base, script_styles).map_err(diagnostics)?;
-        let width = frame.width().to_pt(); let height = frame.height().to_pt();
-        let page = typst_layout::Page { frame, bleed: Sides::splat(Abs::zero()), fill: Smart::Custom(None), numbering: None, supplement: Content::empty(), number: 1 };
-        base = json!({"svg":typst_svg::svg(&page, &Default::default()),"width":width,"height":height});
-    }
-    Ok(json!({"engine":"Typst math IR 59b5999","upper":upper,"lower":lower,"stretch":stretch,"base":base}))
+    Ok(json!({"engine":"Typst math IR 59b5999","upper":upper,"lower":lower}))
 }
 fn main() {
     if std::env::args().any(|a| a == "--server") {
@@ -177,12 +164,10 @@ mod tests {
         assert!(resolve(Request { expression: "unknown_name_1".into(), definitions: String::new(), display: true }).is_err());
     }
     #[test]
-    fn stretch_uses_attachment_measurements_and_keeps_only_the_base_svg() {
-        let short = query("stretch(arrow.r)^(\"a\")", true);
+    fn attachment_service_returns_only_placement_even_for_stretch() {
         let long = query("stretch(arrow.r)^(\"a much longer label\")", true);
         assert_eq!(long["upper"], "limits");
-        assert_eq!(long["stretch"], true);
-        assert!(long["base"]["width"].as_f64().unwrap() > short["base"]["width"].as_f64().unwrap());
-        assert!(long["base"]["svg"].as_str().unwrap().contains("<svg"));
+        assert!(long.get("stretch").is_none());
+        assert!(long.get("base").is_none());
     }
 }

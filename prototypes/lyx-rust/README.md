@@ -1,99 +1,87 @@
-# LyX → Rust / Typst 公式原型
+# Visual Typst：文档与结构公式编辑原型
 
-[会议纪要：当前算法、架构与实现边界](会议纪要.md)（2026-09-09）。
+当前实现允许在 Typst 上下文之间插入多个行内／行间公式，每个公式独立进行结构编辑。Rust/WASM 管理编辑状态，浏览器绘制结构，原生 Typst 引擎负责文档编译和 Raw SVG 提取。文件仍只保存为 Typst 源码。
 
-**阶段状态：公式原型于 2026-09-09 收尾。** 当前成果包含单公式结构编辑、Raw SVG、limits/stretch 适配和可嵌套的宏管理器。完整文档编辑器是下一阶段议题，不在本原型继续扩展范围内。
+## 模块总览
+
+| 模块 | 入口 | 主要功能 |
+|---|---|---|
+| 文档协调 | [src/document.rs](src/document.rs) | 组合上下文与多个公式；插入、删除、激活公式；同步词法前缀；文档级撤销／重做；生成完整源码和 Raw 区间映射 |
+| 数学数据模型 | [src/math.rs](src/math.rs) | 定义 MathData、MathAtom、结构槽和树形光标；统一字符、Raw、宏调用、分式、根式、上下标等对象的存储 |
+| 公式编辑器 | [src/cursor.rs](src/cursor.rs) | 执行单公式输入、命令草稿、导航、选区、删除、粘贴和槽位操作，维护编辑器快照 |
+| Typst 语法与宏 | [src/typst.rs](src/typst.rs) | 将 Typst 语法转换为编辑树并序列化；分析宏是否可展；登记定义版本与共享模板，保留调用源码 |
+| 视图投影 | [src/view.rs](src/view.rs) | 从编辑树生成浏览器视图，展开宏显示，绑定重复参数到同一实参槽，输出光标位置与附件查询源码 |
+| WASM 接口 | [src/wasm.rs](src/wasm.rs)、[src/lib.rs](src/lib.rs) | 用 alloc／dispatch／output_len 交换 JSON；浏览器同步调用 Document，原生服务依赖不进入 WASM |
+| 前端交互与绘制 | [web/app.js](web/app.js)、[web/index.html](web/index.html) | 绘制上下文和公式，转发键盘、鼠标、输入法事件，测量光标坐标，管理宏列表、异步请求及 SVG 缓存 |
+| 样式与字体 | [web/style.css](web/style.css)、[web/math-font.js](web/math-font.js) | 结构槽布局、围绕中心 bbox 放置上下标、数学斜体显示；显示变化不改写源码 |
+| HTTP 服务 | [src/main.rs](src/main.rs) | 提供静态页面、WASM 和本地 API，分发补全、文档渲染与附件位置请求 |
+| 原生服务桥接 | [src/services.rs](src/services.rs) | 管理 Tinymist LSP 和原生适配器进程，处理请求协议、超时、错误与进程复用 |
+| Typst 原生适配器 | [native-adapter/src/main.rs](native-adapter/src/main.rs) | 提供内存 World；常驻模式接收文档渲染请求；单次模式从数学 IR 读取上下标位置 |
+| 文档编译与 SVG 提取 | [native-adapter/src/render.rs](native-adapter/src/render.rs) | 校验源码区间，添加透明映射标签，编译整份文档，从对应 frame 提取 SVG、尺寸和基线 |
+| 引擎桥接补丁 | [native-adapter/prepare.ps1](native-adapter/prepare.ps1)、[engine-patches.json](native-adapter/engine-patches.json)、[layout-entry.rs](native-adapter/layout-entry.rs) | 准备固定版本引擎，让 Raw 标签保留原生数学语义，在最终排版片段上保存映射；不使用隔离 box 或 stretch 专用生成路径 |
+| 字符配置 | [config/symbols.json](config/symbols.json)、[build.rs](build.rs) | 构建时校验并嵌入“源码 → 显示字符”字典，供解析和字符显示使用 |
+| 回归验证 | [tests/](tests/)、适配器内部测试 | 覆盖编辑、宏、多公式、源码映射、缓存刷新、字体和原生排版结果 |
+
+详细的状态归属、模块调用关系、接口字段与修改入口见 [架构与数据流](docs/architecture.md)。键盘操作及宏示例见 [编辑与宏使用指南](docs/editing.md)。
+
+## 三条主要数据流
+
+```text
+结构编辑：浏览器事件 → WASM / Document → Editor → View → DOM 与光标测量
+Raw SVG：完整源码与 Raw 区间 → /api/render → 常驻 Typst 编译 → 映射 frame → SVG 缓存
+辅助查询：命令草稿 → /api/completion → Tinymist
+          上下标分支 → /api/attachments → Typst 数学 IR → 槽位位置
+```
+
+Raw 的 SVG 是从当前文档排版结果中提取的，包含上下文和附件对它的影响。透明标签允许 `stretch` 自然参与原生排版；上下标位置查询只返回位置，不生成中心 SVG。
+
+## 当前行为与边界
+
+- 用按钮插入行内／行间公式，没有模式切换按钮。上下文中直接输入的公式保持源码形式；显式导入时才转换文档的顶层公式。
+- 结构公式保存编辑树，可展宏保存调用和一份实参，仅在视图中展开。无法结构化的表达式保留为 Raw。
+- 成功的 Raw SVG 按源码文本缓存，同文共享。普通输入、上下文变化不自动使已有 SVG 失效；允许编辑器预览暂时与实际排版不同。
+- “更新全部 SVG”刷新所有 Raw 和附件位置缓存。编辑上下标后离开附件区域或输入失焦，会刷新中心项内的 Raw；仅移动光标不会触发。
+- 浏览器负责结构布局，整式不要求与 Typst 最终页面像素一致。原生适配器目前仅提供内存主文档及随附数学字体，不提供文件导入、包加载或日期。
+- 附件位置适配目前针对视图提供查询源码的顶层 Script；嵌套分支保留默认编辑布局。详见 [附件布局适配](docs/operator-limits.md)。
 
 ## 运行与构建
 
-在本目录运行 `start.cmd`，浏览器打开 http://localhost:4320 。修改 Rust 核心后运行 `build.cmd` 更新 WASM；修改服务端后停止原终端并重新运行 `start.cmd`。
+在 `prototypes/lyx-rust` 目录执行：
 
-Release：运行 `build-release.cmd` 构建 WASM、原生适配器和服务；固定版本 Typst 位于公共的 `prototypes/typst-engine`，清空本原型的 `target` 不会再触发 clone。构建成功后运行 `start-release.cmd`，只启动程序，不编译或下载。两个 exe 分别位于 `target/release/` 和 `target/adapter/release/`，不在 `target` 根目录。
-
-宏管理器的本次修改只涉及编辑核心和页面；已更新 `web/core.wasm` 时刷新原页面即可。从源码重新构建使用 `build.cmd`。limits/stretch 的原生适配器仍由 `build-native.cmd` 构建，WASM 不包含完整编译器依赖。核心及 WASM 接口由本地测试验证；界面交互由用户手动验证。
-
-## 公式编辑
-
-- `\` 开始命令草稿，只有 Enter 确认，Esc 取消。空格和括号保留，左右键在草稿内移动。
-- 普通输入逐个插入字符，不合并相邻运算符，也不触发 SVG。显示时允许查询配置中的单字符键，例如 `-` 显示为 `−`，内部仍是 Char，源码不变。`<=+` 仍是三个独立字符，`times` 不自动转换；保留 `/`、`^`、`_` 的结构快捷键及命令、字符串模式操作，草稿和字符串不应用显示映射。
-- 补全使用本机 Tinymist LSP。自动寻找 PATH 或 VS Code/Cursor Tinymist 扩展中的程序，也可以通过 `TINYMIST_BIN` 指定完整路径。找不到服务时保留内置命令补全。
-- Tab 或点击补全只填入候选，不确认。完整表达式仍由 Enter 提交。
-- 公式字体为随附的 New Computer Modern Math。数学字母使用数学斜体字形，数字、运算符和函数名保持正体；命令草稿使用直体等宽字体。显示字形的变化不会改写源码。
-- 本地保留分式、根式、上下标、括号、矩阵、装饰、普通字符、希腊字母和字符串槽。`lr`、`text` 没有专用编辑指令，按原生 Typst 名称处理。
-- 命令确认和导入都生成结构树。符号、运算符、简写、转义和未知表达式先查 `config/symbols.json`：命中时只改变显示，源码保留原文；未命中的 `Raw` 节点交给 Typst 编译器生成 SVG。例如 `frac(dif x, 2 pi)` 保留可编辑分式，只有 `dif` 是 SVG。未知函数调用（例如 `cancel(x)`）整体保留原始源码。
-- [字符显示配置](config/README.md)：可自行添加“源码 → 显示字符”映射，默认含常用运算符与希腊字母。修改后运行 `build.cmd` 并刷新页面，无须改 Rust 代码。字典的显示值不再经过额外字形替换。
-- 每个 SVG 对应一个 Raw 源码对象。左右键跨过它，Backspace/Delete 整块删除；支持撤销，不使用 SVG 内部光标或 Tinymist 源码反向定位。浅色边框标明对象范围，空 SVG 也保留最小可见尺寸。独立 SVG 与相邻字符的间距由编辑器安排，不等同于整段 Typst 排版。
-- 渲染失败时保留命令源码，鼠标悬停显示编译错误。从块左侧按 → 会进入源码开头，从右侧按 ← 会进入源码末尾；也可点击“编辑”。Enter 确认并重试，Esc 恢复原文。Shift＋左右键仍整块选择，渲染成功的 SVG 仍整块跨过。渲染状态按源码和定义上下文缓存，不写入源码或撤销历史。
-- 命令中的 `a/b` 按 Typst 运算优先级解析为分式，导出为等价的 `frac(a, b)`。普通公式中直接输入 `/`，将选区（无选区时为左侧一个对象）放入分子，并进入分母；单独提交 `/` 则插入空分式。
-- `\` 仍是开启命令模式的操作键。草稿中的单个反斜杠在确认后解析为换行，`&` 划分对齐槽，列从右对齐开始按右、左交替；`&&` 保留中间的空槽。只有换行时生成单列多行结构。Tab 切换槽位，上下键按列移动；增加行列按钮也适用于对齐公式。导出使用 Typst 的 `&` 和单反斜杠。[Typst 对齐规则](https://typst.app/docs/reference/math/#alignment)
-- 输入 `"` 进入字符模式，另一个 `"` 或 Enter 结束。字符串槽带浅色边框，空字符串也可见；其中空格、运算符与反斜杠作为文本输入。在命令草稿中，Enter 先闭合未结束的字符串，再次 Enter 才提交命令。
-- 复制选区得到对应的 Typst 源码，字符串中的选区会带引号和必要转义。粘贴时进入命令模式并原样填入剪贴板；已有草稿则插入当前草稿光标处。Enter 解析，Esc 取消并恢复被替换的选区。粘贴完整的 `$ ... $` 公式也可提交。
-- `dif` 没有内置替换，直接交给真实 Typst 编译器处理。
-- 顶栏保留撤销、重做、清空和行内／行间切换，移除了结构/符号 snippet 按钮。结构通过命令或现有快捷键输入。
-- [Typst limits/stretch 适配](docs/operator-limits.md)：顶层上下标分支由原生 Typst IR 返回槽位位置；不按 operator 名称判断。`stretch` 使用 Typst 实际测量与生成的中心字形 SVG，附件仍可编辑。嵌套上下标暂保持原布局。行内／行间设置同步到 `.typ` 导出、补全和独立 SVG 请求。
-
-## 宏管理器
-
-- 宏管理器直接在公式框下方列出 `#let` 源码，支持添加、编辑、删除；点击“应用修改”或在列表中按 Ctrl+Enter 生效。语法错误保留列表草稿和上次有效定义。已应用的修改参与公式撤销/重做，源码与公式一起导出；“载入宏示例”可体验 `pd → jac` 的矩阵展开与不可展调用。
-- 按结构分析自动判断宏是否可展，不区分创建来源、不使用自定义注释标记。第一版支持直接返回数学公式的位置参数函数和公式常量；参数在 Raw 中、未显示的参数、默认/命名/可变参数、动态宏体保持不可展。宏体可以调用此前登记的可展宏，例如 `pd → jac`；参数映射逐层组合，最终绑定到最外层调用的实参。不可展或尚未登记的调用保持 Raw。
-- 可展调用只保存宏名和一份实参槽，显示时展开。重复参数框指向同一个槽位，六色循环；编辑任一框同步显示，光标保留在当前出现位置。固定宏体不可在调用处修改。整块复制与导出仍为调用语法；参数框内复制只复制参数。
-- Typst 单字母参数引用必须写 `#x`；裸 `x` 是数学字母。例：`#let ratio(x, y) = $frac(#x, #x + #y)$`，调用 `ratio(a, b)`。命令 `\ratio` 回车可插入空参数槽，Tab 按参数顺序切换，空格退出调用；参数槽起点退格先选择整个调用，不自动摊平成公式。
-
-嵌套示例（“载入宏示例”内置此定义）：
-
-```typst
-#let pd(f, x) = $frac(partial #f, partial #x)$
-#let jac(f1, f2, x1, x2) = $mat(pd(#f1, #x1), pd(#f1, #x2); pd(#f2, #x1), pd(#f2, #x2))$
-$ jac(f, g, x, y) $
+```powershell
+.\start.cmd
 ```
 
-`pd` 和 `jac` 均可展。显示为包含四个分式的矩阵，八处输入框映射到 `jac` 的四个实参；导出保持 `jac(f, g, x, y)`，不会写成矩阵展开结果。
+浏览器打开 http://localhost:4320 。启动脚本会在 WASM 缺失时构建它，然后准备并构建原生适配器，再启动本地服务。已有 WASM 不会因为核心源码变化而自动重编。
 
-定义源码按顺序存于 `Vec`，当前名称由 `HashMap` 查询。不可展定义也登记名称，防止误用被它覆盖的旧宏。模板通过 `Rc` 共享（WASM 编辑核心为单线程）；嵌套调用按定义序号引用已登记的不可变版本，不在登记时复制展开。后续重定义不会改变早先宏捕获的版本；编辑早先定义并应用时，则会重新分析后续定义。
-
-### 缓存与更新范围
-
-当前是**全量解析源码、增量更新模板**，不是完全增量：
-
-| 操作／阶段 | 当前处理 |
+| 修改内容 | 操作 |
 |---|---|
-| 在宏列表里打字 | 只修改未应用草稿，不分析宏 |
-| 应用发生变化的定义 | 全量解析定义源码，按顺序扫描并重建名称表 |
-| 更新可展判定与模板 | 找到第一条变化的定义；复用未变前缀，从变化处重新分析整个后缀，包括没有直接依赖它的宏 |
-| 更新当前公式 | 通过源码整体重新解析，以重新判定调用类型；调用及实参保留，光标回到公式起点 |
-| 普通公式按键 | 复用当前定义集的分析和模板；修改实参并生成视图 |
+| Rust 编辑核心、解析器、视图或字符字典 | `.\build.cmd` 更新 WASM，再刷新页面 |
+| 前端 JS／HTML／CSS | 刷新页面，必要时 Ctrl+F5 |
+| 原生适配器、引擎补丁或 HTTP 服务 | 停止旧服务，重新运行 `.\start.cmd` |
+| 全套 release 产物 | `.\build-release.cmd`，成功后 `.\start-release.cmd` 启动 |
 
-例如修改 100 条定义中的第 90 条，仍解析整段定义源码，但仅重建第 90～100 条的模板。尚未实现语法树局部更新、仅按依赖关系失效，或当前公式树的局部重新分类。
+构建需要 Rust 工具链、`wasm32-unknown-unknown` 目标和 Git；首次准备依赖及固定引擎需要网络。共享引擎放在 `prototypes/typst-engine`，固定 revision 为 `59b5999da8e74e74583069408d2564fc1f9bc973`。
 
-模板大小与参数重复次数在登记时组合缓存，显示规模预估不逐路遍历整个共享依赖图。预计超过 4096 个结构节点或深度保护值 64 时，显示调用名与可编辑实参；这是显示预算回退，不会把宏判为不可展。Raw SVG 沿用“源码＋上下文＋公式模式”缓存；模板内独立 Raw 使用定义处的上下文。
+Tinymist 仅用于补全，自动从 PATH 或 VS Code／Cursor 扩展中查找，也可通过 `TINYMIST_BIN` 指定。找不到时保留内置命令补全；Raw 渲染使用独立的原生适配器。
 
-## 范围与验证
+## 文档与验证入口
 
-Rust/WASM 同步维护公式树。Rust 本地服务提供 Tinymist stdio LSP 与独立 SVG 编译；页面只绘制和转发事件。此原型一次编辑一个公式，可携带前置的 `#let` 原始代码；尚不支持完整文档、包导入或完整 LyX 功能。
+- [架构与数据流](docs/architecture.md)：各模块如何合作、状态放在哪里、修改功能应看哪些文件。
+- [编辑与宏使用指南](docs/editing.md)：键盘、导入导出、宏管理、缓存与刷新规则。
+- [附件布局适配](docs/operator-limits.md)：limits／scripts、中心 bbox、透明映射及 stretch 回归。
+- [字符显示配置](config/README.md)：修改符号字典。
+- [历史会议纪要](会议纪要.md)：早期单公式阶段的决策记录，当前实现以本文和架构说明为准。
 
-当前本机 Tinymist 0.15.6 在复用会话并快速更新内存文档时会偶尔返回旧快照。本原型为每次补全启动独立的 LSP 会话，并在请求结束后关闭；页面用 120 ms 防抖和单个在途请求限制开销。补全是异步的，不阻塞公式输入。后续可在确认文档同步可靠后改为常驻会话。
-
-收尾时的验证记录：
-
-- 58 项 Rust 核心及回归测试通过；依赖本机 Tinymist 的 3 项服务测试在默认测试集中跳过，本轮未执行。
-- release WASM 已构建并复制到 `web/core.wasm`；WASM 接口测试、字体映射测试及页面脚本语法检查通过。
-- 回归覆盖 `pd → jac`、外层参数联动、同名覆盖、定义版本捕获、前缀模板复用、后缀失效、撤销、导出再导入以及展开规模保护。
-- 用户负责界面试用；助手未进行本轮浏览器可视化验收，也未在本轮重新验证完整 release 发布链路或原生附件适配器。
-
-本机一次 Node/WASM 测量：100 条定义、一个调用，导入约 2.64 ms，缓存后的按键处理中位数约 0.18 ms、P95 约 0.24 ms。数值包含 JSON 接口和视图生成，不包含浏览器排版、SVG 编译或端到端延迟，不作为性能保证。
-
-可复现的检查命令（按需运行，不代表以下所有步骤均在本轮执行）：
+常用检查如下；具体覆盖范围与本机依赖见架构说明中的测试表。这些命令是维护入口，不代表每次文档更新都执行了全部测试。
 
 ```powershell
 cargo test --offline --locked
-cargo test --offline --locked --test services -- --ignored
-.\build.cmd
+cargo test --offline --locked --manifest-path native-adapter/Cargo.toml --target-dir target/adapter
 node tests/wasm-command.mjs
+node tests/preview-cache.mjs
 node tests/math-font.mjs
-node tests/layout-fixture.mjs
+node --check web/app.js
 ```
 
-第二条测试会直接启动本机 Tinymist，并验证真实 LSP 和 SVG 输出，不启动 HTTP 服务。
-`layout-fixture.mjs` 使用实际 WASM 对象树、绘制代码、字体和样式生成 `target/layout-preview.html`，用于手动检查根号、对齐和空 SVG 的布局；其中 SVG 内容是占位图，不验证编译器结果。
-
-字体原文件来自本地 `typst-assets 0.15.1`，保留其 `web/fonts/NOTICE`。项目资料：https://ctan.org/pkg/newcomputermodern 。LyX 源码快照、作者和许可见 `upstream/`、`COPYING`。
+字体文件和许可见 `web/fonts/NOTICE`；LyX 源码快照、作者和项目许可见 [upstream/](upstream/) 与 [COPYING](COPYING)。

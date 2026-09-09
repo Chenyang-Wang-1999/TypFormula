@@ -62,12 +62,6 @@ async function runAttachments() {
     const result=await api('/api/attachments',request);
     if(attachments.get(key)!==record)return;
     if(![null,'limits','scripts'].includes(result.upper)||![null,'limits','scripts'].includes(result.lower))throw new Error('无效的 Typst 附件位置');
-    if(result.base) {
-      const base=result.base;
-      if(!Number.isFinite(base.width)||!Number.isFinite(base.height)||base.width<0||base.height<0)throw new Error('无效的伸展字形尺寸');
-      if(new DOMParser().parseFromString(base.svg,'image/svg+xml').documentElement.localName!=='svg')throw new Error('无效的伸展 SVG');
-      base.url=URL.createObjectURL(new Blob([base.svg],{type:'image/svg+xml'}));base.status='ready';
-    }
     Object.assign(record,{status:'ready',...result});
   } catch(error) { Object.assign(record,{status:'error',error:error.message}); }
   finally { attachmentBusy=false;redraw(); }
@@ -112,8 +106,6 @@ function invalidatePreview(source) {
   previews.delete(source);
 }
 function invalidateAttachment(key) {
-  const record=attachments.get(key);
-  if(record?.base?.url)URL.revokeObjectURL(record.base.url);
   attachments.delete(key);
 }
 function refreshAllSvg() {
@@ -230,7 +222,6 @@ async function runPreviews() {
 }
 window.addEventListener('pagehide',()=>{
   for(const record of previews.values())if(record.url)URL.revokeObjectURL(record.url);
-  for(const record of attachments.values())if(record.base?.url)URL.revokeObjectURL(record.base.url);
 });
 const examples = {
   blank: '$ "" $',
@@ -305,12 +296,12 @@ function renderDocument() {
   if(!state.blocks.length)canvas.remove();
 }
 function sizeContext(input){input.style.width=Math.min(100,Math.max(8,Math.max(...input.value.split('\n').map(l=>l.length))+2))+'ch';input.style.height='auto';input.style.height=Math.max(38,input.scrollHeight)+'px';}
-function draw(node, inText=false, basePreview=null) {
+function draw(node, inText=false) {
   const el = element(node.kind); el.classList.toggle('selected', node.selected);
   if(node.kind==='macro-argument'){el.style.setProperty('--argument-color',['#317bb5','#ae6430','#8b59b0','#288473','#b44970','#767323'][node.columns%6]);el.title=`参数 ${node.text} · 同色框共享内容`;el.setAttribute('aria-label',`参数 ${node.text}`);}
   if(node.kind==='macro' || node.kind==='macro-collapsed')el.title=node.text;
-  if(node.kind==='raw' || (basePreview && ['char','symbol'].includes(node.kind))) {
-    const record=basePreview || (rawReady?previewFor(node):{status:'unavailable'});
+  if(node.kind==='raw') {
+    const record=rawReady?previewFor(node):{status:'unavailable'};
     if(record.status==='ready') {
       el.classList.add('rendered');const img=document.createElement('img');img.src=record.url;img.alt=node.text;
       img.style.width=record.mapped?(record.width*4/3)+'px':(record.width/24)+'em';img.style.height=record.mapped?(record.height*4/3)+'px':(record.height/24)+'em';img.addEventListener('load',measure,{once:true});el.append(img);
@@ -341,10 +332,7 @@ function draw(node, inText=false, basePreview=null) {
     const body=element('radicand'); body.append(draw(node.children[0])); shell.append(radical,body);el.append(shell);
   } else if(node.kind === 'script') {
     const record=attachmentFor(node), resolved=record?.status==='ready'?record:null;
-    // Replace only an atomic base's image. All its cursor stops and the
-    // original source stay in the Rust tree; structured bases remain editable.
-    const atoms=node.children[0].children.filter(n=>n.kind!=='stop');
-    const base=draw(node.children[0],false,atoms.length===1&&['raw','char','symbol'].includes(atoms[0].kind)?resolved?.base:null);
+    const base=draw(node.children[0]);
     el.classList.add('attachment-layout');base.classList.add('attachment-base');el.append(base);
     // The side stack shares the base's grid row and stretches to its bbox.
     // Keeping an empty opposite slot anchors single attachments to the same
@@ -376,7 +364,7 @@ function draw(node, inText=false, basePreview=null) {
     });
   } else {
     if(node.kind === 'decoration') el.dataset.decoration=node.text;
-    node.children.forEach(child=>el.append(draw(child,inText,basePreview)));
+    node.children.forEach(child=>el.append(draw(child,inText)));
   }
   return el;
 }
