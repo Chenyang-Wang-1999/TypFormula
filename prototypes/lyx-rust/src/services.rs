@@ -87,16 +87,48 @@ impl Lsp {
 pub struct CompletionRequest { pub source: String, pub start: usize, pub end: usize, pub caret: usize }
 #[derive(Serialize)]
 pub struct CompletionReply { pub engine: &'static str, pub items: Vec<crate::cursor::CommandCompletion> }
-#[derive(Deserialize)]
-pub struct RenderRequest { pub expression: String, #[serde(default)] pub definitions: String, #[serde(default = "default_display")] pub display: bool }
-fn default_display() -> bool { true }
+#[derive(Deserialize, Serialize)]
+pub struct RenderRequest { pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange> }
+#[derive(Deserialize, Serialize)]
+pub struct RawRange { pub id: String, pub start: usize, pub end: usize }
+
+struct RenderAdapter { child: Child, requests: mpsc::Sender<Vec<u8>>, replies: mpsc::Receiver<Result<Value,String>> }
+impl Drop for RenderAdapter { fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); } }
+impl RenderAdapter {
+    fn start(bin: &Path, root: &Path) -> Result<Self,String> {
+        let mut child = hidden(Command::new(bin).arg("--server")).current_dir(root)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+            .map_err(|e|format!("请运行 build-native.cmd 构建实时 Typst 引擎：{e}"))?;
+        let mut input = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (requests, receiver) = mpsc::channel::<Vec<u8>>();
+        let (sender, replies) = mpsc::channel();
+        std::thread::spawn(move || { for body in receiver { if input.write_all(&body).and_then(|_|input.write_all(b"\n")).and_then(|_|input.flush()).is_err() { break; } } });
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.by_ref().take(16*1024*1024+1).read_line(&mut line) { Ok(0) | Err(_) => break, _ => {} }
+                if line.len() > 16*1024*1024 { let _ = sender.send(Err("Typst SVG 响应过大".into())); break; }
+                if sender.send(serde_json::from_str(&line).map_err(|e|e.to_string())).is_err() { break; }
+            }
+        });
+        Ok(Self { child,requests,replies })
+    }
+    fn request(&mut self, req: &RenderRequest) -> Result<Value,String> {
+        self.requests.send(serde_json::to_vec(req).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        let value = self.replies.recv_timeout(Duration::from_secs(12)).map_err(|_|"Typst 实时编译超时；源码已保留")??;
+        // A document diagnostic is a valid protocol reply; keep the warm engine.
+        Ok(value)
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 pub struct AttachmentRequest { pub expression: String, #[serde(default)] pub definitions: String, pub display: bool }
 
-pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()> }
+pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, render_adapter: Mutex<Option<RenderAdapter>> }
 impl Services {
-    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), root, completion_lock: Mutex::new(()) } }
+    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), root, completion_lock: Mutex::new(()), render_adapter: Mutex::new(None) } }
     fn adapter_bin(&self) -> PathBuf { self.root.join("target/adapter").join(if cfg!(debug_assertions) { "debug" } else { "release" }).join(if cfg!(windows) { "lyx-typst-layout-adapter.exe" } else { "lyx-typst-layout-adapter" }) }
     pub fn status(&self) -> Value { match &self.bin { Ok(path) => json!({"available":true,"attachments":self.adapter_bin().is_file(),"engine":"Tinymist LSP + Typst","path":path}), Err(error) => json!({"available":false,"attachments":self.adapter_bin().is_file(),"error":error}) } }
     pub fn attachments(&self, req: AttachmentRequest) -> Result<Value, String> {
@@ -184,34 +216,13 @@ impl Services {
         }
     }
     pub fn render(&self, req: RenderRequest) -> Result<Value, String> {
-        let bin = self.bin.as_ref().map_err(Clone::clone)?;
-        // Temporary .typ source is removed after compilation. It is never an editor format.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = self.root.join("target").join(format!("preview-{}-{id}", std::process::id()));
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        struct Cleanup(PathBuf); impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_file(self.0.join("formula.typ")); let _ = fs::remove_file(self.0.join("formula.svg")); let _ = fs::remove_dir(&self.0); } }
-        let _cleanup = Cleanup(dir.clone());
-        let space = if req.display { " " } else { "" };
-        let source = format!("#set page(width: auto, height: auto, margin: 0pt)\n#set text(font: \"New Computer Modern Math\", size: 24pt)\n{}\n${space}{}{space}$", req.definitions, req.expression);
-        let file = dir.join("formula.typ"); fs::write(&file, source).map_err(|e| e.to_string())?;
-        let svg_file = dir.join("formula.svg");
-        let mut child = hidden(Command::new(bin).arg("compile").arg(&file).arg(&svg_file).args(["--format", "svg", "--ignore-system-fonts"]).arg("--root").arg(&dir)).current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
-        let stdout = child.stdout.take().unwrap(); let stderr = child.stderr.take().unwrap();
-        let output = std::thread::spawn(move || { let mut bytes = vec![]; let _ = stdout.take(16*1024*1024).read_to_end(&mut bytes); bytes });
-        let errors = std::thread::spawn(move || { let mut bytes = vec![]; let _ = stderr.take(1024*1024).read_to_end(&mut bytes); bytes });
-        let until = Instant::now() + Duration::from_secs(12);
-        let status = loop {
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? { break status; }
-            if Instant::now() > until { let _ = child.kill(); let _ = child.wait(); let _ = output.join(); let _ = errors.join(); return Err("Typst 渲染超时；源码已保留".into()); }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let _ = output.join().map_err(|_| "无法读取编译输出")?;
-        let error = String::from_utf8_lossy(&errors.join().unwrap_or_default()).to_string();
-        if !status.success() { return Err(error); }
-        let svg = fs::read_to_string(svg_file).map_err(|e| e.to_string())?;
-        if !svg.contains("<svg") { return Err("Typst 未返回 SVG".into()); }
-        Ok(json!({"svg":svg,"engine":"Typst via Tinymist"}))
+        let mut adapter = self.render_adapter.lock().map_err(|e| e.to_string())?;
+        if adapter.is_none() { *adapter = Some(RenderAdapter::start(&self.adapter_bin(), &self.root)?); }
+        let result = adapter.as_mut().unwrap().request(&req);
+        if result.is_err() { *adapter = None; }
+        let value = result?;
+        if let Some(error) = value["error"].as_str() { return Err(error.into()); }
+        Ok(value)
     }
 }
 fn position(source: &str, byte: usize) -> Value {

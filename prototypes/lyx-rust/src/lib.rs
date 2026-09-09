@@ -4,6 +4,7 @@ pub mod cursor;
 pub mod math;
 pub mod typst;
 pub mod view;
+pub mod document;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod services;
 #[cfg(target_arch = "wasm32")]

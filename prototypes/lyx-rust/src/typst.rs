@@ -243,12 +243,27 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
 
 pub struct Parsed { pub root: MathData, pub definitions: String, pub display: bool }
 
+/// Parse a single equation against the lexical document prefix without treating
+/// surrounding markup as part of the editable math tree.
+pub fn parse_formula(text: &str, context: &str) -> Result<Parsed, String> {
+    let source = Source::detached(text.to_owned());
+    let (errors, _) = source.root().errors_and_warnings();
+    if let Some(error) = errors.first() { return Err(error.message.to_string()); }
+    let eq = source.root().children().find_map(|n| n.cast::<ast::Equation>()).ok_or("缺少公式")?;
+    let registry = macro_registry(context);
+    let ctx = ParseContext { params: &[], locals: &HashSet::new(), registry: &registry, template: false };
+    Ok(Parsed { root: parse_cell(eq.body().to_untyped(), &ctx), definitions: context.to_owned(), display: eq.block() })
+}
+
 pub fn parse_command(text: &str, definitions: &str) -> Result<Parsed, String> {
     let source = Source::detached(text.to_string());
     let document = source.root().children().any(|n| matches!(n.kind(), SyntaxKind::Equation | SyntaxKind::LetBinding));
     let body = if document { text.to_string() } else { format!("$ {text} $") };
     let separator = if definitions.is_empty() || definitions.ends_with('\n') { "" } else { "\n" };
-    parse_document(&format!("{definitions}{separator}{body}"))
+    if !document { return parse_formula(&body, definitions); }
+    if source.root().children().any(|n| n.kind() == SyntaxKind::LetBinding) {
+        parse_document(&format!("{definitions}{separator}{body}"))
+    } else { parse_formula(&body, definitions) }
 }
 
 pub fn parse_document(text: &str) -> Result<Parsed, String> {

@@ -20,6 +20,17 @@ $originalMathSource = $mathSource
 $offset = $mathSource.IndexOf($marker)
 if ($offset -ge 0) { $mathSource = $mathSource.Substring(0, $offset) }
 $entry = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'layout-entry.rs'))
+$boxHook = '    let frame = crate::inline::layout_box('
+$mappedHook = @'
+    if let Some(frame) = editor_mapped_box(item, ctx, styles)? {
+        ctx.push(FrameFragment::new(props, styles, frame));
+        return Ok(());
+    }
+'@
+if (!$mathSource.Contains('editor_mapped_box(item, ctx, styles)?')) {
+    if (!$mathSource.Contains($boxHook)) { throw 'Typst box bridge anchor missing' }
+    $mathSource = $mathSource.Replace($boxHook, $mappedHook + "`n" + $boxHook)
+}
 $patchedMathSource = $mathSource.TrimEnd() + "`n`n$marker`n" + $entry
 if ($patchedMathSource -ne $originalMathSource) {
     [IO.File]::WriteAllText($mathPath, $patchedMathSource)

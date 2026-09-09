@@ -34,7 +34,7 @@ pub enum Action {
 #[derive(Clone, Debug, Deserialize)]
 pub struct StopGeometry { pub cursor: Cursor, pub x: f64, pub y: f64 }
 #[derive(Clone)]
-struct Snapshot { root: MathData, cursor: Cursor, anchor: Option<Cursor>, definitions: String, display: bool }
+pub(crate) struct Snapshot { root: MathData, cursor: Cursor, anchor: Option<Cursor>, definitions: String, display: bool }
 
 pub struct Editor {
     pub root: MathData,
@@ -57,8 +57,8 @@ impl Default for Editor {
     fn default() -> Self { Self { root: vec![], cursor: Cursor::default(), anchor: None, definitions: String::new(), display: true, message: String::new(), completion_index: 0, revision: 0, geometry: vec![], target_x: None, history: vec![], future: vec![], typing: false, lsp_completions: None, failed_previews: HashSet::new() } }
 }
 impl Editor {
-    fn snapshot(&self) -> Snapshot { Snapshot { root: self.root.clone(), cursor: self.cursor.clone(), anchor: self.anchor.clone(), definitions: self.definitions.clone(), display: self.display } }
-    fn restore(&mut self, s: Snapshot) { self.root = s.root; self.cursor = s.cursor; self.anchor = s.anchor; self.definitions = s.definitions; self.display = s.display; }
+    pub(crate) fn snapshot(&self) -> Snapshot { Snapshot { root: self.root.clone(), cursor: self.cursor.clone(), anchor: self.anchor.clone(), definitions: self.definitions.clone(), display: self.display } }
+    pub(crate) fn restore(&mut self, s: Snapshot) { self.root = s.root; self.cursor = s.cursor; self.anchor = s.anchor; self.definitions = s.definitions; self.display = s.display; }
     pub fn can_undo(&self) -> bool { !self.history.is_empty() }
     pub fn can_redo(&self) -> bool { !self.future.is_empty() }
     fn data(&self) -> &MathData { cell(&self.root, &self.cursor.slices) }

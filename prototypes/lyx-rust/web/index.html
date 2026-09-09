@@ -9,9 +9,12 @@
       <div class="toolbar">
         <button id="undo" title="撤销 Ctrl+Z" aria-label="撤销">↶</button><button id="redo" title="重做 Ctrl+Y" aria-label="重做">↷</button>
         <button id="clear" class="text-button">清空公式</button>
-        <button id="display-mode" class="text-button" aria-pressed="true" title="切换行内／行间公式">行间公式</button>
+        <button id="refresh-svg" class="text-button" title="重新生成所有公式中的 SVG">更新全部 SVG</button>
+        <button id="insert-inline" class="text-button">插入行内公式</button>
+        <button id="insert-display" class="text-button">插入行间公式</button>
+        <button id="remove-formula" class="text-button">删除当前公式</button>
       </div>
-      <div class="canvas-scroll"><div id="canvas" role="group" aria-label="可编辑公式"></div></div>
+      <div class="canvas-scroll"><div id="document-flow" aria-label="文档正文"></div><div id="canvas" role="group" aria-label="可编辑公式"></div></div>
       <div class="editor-footer"><span id="status" role="status">正在加载 Rust 核心…</span><span id="attachment-status" role="status" hidden></span><span id="position"></span></div>
     </section>
     <div class="quick-help"><span><kbd>\</kbd> 输入命令</span><span><kbd>Enter</kbd> 确认命令</span><span><kbd>Space</kbd> 退出结构</span><span><kbd>Tab</kbd> 循环槽位</span><button data-example="attachments">试用 limits / stretch</button></div>

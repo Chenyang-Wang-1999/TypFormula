@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #![cfg(not(target_arch = "wasm32"))]
-use lyx_typst_core::{Action, Editor, services::{Services, CompletionRequest, RenderRequest}};
+use lyx_typst_core::{Action, Editor, services::{Services, CompletionRequest, RenderRequest, RawRange}};
+
+fn render(service: &Services, expression: &str, definitions: &str) -> Result<serde_json::Value,String> {
+    let prefix=format!("{definitions}\n$ ");
+    let start=prefix.len();
+    let result=service.render(RenderRequest {source:format!("{prefix}{expression} $"),raw:vec![RawRange{id:"raw".into(),start,end:start+expression.len()}],formulas:vec![]})?;
+    Ok(result["items"][0].clone())
+}
 
 #[test]
 #[ignore = "requires local Tinymist"]
@@ -13,7 +20,7 @@ fn differential_symbol_keeps_its_name_and_renders() {
     editor.apply(Action::Key {key:"Enter".into(),shift:false,ctrl:false}).unwrap();
     let expression=lyx_typst_core::typst::write_cell(&editor.root);
     assert!(matches!(&editor.root[0].kind,lyx_typst_core::math::Kind::Raw {source} if source=="dif"));
-    let output=service.render(RenderRequest { display:true,expression:expression.clone(),definitions:String::new()}).unwrap();
+    let output=render(&service, &expression, "").unwrap();
     let svg=output["svg"].as_str().unwrap();
     assert!(svg.contains("<svg") && svg.contains("<path"));assert_eq!(expression,"dif");
 }
@@ -30,11 +37,11 @@ fn real_tinymist_completions_and_typst_svg() {
         assert!(reply.items.iter().any(|i| i.label.contains(expected)),"missing {expected} for {draft}");
     }
     for expression in ["cancel(x)", "cases(x, y)", "arrow.r.double"] {
-        let result=service.render(RenderRequest { display:true, expression:expression.into(),definitions:String::new() }).unwrap();
+        let result=render(&service, expression, "").unwrap();
         assert!(result["svg"].as_str().unwrap().contains("<svg"));
     }
-    assert!(service.render(RenderRequest { display:true,expression:"not_a_defined_function(x)".into(),definitions:String::new()}).is_err());
-    let result = service.render(RenderRequest { display:true,expression:"cancel(twice(x))".into(),definitions:"#let twice(x) = $ #x + #x $".into()}).unwrap();
+    assert!(render(&service, "not_a_defined_function(x)", "").is_err());
+    let result = render(&service, "cancel(twice(x))", "#let twice(x) = $ #x + #x $").unwrap();
     assert!(result["svg"].as_str().unwrap().contains("<svg"));
 }
 
@@ -44,7 +51,7 @@ fn macro_calls_and_scoped_raw_compile_with_native_typst() {
     let service = Services::new(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let definitions = "#let ratio(x, y) = $frac(#x, #x + #y)$\n#let marked(x) = $cancel(#x)$";
     for expression in ["ratio(a, b)", "ratio(\"\", \"\")", "marked(c)", "ratio(marked(a), b)"] {
-        let result = service.render(RenderRequest { display:true, expression:expression.into(), definitions:definitions.into() }).unwrap();
+        let result = render(&service, expression, definitions).unwrap();
         assert!(result["svg"].as_str().unwrap().contains("<svg"));
     }
 }

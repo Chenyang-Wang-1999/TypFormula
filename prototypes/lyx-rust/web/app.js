@@ -6,14 +6,14 @@ const keyboard = $('#keyboard'), canvas = $('#canvas'), caret = $('#caret'), pop
 const encoder = new TextEncoder(), decoder = new TextDecoder();
 let wasm, state, composing = false, suppressComposition = false;
 let completionTimer, completionBusy = false, requestedCommand = '', serviceReady = false;
-const previews = new Map(), previewQueue = [];
-let previewBusy = 0, redrawQueued = false;
+const previews = new Map();
+let rawReady=false, redrawQueued = false;
 let attachmentReady = false, attachmentBusy = false, attachmentTimer;
 const attachments = new Map();
-function attachmentKey(expression) { return JSON.stringify([state.definitions,state.display,expression]); }
+function attachmentKey(expression,definitions=state.formula_definitions,display=state.display) { return JSON.stringify([definitions,display,expression]); }
 function attachmentFor(node) {
   if(!attachmentReady || !node.attachment)return null;
-  const key=attachmentKey(node.attachment);
+  const key=attachmentKey(node.attachment,node.attachmentDefinitions,node.attachmentDisplay);
   if(!attachments.has(key))attachments.set(key,{status:'waiting'});
   return attachments.get(key);
 }
@@ -41,17 +41,26 @@ function paintAttachmentStatus() {
   }
 }
 async function runAttachments() {
-  if(attachmentBusy)return;
+  if(attachmentBusy || state.pending || attachmentEdits.size)return;
   const candidates=[];
-  function visit(node) { if(node.attachment)candidates.push(node.attachment);node.children.forEach(visit); }
-  visit(state.view);
-  const expression=candidates.find(e=>attachments.get(attachmentKey(e))?.status==='waiting');
-  if(expression===undefined)return;
-  const key=attachmentKey(expression), record=attachments.get(key);
-  const request={expression,definitions:state.definitions,display:state.display};
+  for(const block of state.blocks) {
+    function visit(node) {
+      if(node.attachment) {
+        const key=attachmentKey(node.attachment,block.definitions,block.display);
+        if(!attachments.has(key))attachments.set(key,{status:'waiting'});
+        candidates.push({key,request:{expression:node.attachment,definitions:block.definitions,display:block.display}});
+      }
+      node.children.forEach(visit);
+    }
+    visit(block.view);
+  }
+  const task=candidates.find(c=>attachments.get(c.key)?.status==='waiting');
+  if(!task)return;
+  const {key,request}=task, record=attachments.get(key);
   attachmentBusy=true;
   try {
     const result=await api('/api/attachments',request);
+    if(attachments.get(key)!==record)return;
     if(![null,'limits','scripts'].includes(result.upper)||![null,'limits','scripts'].includes(result.lower))throw new Error('无效的 Typst 附件位置');
     if(result.base) {
       const base=result.base;
@@ -93,32 +102,130 @@ function scheduleCompletion() {
   },120);
 }
 function redraw() { if(!redrawQueued){redrawQueued=true;requestAnimationFrame(()=>{redrawQueued=false;render();paintCaret();});} }
-function previewFor(node) {
-  const definitions=node.definitions ?? state.definitions;
-  const display=state.display, key=JSON.stringify([definitions,display,node.text]);
-  if(!previews.has(key)) {
-    const record={status:'waiting',expression:node.text};previews.set(key,record);
-    previewQueue.push({key,expression:node.text,definitions,display,record});queueMicrotask(runPreviews);
-  }
-  return previews.get(key);
+let renderTimer, renderBusy=false, contextFocus=null;
+// Editor previews deliberately outlive their original document context and
+// source offsets. The first successful SVG for this Raw spelling is reused
+// until an explicit refresh, including after deletion and undo.
+function invalidatePreview(source) {
+  const record=previews.get(source);
+  if(record?.url)URL.revokeObjectURL(record.url);
+  previews.delete(source);
 }
-function runPreviews() {
-  while(serviceReady && previewBusy<2 && previewQueue.length) {
-    const task=previewQueue.shift();previewBusy++;
-    api('/api/render',{expression:task.expression,definitions:task.definitions,display:task.display}).then(result=>{
-      const doc=new DOMParser().parseFromString(result.svg,'image/svg+xml');
-      const svg=doc.documentElement;
-      if(svg.localName!=='svg')throw new Error('无效的 SVG');
-      const box=svg.getAttribute('viewBox')?.split(/[ ,]+/).map(Number);
-      const width=box?.[2] ?? parseFloat(svg.getAttribute('width'));
-      const height=box?.[3] ?? parseFloat(svg.getAttribute('height'));
-      if(!Number.isFinite(width)||!Number.isFinite(height)||width<0||height<0)throw new Error('SVG 尺寸无效');
-      Object.assign(task.record,{status:'ready',url:URL.createObjectURL(new Blob([result.svg],{type:'image/svg+xml'})),width,height});
-    }).catch(error=>{Object.assign(task.record,{status:'error',error:error.message});})
-      .finally(()=>{
-        state=call({action:'preview_result',source:task.expression,definitions:task.definitions,display:task.display,failed:task.record.status==='error'});
-        previewBusy--;redraw();runPreviews();
+function invalidateAttachment(key) {
+  const record=attachments.get(key);
+  if(record?.base?.url)URL.revokeObjectURL(record.base.url);
+  attachments.delete(key);
+}
+function refreshAllSvg() {
+  for(const source of previews.keys())invalidatePreview(source);
+  for(const key of attachments.keys())invalidateAttachment(key);
+  render();
+  $('#status').textContent=state.pending?'已请求更新；确认或取消命令后刷新所有 SVG':'正在更新所有 SVG…';
+}
+
+// Track edited script slots using the view's existing cursor projections.
+// Navigation alone is not an edit. Stay in the same session when moving
+// between an upper and lower slot, and include nested script ancestors.
+const attachmentEdits=new Map();
+function attachmentContent(node) {
+  return [node.kind,node.text,node.columns,node.children.filter(c=>!['stop','draft-caret'].includes(c.kind)).map(attachmentContent)];
+}
+function focusedAttachments(snapshot) {
+  const found=new Map(), cursor=snapshot.cursor;
+  function containsCursor(node) {
+    const c=node.cursor;
+    return (c && c.pos===cursor.pos && c.occurrence===cursor.occurrence && JSON.stringify(c.slices)===JSON.stringify(cursor.slices)) || node.children.some(containsCursor);
+  }
+  function visit(node,path) {
+    if(node.kind==='script' && node.children.slice(1).some(containsCursor)) {
+      const raw=new Set();
+      function base(part){if(part.kind==='raw')raw.add(part.text);part.children.forEach(base);}
+      base(node.children[0]);
+      found.set(JSON.stringify([snapshot.active_formula,path]),{
+        signature:JSON.stringify(node.children.slice(1).map(attachmentContent)),raw,
+        attachment:node.attachment?attachmentKey(node.attachment,snapshot.formula_definitions,snapshot.display):null,
       });
+    }
+    node.children.forEach((child,i)=>visit(child,[...path,i]));
+  }
+  visit(snapshot.view,[]);return found;
+}
+function updateAttachmentEdits(snapshot,focused=true) {
+  if(!focused && snapshot.pending)return;
+  const current=focusedAttachments(snapshot);
+  let refreshed=false;
+  for(const [key,edit] of attachmentEdits) {
+    const next=current.get(key);
+    if(next){edit.latest=next;}
+    if(focused && next)continue;
+    if(edit.initial!==edit.latest.signature) {
+      for(const source of edit.latest.raw)invalidatePreview(source);
+      if(edit.latest.attachment)invalidateAttachment(edit.latest.attachment);
+      refreshed=true;
+    }
+    attachmentEdits.delete(key);
+  }
+  if(focused)for(const [key,latest] of current)if(!attachmentEdits.has(key))attachmentEdits.set(key,{initial:latest.signature,latest});
+  if(refreshed){schedulePreviews();scheduleAttachments();}
+}
+function previewFor(node) {
+  return previews.get(node.text) || {status:'waiting'};
+}
+function visitRaw(callback) {
+  for(const block of state.blocks) {
+    function visit(node) {
+      if(node.kind==='raw')callback(node,block);
+      node.children.forEach(visit);
+    }
+    visit(block.view);
+  }
+}
+function schedulePreviews() {
+  clearTimeout(renderTimer);
+  let waiting=false;
+  visitRaw(node=>{
+    if(!previews.has(node.text))previews.set(node.text,{status:'waiting',expression:node.text});
+    if(previews.get(node.text).status==='waiting')waiting=true;
+  });
+  if(waiting && !state.pending)renderTimer=setTimeout(runPreviews,160);
+}
+function syncPreviewResults() {
+  visitRaw((node,block)=>{
+    const status=previewFor(node).status;
+    if(status==='ready'||status==='error')state=call({action:'preview_result',formula:block.index,source:node.text,definitions:node.definitions??block.definitions,display:block.display,failed:status==='error'});
+  });
+}
+async function runPreviews() {
+  if(renderBusy || !rawReady || state.pending)return;
+  // IDs belong only to this compile snapshot. Keep their record references so
+  // typing, source-offset shifts and formula insertion cannot redirect replies.
+  const targets=new Map();
+  visitRaw(node=>{
+    const record=previews.get(node.text);
+    if(node.render_id && record?.status==='waiting')targets.set(node.render_id,record);
+  });
+  if(!targets.size)return;
+  const request={...state.render,raw:state.render.raw.filter(range=>[...targets.keys()].some(id=>id.startsWith(range.id+':')))};
+  const records=new Set(targets.values());
+  for(const record of records)record.status='loading';
+  renderBusy=true;
+  try {
+    const result=await api('/api/render',request);
+    for(const item of result.items) {
+      const record=targets.get(item.id);
+      if(!record || previews.get(record.expression)!==record || record.status==='ready')continue;
+      const svg=new DOMParser().parseFromString(item.svg,'image/svg+xml').documentElement;
+      if(svg.localName!=='svg'||![item.width,item.height].every(n=>Number.isFinite(n)&&n>=0))throw new Error('无效的 Typst SVG');
+      Object.assign(record,item,{status:'ready',mapped:true,url:URL.createObjectURL(new Blob([item.svg],{type:'image/svg+xml'}))});
+    }
+    for(const record of records)if(record.status==='loading')Object.assign(record,{status:'error',error:'当前文档没有此 Raw 的可见排版结果'});
+  } catch(error) {
+    for(const record of records)if(record.status!=='ready')Object.assign(record,{status:'error',error:error.message});
+  } finally {
+    renderBusy=false;
+    syncPreviewResults();
+    redraw();
+    schedulePreviews();
   }
 }
 window.addEventListener('pagehide',()=>{
@@ -146,6 +253,7 @@ function send(action, focus = true) {
   try {
     const draft=state?.command?.draft;
     state = call(action);
+    updateAttachmentEdits(state,focus || document.activeElement===keyboard);
     if(action.action==='key' && action.key==='Enter' && !state.pending && draft) {
       for(const [key,record] of previews)if(record.status==='error' && record.expression===draft.trim())previews.delete(key);
       for(const [key,record] of attachments)if(record.status==='error')attachments.delete(key);
@@ -159,19 +267,57 @@ function element(kind, text) {
   if (text !== undefined) el.textContent = text;
   return el;
 }
+let contextNodes=[], formulaNodes=[];
+function renderDocument() {
+  const flow=$('#document-flow');
+  if(contextNodes.length!==state.contexts.length) {
+    contextNodes=[];formulaNodes=[];flow.replaceChildren();
+    state.contexts.forEach((text,index)=>{
+      const input=document.createElement('textarea');input.className='document-context';input.spellcheck=false;
+      input.setAttribute('aria-label',`上下文 ${index+1}`);input.placeholder='输入 Typst 上下文…';input.rows=1;
+      function remember(){contextFocus={index,offset:encoder.encode(input.value.slice(0,input.selectionStart)).length};}
+      input.addEventListener('focus',remember);input.addEventListener('select',remember);input.addEventListener('keyup',remember);input.addEventListener('click',remember);
+      input.addEventListener('input',()=>{
+        remember();
+        try{state=call({action:'set_context',index,text:input.value});$('#source').value=state.source;schedulePreviews();sizeContext(input);$('#undo').disabled=!state.undo;$('#redo').disabled=!state.redo;}
+        catch(error){$('#status').textContent=error.message;$('#status').classList.add('error');}
+      });
+      input.addEventListener('blur',()=>{render();scheduleCompletion();});
+      input.addEventListener('keydown',event=>{
+        if((event.ctrlKey||event.metaKey)&&['z','y'].includes(event.key.toLowerCase())){event.preventDefault();send({action:event.key.toLowerCase()==='y'||event.shiftKey?'redo':'undo'},false);}
+      });
+      contextNodes.push(input);flow.append(input);
+      if(index<state.blocks.length){const formula=document.createElement('span');formulaNodes.push(formula);flow.append(formula);}
+    });
+  }
+  state.contexts.forEach((text,i)=>{const input=contextNodes[i];if(input.value!==text)input.value=text;sizeContext(input);});
+  state.blocks.forEach(block=>{
+    const formula=formulaNodes[block.index];formula.className='document-formula '+(block.display?'display-formula':'inline-formula');
+    formula.classList.toggle('current-formula',block.index===state.active_formula);
+    formula.title=block.display?'行间公式':'行内公式';
+    if(block.index===state.active_formula){if(canvas.parentElement!==formula)formula.replaceChildren(canvas);formula.onpointerdown=null;}
+    else {
+      function passive(node){return {...node,cursor:null,edit:null,active:false,attachmentDefinitions:block.definitions,attachmentDisplay:block.display,children:node.children.map(passive)};}
+      formula.replaceChildren(draw(passive(block.view)));formula.onpointerdown=event=>{event.preventDefault();contextFocus=null;send({action:'activate_formula',index:block.index});};
+    }
+    syncPreviewResults();
+  });
+  if(!state.blocks.length)canvas.remove();
+}
+function sizeContext(input){input.style.width=Math.min(100,Math.max(8,Math.max(...input.value.split('\n').map(l=>l.length))+2))+'ch';input.style.height='auto';input.style.height=Math.max(38,input.scrollHeight)+'px';}
 function draw(node, inText=false, basePreview=null) {
   const el = element(node.kind); el.classList.toggle('selected', node.selected);
   if(node.kind==='macro-argument'){el.style.setProperty('--argument-color',['#317bb5','#ae6430','#8b59b0','#288473','#b44970','#767323'][node.columns%6]);el.title=`参数 ${node.text} · 同色框共享内容`;el.setAttribute('aria-label',`参数 ${node.text}`);}
   if(node.kind==='macro' || node.kind==='macro-collapsed')el.title=node.text;
   if(node.kind==='raw' || (basePreview && ['char','symbol'].includes(node.kind))) {
-    const record=basePreview || (serviceReady?previewFor(node):{status:'unavailable'});
+    const record=basePreview || (rawReady?previewFor(node):{status:'unavailable'});
     if(record.status==='ready') {
       el.classList.add('rendered');const img=document.createElement('img');img.src=record.url;img.alt=node.text;
-      img.style.width=(record.width/24)+'em';img.style.height=(record.height/24)+'em';img.addEventListener('load',measure,{once:true});el.append(img);
+      img.style.width=record.mapped?(record.width*4/3)+'px':(record.width/24)+'em';img.style.height=record.mapped?(record.height*4/3)+'px':(record.height/24)+'em';img.addEventListener('load',measure,{once:true});el.append(img);
       el.title=`${node.text}\nTypst 渲染的整体公式，可整块删除`;
     } else {
       el.textContent=node.text;el.classList.toggle('render-error',record.status==='error');
-      el.title=record.status==='error'?`Typst 未能渲染：${record.error}\n从左侧按 → 或右侧按 ← 可进入源码编辑` :record.status==='waiting'?'Typst 正在渲染…':node.text;
+      el.title=record.status==='error'?`Typst 未能渲染：${record.error}\n从左侧按 → 或右侧按 ← 可进入源码编辑` :['waiting','loading'].includes(record.status)?'Typst 正在渲染…':node.text;
       if(record.status==='error' && node.edit) {
         const edit=document.createElement('button');edit.type='button';edit.className='edit-source';edit.textContent='编辑';edit.title='编辑保留的命令源码';
         edit.addEventListener('pointerdown',event=>{event.stopPropagation();});
@@ -199,16 +345,20 @@ function draw(node, inText=false, basePreview=null) {
     // original source stay in the Rust tree; structured bases remain editable.
     const atoms=node.children[0].children.filter(n=>n.kind!=='stop');
     const base=draw(node.children[0],false,atoms.length===1&&['raw','char','symbol'].includes(atoms[0].kind)?resolved?.base:null);
-    if(resolved && (resolved.upper==='limits'||resolved.lower==='limits')) {
-      el.classList.add('attachment-layout');base.classList.add('attachment-base');el.append(base);
-      for(const [index,place,side] of [[1,resolved.upper,'upper'],[2,resolved.lower,'lower']]) {
-        if(node.children[index].kind==='absent')continue;
-        const slot=element(`attachment-slot ${side} ${place==='limits'?'center':'side'}`);
-        slot.append(draw(node.children[index]));el.append(slot);
-      }
-    } else {
-      el.append(base);const stack=element('scripts');stack.append(draw(node.children[1]),draw(node.children[2]));el.append(stack);
+    el.classList.add('attachment-layout');base.classList.add('attachment-base');el.append(base);
+    // The side stack shares the base's grid row and stretches to its bbox.
+    // Keeping an empty opposite slot anchors single attachments to the same
+    // top/bottom edges. Centered limits stay in their own rows outside the base.
+    const sides=element('attachment-sides');let hasSide=false;
+    for(const [index,place,side] of [[1,resolved?.upper,'upper'],[2,resolved?.lower,'lower']]) {
+      if(node.children[index].kind==='absent') { sides.append(element('absent'));continue; }
+      const centered=place==='limits';
+      const slot=element(`attachment-slot ${side} ${centered?'center':'side'}`);
+      slot.append(draw(node.children[index]));
+      if(centered) { el.append(slot);sides.append(element('absent')); }
+      else { sides.append(slot);hasSide=true; }
     }
+    if(hasSide)el.append(sides);
     if(record?.status==='error')el.title=`Typst 附件布局暂不可用，保留右侧槽位：${record.error}`;
     else if(record?.status==='waiting')el.title='Typst 正在解析附件位置…';
   } else if(node.kind === 'delim') {
@@ -232,12 +382,13 @@ function draw(node, inText=false, basePreview=null) {
 }
 function render() {
   renderMacros();
+  schedulePreviews();
   canvas.replaceChildren(draw(state.view));
+  renderDocument();
   paintAttachmentStatus();
   $('#source').value = state.source;
   $('#undo').disabled=!state.undo; $('#redo').disabled=!state.redo;
-  $('#display-mode').textContent=state.display?'行间公式':'行内公式';
-  $('#display-mode').setAttribute('aria-pressed',String(state.display));
+  $('#remove-formula').disabled=state.blocks.length===0;
   $('#status').classList.remove('error');
   $('#status').textContent=state.message || (state.string_mode?'字符模式 · Enter 或 " 结束':state.pending?'输入命令 · Enter 确认，Esc 取消':'就绪 · 空格退出结构，Tab 切换槽位');
   $('#position').textContent=`${state.cursor.slices.length} 层 · 位置 ${state.cursor.pos}`;
@@ -290,6 +441,8 @@ keyboard.addEventListener('beforeinput',event=>{
   keyboard.value='';
 });
 keyboard.addEventListener('compositionstart',()=>{composing=true;});
+keyboard.addEventListener('blur',()=>{updateAttachmentEdits(state,false);redraw();});
+keyboard.addEventListener('focus',()=>updateAttachmentEdits(state));
 keyboard.addEventListener('compositionend',event=>{composing=false;keyboard.value='';if(event.data)send({action:'input',text:event.data});suppressComposition=true;queueMicrotask(()=>{suppressComposition=false;});});
 keyboard.addEventListener('paste',event=>{event.preventDefault();send({action:'paste',text:event.clipboardData.getData('text/plain')});});
 keyboard.addEventListener('copy',event=>{if(state?.selected_source){event.preventDefault();event.clipboardData.setData('text/plain',state.selected_source);}});
@@ -337,7 +490,16 @@ $('#macro-apply').onclick=()=>{
 };
 $('#macro-example').onclick=()=>{macroDirty=false;macroBase=null;send({action:'import',source:examples.macros});};
 $('#undo').onclick=()=>send({action:'undo'});$('#redo').onclick=()=>send({action:'redo'});$('#clear').onclick=()=>send({action:'clear'});
-$('#display-mode').onclick=()=>send({action:'set_display',display:!state.display});
+$('#refresh-svg').onclick=refreshAllSvg;
+for(const [id,display] of [['insert-inline',false],['insert-display',true]]) {
+  $('#'+id).onpointerdown=event=>event.preventDefault();
+  $('#'+id).onclick=()=>{
+    const index=contextFocus?.index??Math.min(state.active_formula+1,state.contexts.length-1);
+    const offset=contextFocus?.offset??encoder.encode(state.contexts[index]).length;
+    contextFocus=null;send({action:'insert_formula',index,offset,display});
+  };
+}
+$('#remove-formula').onclick=()=>{contextFocus=null;send({action:'remove_formula'});};
 $('#row').onclick=()=>send({action:'add_row'});$('#column').onclick=()=>send({action:'add_column'});
 document.querySelectorAll('[data-example]').forEach(button=>button.onclick=()=>send({action:'import',source:examples[button.dataset.example]}));
 $('#import').onclick=()=>{$('#import-source').value=state.source;$('#import-error').textContent='';$('#import-dialog').showModal();$('#import-source').focus();};
@@ -350,9 +512,8 @@ try {
   const {instance}=await WebAssembly.instantiateStreaming(fetch('/core.wasm'),{});wasm=instance.exports;
   send({action:'state'}); document.fonts.ready.then(measure);
   api('/api/status').then(result=>{
-    serviceReady=result.available;attachmentReady=result.attachments;
+    serviceReady=result.available;attachmentReady=result.attachments;rawReady=result.attachments;
     serviceLabel(serviceReady?'LSP 待连接':'内置补全',result.error||'');
-    $('#display-mode').title=attachmentReady?'切换公式样式；顶层上下标由 Typst 决定位置':'切换公式样式；limits/stretch 需要运行 build-native.cmd 并重启服务';
-    render();scheduleCompletion();
+    render();scheduleCompletion();runPreviews();
   }).catch(error=>serviceLabel('请重启 start.cmd',error.message));
 } catch(error) { $('#status').textContent='加载失败：'+error.message; }

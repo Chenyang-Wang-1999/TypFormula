@@ -16,6 +16,7 @@ use typst::routines::Arenas;
 use typst::syntax::{FileId, Source};
 use typst::text::{Font, FontBook};
 use typst::utils::{LazyHash, Protected};
+mod render;
 
 #[derive(Deserialize)]
 struct Request { expression: String, #[serde(default)] definitions: String, display: bool }
@@ -96,8 +97,7 @@ fn resolve(req: Request) -> Result<Value, String> {
     let arenas = Arenas::default();
     let mut equations = vec![];
     collect_equations(&content, styles, &arenas, &mut equations);
-    if equations.len() != 1 { return Err("适配请求必须包含一个顶层公式".into()); }
-    let (equation, styles) = equations[0];
+    let (equation, styles) = *equations.last().ok_or("适配请求缺少公式")?;
     let introspector = EmptyIntrospector;
     let mut engine = Engine { world: world_ref.track(), library: &world.library, introspector: Protected::new(introspector.track()), traced: traced.track(), sink: sink.track_mut(), route: Route::default() };
     let item = resolve_equation(equation, &mut engine, Locator::root(), &arenas, styles).map_err(diagnostics)?;
@@ -120,6 +120,22 @@ fn resolve(req: Request) -> Result<Value, String> {
     Ok(json!({"engine":"Typst math IR 59b5999","upper":upper,"lower":lower,"stretch":stretch,"base":base}))
 }
 fn main() {
+    if std::env::args().any(|a| a == "--server") {
+        use std::io::{BufRead, Write};
+        let mut world = render::world().expect("embedded font");
+        let input = io::stdin();
+        let mut input = input.lock();
+        loop {
+            let mut line = String::new();
+            match input.by_ref().take(256*1024+1).read_line(&mut line) { Ok(0) | Err(_) => break, _ => {} }
+            if line.len() > 256*1024 { break; }
+            let result = serde_json::from_str(&line).map_err(|e|e.to_string()).and_then(|req|render::render(req,&mut world));
+            println!("{}",result.unwrap_or_else(|error|json!({"error":error})));
+            let _ = io::stdout().flush();
+            typst::comemo::evict(10);
+        }
+        return;
+    }
     let result = (|| {
         let mut body = String::new();
         io::stdin().take(256 * 1024 + 1).read_to_string(&mut body).map_err(|e| e.to_string())?;

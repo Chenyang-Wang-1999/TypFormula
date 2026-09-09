@@ -18,10 +18,12 @@ pub struct View {
     pub attachment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definitions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 impl View {
     fn new(kind: &str, text: impl Into<String>, children: Vec<View>) -> Self {
-        Self { kind: kind.into(), text: text.into(), display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None }
+        Self { kind: kind.into(), text: text.into(), display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None, origin: None }
     }
 }
 #[derive(Serialize)]
@@ -182,7 +184,7 @@ impl Editor {
             *view = args[view.columns].clone();
             return;
         }
-        if view.kind == "raw" { view.definitions = Some(def.context.as_ref().clone()); }
+        if view.kind == "raw" { view.definitions = Some(def.context.as_ref().clone()); view.origin = Some(def.source.clone()); }
         for child in &mut view.children {
             self.bind_template(child, def, registry, args);
         }
