@@ -1,0 +1,47 @@
+:root { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #293a32; background: #f3f4ef; --line: #d9ded7; --accent: #356b58; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, textarea, input { font: inherit; }
+header { min-height: 62px; padding: 12px 30px; display: flex; align-items: center; justify-content: space-between; gap: 15px; border-bottom: 1px solid var(--line); background: white; }
+header > div { display: flex; align-items: center; gap: 12px; }
+.logo { font: 30px "Cambria Math", serif; color: var(--accent); }
+.badge, #engine-status { font-size: 11px; color: #6b7b72; }
+main { max-width: 1180px; margin: auto; padding: 28px; }
+h1 { font-size: 24px; font-weight: 550; margin: 0 0 8px; }
+.instructions p { font-size: 13px; color: #67776e; line-height: 1.8; }
+.insert-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px; background: #eef1eb; border: 1px solid var(--line); position: sticky; top: 0; z-index: 10; }
+button { border: 1px solid #cdd8d0; border-radius: 4px; background: white; padding: 7px 11px; cursor: pointer; }
+button:hover { background: #e5efe9; }
+button:focus-visible, textarea:focus-visible { outline: 2px solid #75a58f; outline-offset: 2px; }
+#document-status { margin-left: auto; font-size: 11px; max-width: 60%; }
+.error { color: #b14f3b !important; }
+#document-page { min-height: 350px; padding: 38px 44px; border: 1px solid var(--line); border-top: 0; background: #fffefb; font: 16px/1.9 Georgia, "Microsoft YaHei", serif; white-space: pre-wrap; overflow-wrap: anywhere; }
+#document-page:focus { outline: none; }
+.text-run:empty::after { content: '\200b'; }
+.macro-widget { display: block; margin: 3px 0; padding: 1px 6px; background: #faf5ee; white-space: normal; }
+.macro-widget textarea { display: block; width: 100%; min-height: 27px; border: 0; border-bottom: 1px solid transparent; background: transparent; resize: none; padding: 3px 0; font: 13px/1.6 Consolas, monospace; }
+.macro-widget textarea:focus { outline: none; border-bottom-color: #9c7952; }
+.formula-widget { position: relative; border: 1px solid #cbd8cf; padding: 2px 4px; min-width: 20px; min-height: 25px; border-radius: 2px; background: white; white-space: nowrap; overflow-wrap: normal; }
+.inline-widget { display: inline-block; vertical-align: baseline; margin: 0 2px; max-width: 100%; overflow-x: auto; }
+.display-widget { display: block; margin: 8px 0; padding: 8px; text-align: center; overflow-x: auto; }
+.formula-widget:focus-within { border-color: #77a18b; }
+.formula-widget.editing-widget { cursor: text; }
+.preview-widget { cursor: pointer; }
+.preview-widget img { max-width: none; max-height: none; }
+.formula-widget { scrollbar-width: thin; }
+.preview-pending { font: 14px/1.4 Consolas, monospace; color: #68766f; }
+.fragment-unavailable { border-style: dashed; }
+.inspectors { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 20px; }
+.inspectors article, .compiled-document { border: 1px solid var(--line); background: white; }
+h2 { font-size: 12px; margin: 0; padding: 10px 12px; font-weight: 550; }
+.inspectors textarea { display: block; width: 100%; height: 180px; border: 0; border-top: 1px solid var(--line); padding: 12px; background: #fafbf8; color: #4c6457; font: 12px/1.6 Consolas, monospace; resize: vertical; }
+.compiled-document { margin-top: 20px; }
+.preview-heading { display: flex; align-items: center; justify-content: space-between; padding-right: 8px; border-bottom: 1px solid var(--line); }
+.preview-heading button { font-size: 11px; padding: 4px 8px; }
+#document-preview { background: #e8ebe6; padding: 16px; position: relative; }
+#document-preview::before { content: attr(data-version); display: block; font-size: 11px; color: #6a786f; margin-bottom: 10px; }
+#document-preview.stale-preview::before { color: #a06e3f; }
+#document-preview > img { display: block; width: auto; max-width: 100%; height: auto; margin: 0 auto 16px; background: white; box-shadow: 0 2px 12px #0001; }
+details { margin-top: 18px; color: #738177; font-size: 12px; line-height: 1.8; }
+summary { cursor: pointer; }
+@media(max-width:760px) { header { padding: 12px; flex-wrap: wrap; } main { padding: 16px 10px; } #document-page { padding: 24px 16px; } .inspectors { grid-template-columns: 1fr; } #document-status { max-width: 100%; margin: 0; } }

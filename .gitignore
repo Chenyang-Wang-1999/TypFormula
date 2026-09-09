@@ -1,0 +1,5 @@
+typst-engine
+*.lock
+target
+prototypes/lyx-rust/upstream
+*.otf

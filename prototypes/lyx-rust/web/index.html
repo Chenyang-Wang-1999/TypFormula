@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LyX → Rust · Typst 公式原型</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+  <header><div><span class="logo">∑</span><strong>LyX → Rust</strong><span class="badge">独立公式原型</span></div><button id="help">操作说明</button></header>
+  <main>
+    <div class="intro"><h1>从 LyX 的公式树开始。</h1><p>输入、确认、进入槽位。用熟悉的方式编辑，输出 Typst。</p></div>
+    <section class="workbench" aria-label="公式编辑器">
+      <div class="toolbar">
+        <button id="undo" title="撤销 Ctrl+Z" aria-label="撤销">↶</button><button id="redo" title="重做 Ctrl+Y" aria-label="重做">↷</button>
+        <button id="clear" class="text-button">清空公式</button>
+        <button id="display-mode" class="text-button" aria-pressed="true" title="切换行内／行间公式">行间公式</button>
+      </div>
+      <div class="canvas-scroll"><div id="canvas" role="group" aria-label="可编辑公式"></div></div>
+      <div class="editor-footer"><span id="status" role="status">正在加载 Rust 核心…</span><span id="attachment-status" role="status" hidden></span><span id="position"></span></div>
+    </section>
+    <div class="quick-help"><span><kbd>\</kbd> 输入命令</span><span><kbd>Enter</kbd> 确认命令</span><span><kbd>Space</kbd> 退出结构</span><span><kbd>Tab</kbd> 循环槽位</span><button data-example="attachments">试用 limits / stretch</button></div>
+    <section class="source-card macro-manager" aria-label="宏管理器">
+      <div class="card-heading"><h2>宏定义 · Typst let</h2><div><button id="macro-example">载入宏示例</button><button id="macro-add">添加定义</button><button id="macro-reset">还原列表</button><button id="macro-apply" class="primary">应用修改</button></div></div>
+      <p>按顺序编辑源码并应用。可展宏显示参数输入框；不可展宏作为 Typst 渲染上下文。定义与公式一起导出。</p>
+      <div id="macro-list"></div><p id="macro-status" role="status"></p>
+    </section>
+    <div class="below">
+      <section class="source-card"><div class="card-heading"><h2>Typst 源码</h2><div><button id="copy">复制</button><button id="download">下载 .typ</button><button id="import">导入公式</button></div></div><textarea id="source" readonly spellcheck="false" aria-label="导出的 Typst 源码"></textarea><p>本原型编辑一个公式及其函数定义。源码在需要导入或输出时转换。</p></section>
+      <aside><h2>试一试</h2><button class="example" data-example="blank"><strong>从空白开始</strong><span>输入 \frac，回车后填分子、分母</span></button><button class="example" data-example="mixed"><strong>结构与 SVG</strong><span>分式保留槽位，dif 单独编译</span></button><button class="example" data-example="matrix"><strong>矩阵与上下标</strong><span>Tab 切换格子，上下键按列移动</span></button><button class="example" data-example="fallback"><strong>Typst 渲染</strong><span>未知结构生成 SVG，整块移动和删除</span></button><div class="matrix-tools"><button id="row">增加一行</button><button id="column">增加一列</button></div></aside>
+    </div>
+    <details><summary>移植范围与当前限制</summary><p>Rust 核心移植 MathData、CursorSlice、命令输入、分式/根式/上下标导航、删除的主要分支。浏览器仅负责绘制、测量与事件转发。尚未完整移植 Qt 字体度量、所有公式 inset、数学自动纠错、RTL 与多行公式环境；目前不是 LyX 全量一比一替代品。</p></details>
+  </main>
+  <textarea id="keyboard" aria-label="公式输入" autocapitalize="off" autocomplete="off" spellcheck="false"></textarea><div id="caret" hidden></div><div id="completions" role="listbox" aria-label="公式命令补全" hidden></div>
+  <dialog id="import-dialog"><form id="import-form"><h2>导入 Typst 公式</h2><p>可直接粘贴公式体，或一个 $…$ 公式及其 #let 函数定义。</p><textarea id="import-source" aria-label="待导入的 Typst 源码" spellcheck="false"></textarea><p id="import-error"></p><div class="actions"><button type="button" data-close="import-dialog">取消</button><button class="primary">载入</button></div></form></dialog>
+  <dialog id="help-dialog"><h2>沿用 LyX 的操作方式</h2><dl><dt>\ 或 Ctrl+Space</dt><dd>开始输入命令或 Typst 公式，如 frac、alpha 或 frac(a, b)。草稿以蓝色直体显示，只有 Enter 才转换为公式。</dd><dt>Enter / Tab</dt><dd>命令输入中，Enter 确认命令或解析完整表达式；Tab 和点击候选只填入补全，不退出输入。普通公式中的 Enter 不换行。</dd><dt>空格</dt><dd>命令输入中，空格和括号按原样保留，不触发确认。普通公式中空格退出当前结构，文本槽中则输入空格。</dd><dt>← → / ↑ ↓</dt><dd>命令输入中，左右键移动草稿光标，上下键选择候选，边界处也不退出。普通公式中进入/退出嵌套结构，分式上下切换，矩阵按列移动。</dd><dt>Tab / Shift+Tab</dt><dd>在当前对象的槽位中循环；单槽对象则退出。分母之后回到分子。</dd><dt>^ / _</dt><dd>进入或创建左侧对象的上/下标。选中文字会进入标注内容。</dd><dt>Esc</dt><dd>取消命令输入或选区；否则退出一层结构。</dd><dt>Backspace</dt><dd>大对象先选中再删除；在槽开头按退格，会去掉外层结构并保留当前槽内容。</dd><dt>普通输入</dt><dd>字符逐个插入，不合并运算符，也不触发 SVG。单字符配置可直接改变显示字形，源码不变；多字符键仅在命令确认或导入时匹配。保留 /、^、_ 等结构快捷键，草稿和字符串仍显示原文。</dd><dt>字符模式</dt><dd>输入 &quot; 开始，另一个 &quot; 或 Enter 结束。字符串带浅色边框，空字符串也可见。空格、运算符与反斜杠作为文本保留。命令草稿中 Enter 先闭合字符串，再次 Enter 才提交命令。</dd><dt>/ 与换行对齐</dt><dd>普通公式中 / 将选区或左侧对象放入分子，并进入分母。命令中 a/b 按 Typst 语法解析；草稿中的单个反斜杠换行，& 划分对齐槽，列按右、左交替对齐，&& 保留空槽。Tab 切换槽位，上下键按列移动。</dd><dt>SVG 公式</dt><dd>结构树中每个未知子表达式对应一个 SVG，其外层分式等结构仍可编辑。浅色边框标明范围，空 SVG 也可见。方向键跨过，Backspace/Delete 整块删除；支持撤销。编译失败时保留源码，从左侧按 → 或右侧按 ← 可进入失败块源码，也可点击“编辑”；修改后回车重试，Esc 恢复原文。</dd><dt>复制 / 粘贴</dt><dd>复制选区得到 Typst 源码；粘贴进入命令模式，保留剪贴板原文，Enter 后才解析。Esc 取消并恢复被替换的选区。已有草稿时粘贴到草稿光标处。</dd></dl><p>普通公式中的第一个反斜杠唤起命令输入；草稿中的反斜杠按 Typst 语法处理，单个反斜杠表示换行。使用 \alpha 输入符号，直接键入 alpha 则表示五个数学字母。</p><div class="actions"><button class="primary" data-close="help-dialog">开始编辑</button></div></dialog>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

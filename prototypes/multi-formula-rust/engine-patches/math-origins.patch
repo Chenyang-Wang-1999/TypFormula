@@ -1,0 +1,62 @@
+diff --git a/crates/typst-eval/src/math.rs b/crates/typst-eval/src/math.rs
+index 64235078c..0a6335013 100644
+--- a/crates/typst-eval/src/math.rs
++++ b/crates/typst-eval/src/math.rs
+@@ -1,4 +1,5 @@
+ use ecow::eco_format;
++use typst_library::World;
+ use typst_library::diag::{At, SourceResult};
+ use typst_library::foundations::{Content, NativeElement, Symbol, SymbolElem, Value};
+ use typst_library::math::{
+@@ -179,6 +180,24 @@ trait ExprExt {
+ 
+ impl ExprExt for ast::Expr<'_> {
+     fn eval_display(&self, vm: &mut Vm) -> SourceResult<Content> {
+-        Ok(self.eval(vm)?.display().spanned(self.span()))
++        let content = self.eval(vm)?.display().spanned(self.span());
++        if !vm.world().editor_math_origin(self.span()) {
++            return Ok(content);
++        }
++        // visual-typst source provenance: zero-size existing math tags, not a
++        // box (which would change atom classes, spacing, or stretch behaviour).
++        // These markers are not queryable and never become visible SVG nodes.
++        use typst_library::introspection::{Location, MetadataElem, Tag, TagElem, TagFlags};
++        let key = typst_utils::hash128(&("visual-typst-origin-v1", self.span()));
++        let location = Location::new(key);
++        let mut marker = MetadataElem::new(Value::Str("visual-typst-origin-v1".into()))
++            .pack().spanned(self.span());
++        marker.set_location(location);
++        let flags = TagFlags { introspectable: false, tagged: false };
++        Ok(Content::sequence([
++            TagElem::packed(Tag::Start(marker, flags)),
++            content,
++            TagElem::packed(Tag::End(location, key, flags)),
++        ]))
+     }
+ }
+diff --git a/crates/typst-library/src/lib.rs b/crates/typst-library/src/lib.rs
+index 21d733e00..1c2fb8089 100644
+--- a/crates/typst-library/src/lib.rs
++++ b/crates/typst-library/src/lib.rs
+@@ -95,6 +95,10 @@ pub trait World: Send + Sync {
+     /// If this function returns `None`, Typst's `datetime` function will
+     /// return an error.
+     fn today(&self, offset: Option<Duration>) -> Option<Datetime>;
++
++    /// Opt-in editor provenance. Default worlds retain normal compilation.
++    /// Tracked per span, so enabling a target participates in cache validation.
++    fn editor_math_origin(&self, _span: typst_syntax::Span) -> bool { false }
+ }
+ 
+ macro_rules! world_impl {
+@@ -127,6 +131,10 @@ macro_rules! world_impl {
+             fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
+                 self.deref().today(offset)
+             }
++
++            fn editor_math_origin(&self, span: typst_syntax::Span) -> bool {
++                self.deref().editor_math_origin(span)
++            }
+         }
+     };
+ }

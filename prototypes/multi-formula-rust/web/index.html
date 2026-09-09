@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>多公式文档原型</title>
+  <link rel="stylesheet" href="/document.css">
+  <link rel="stylesheet" href="/document-editor.css">
+</head>
+<body>
+  <header>
+    <div><span class="logo">∑</span><strong>多公式文档原型</strong><span class="badge">Typst · 编辑投影</span></div>
+    <span id="engine-status">正在准备文档编译会话…</span>
+  </header>
+  <main>
+    <section class="instructions">
+      <h1>在文档光标处插入公式或宏。</h1>
+      <p>公式是文档内的可编辑细框，可用方向键进出，也可随时点击正文或其他公式继续编辑。公式里用 \ 输入命令；Enter 只切换到 SVG 预览，点击 SVG 返回显示模式。</p>
+    </section>
+    <nav class="insert-bar" aria-label="插入工具">
+      <button id="add-macro">＋ 添加宏</button>
+      <button id="add-inline">＋ 添加行内公式</button>
+      <button id="add-display">＋ 添加行间公式</button>
+      <button id="refresh-preview">全部更新 SVG</button>
+      <span id="document-status" role="status">尚未更新</span>
+    </nav>
+    <section id="document-page" contenteditable="true" spellcheck="false" aria-label="Typst 文档编辑区"></section>
+    <section class="inspectors">
+      <article>
+        <h2>Typst 文档源码 · Enter 应用，Shift+Enter 换行</h2>
+        <textarea id="document-source" spellcheck="false" aria-label="完整文档源码"></textarea>
+      </article>
+      <article>
+        <h2>当前公式的可见宏定义</h2>
+        <textarea id="formula-context" readonly placeholder="激活一个公式后显示它能看到的 let"></textarea>
+      </article>
+    </section>
+    <section class="compiled-document">
+      <div class="preview-heading"><h2>全文档预览 · 实时编译；编辑框 SVG 按需更新</h2></div>
+      <div id="document-preview" aria-label="Typst 全文编译结果"></div>
+    </section>
+    <details>
+      <summary>原型限制</summary>
+      <p>可以同时展开多个公式；失焦不会强制转成预览。宏和 Raw 源码草稿按 Enter 应用，Shift+Enter 换行，不阻止在其他区域编辑。缓存由后端保留，在创建节点、提交 Raw 源码或切换模式时刷新相应公式；改宏或 show 后可点“全部更新 SVG”（也会重新读取依赖）。全文预览始终自动编译。未完成源码保留局部修复框及旧 SVG；没有独立输出或跨页的片段可能只有源码占位。编辑仅保存在会话中，请复制源码保存。</p>
+    </details>
+  </main>
+  <script type="module" src="/document.js"></script>
+</body>
+</html>
