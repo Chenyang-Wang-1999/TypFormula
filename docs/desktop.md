@@ -31,6 +31,8 @@ python -m pip install -r desktop/requirements.txt  # 已安装 PyQt5 时无需�
 | 源码栏、大纲 | 视图 → 显示源码栏；大纲按 Typst AST 标题生成，点击定位 |
 | PDF 编译 | F5 或工具栏“编译 PDF 并打开”；写入临时文件后调用系统默认 PDF 阅读器 |
 | 字号 | Ctrl+滚轮，或视图菜单；改变编辑显示，不改文章字号 |
+| 上下标与空槽 | 上下标按 Typst 的移位绘制（上标在基线上方 .36 em、下标在下方 .25 em）；空的可编辑槽画成虚线方框（`\frac` + Enter 后分子分母各一个）|
+| 行间公式 | 独占一行的行间公式整行居中，与 Typst 的块级公式一致；与正文同行的保持左对齐 |
 | Tinymist | 真实语义高亮、输入后补全提示、Ctrl+Space 补全、格式化；异步结果核对文档版本 |
 | 粗体、斜体、颜色 | 保留源码标记并按 AST 加粗/倾斜；编译后把 Typst 实际纯色文字样式映射回源区间 |
 | 选区 | Qt 原生 Shift+方向键和鼠标选区包括公式对象；公式内用共享结构光标进行选区 |
@@ -59,6 +61,12 @@ Raw SVG 按可见公式/活动公式按需加载。每个 Raw 的源码区间由
 
 编辑器里的片段图一律以**黑色**栅格化（`desktop/svg.py` 的单色转换 + `BitmapCache`）：片段是从文档里切出来的图，而文档可能把数学排成白色（幻灯片主题常见），浅色编辑区上就看不见了。导出 PDF/SVG 用的是原始 SVG，文档颜色照旧保留。
 
+公式内的字形分两类，字体也随之分两类：识别出的数学原子用数学字体（`math_font`），而**命令草稿和 Raw 源码用编辑器正文字体**（`mathview.py::source_run`）。草稿是正在输入的 Typst 源码，跟编译出来的字形不是一回事，用正文字体读起来才像在打字；字符串模式共用同一条绘制路径。空的可编辑槽（新建 `\frac` 的分子分母、矩阵空格、空公式本身）不再画 `□` 字符，而是画**虚线方框**（`empty-cell` → `("slot", …)`），宽度约 .45 em、高度一行。方框**保留该槽自己的 stop**：光标画在方框里，点击/上下键也能靠这个位置进入它——位置丢失的话，核心的 `move_vertical` 找不到落点，光标就会停在公式外层（`desktop/test_desktop.py::test_the_caret_survives_inside_an_empty_slot`）。
+
+上下标位置取自 Typst 自己：从编译出的 SVG 里读出 `x^2`、`x_1` 的基线差，得到上标 `.36 em`、下标 `.25 em`（相对基底基线，基底字号为 em）。基底是**组合对象**（分式、根式、定界符、片段图）时还有真实的高度/基线，于是按 Typst 的 `max(shift, ascent − drop)` 让脚标躲开它；基底是**单个字符**时只有行盒度量（带 leading），就用固定移位。改动前下标是按"脚标自身的上伸部"放的，实测落到基线下约 .6 em，看起来偏右下；现在与编译结果一致（`desktop/test_desktop.py::test_side_scripts_follow_the_shifts_the_compiler_uses` 断言 .25 em / .36 em，误差 1px 内）。
+
+源码栏与编辑器**逐行对齐**：两边用同一份文本，但编辑器把每个公式换成一个占位字符，于是带高公式的行更高。`Window.sync_source_lines` 让源码栏使用与编辑器相同的文档默认字体、相同的顶部偏移（`documentMargin` 补上编辑器样式表的 16px 内边距），并把编辑器**实测**的每行高度按 `MinimumHeight` 写进源码栏（编辑器尚未布局时退回"公式盒高 + 6"的估算）。因为行高逐一相等，两栏的滚动值可以直接对应，`Window.mirror_scroll` 让滚动任意一栏另一栏跟随。源码栏因此是 `QTextEdit` 而不是 `QPlainTextEdit`：后者的文档布局忽略块行高。
+
 编辑区左侧行号按原始 Typst 源文件编号；折叠多行内容时允许行号跳号。行号背景使用 QTextDocument 的实际文本块边界，公式、矩阵和分式会自然撑高其所在行。静态公式行不设固定高度上限。
 
 ## 实现和边界
@@ -70,6 +78,8 @@ Raw SVG 按可见公式/活动公式按需加载。每个 Raw 的源码区间由
 Qt 5 的 SVG Tiny 加载器不支持 Typst 输出中的 glyph `<symbol>`，会报告 `qt.svg: link #g… is undefined`。`desktop/svg.py` 仅在 Raw 和显式 SVG 导出的 Qt 加载边界做兼容转换。PDF 直接由 Typst 生成，不经过这个 SVG 适配。
 
 `src/desktop.rs` 在生成静态投影时保存并恢复活动会话，宏定义中的不可展开公式留在源码中。普通输入与结构编辑都由窗口的完整源码历史负责撤销。后台编译、预热和 LSP 不进入撤销栈。
+
+每个窗口有自己的三个辅助进程：`--desktop-core`（一个文档与一个活动公式会话）、两个 `--stdio`（预览、取图、LSP）；取图用的 Typst 引擎与 Tinymist 再由对应的 `--stdio` 惰性启动。它们之间没有端口、锁文件或共享临时路径，因此同时开两个 desktop 时互不影响。**超时不再杀进程**：`set_source`、`analyze` 这类要先解析整份文档的请求各有自己的预算（`desktop/bridge.py` 的 `BUDGETS`，其余动作仍是短预算），核心超时或退出时窗口会重启它、按最后确认的源码重放 `set_source`（并恢复当时打开的公式会话）后再重试该请求一次，只有两次都失败才报错；报错文本带上动作名、退出码和核心 stderr 尾部，`--stdio` 后端退出后也由下一次请求自动重启。旧实现对所有动作统一用 5 秒死线并在超时时 `kill` 核心，一次慢回复就让该窗口的公式服务整场不可用（`desktop/test_desktop.py::BridgeTest`）。
 
 公式投影在首次载入时建立索引。后续源码编辑由常驻 `typst_syntax::Source::edit` 增量重解析；Typst 返回实际重解析范围，桌面端平移范围外公式的 UTF-8 区间和渲染标记，只重建与该范围相交的公式。轻量语法扫描不创建公式编辑器。修改 `let` 会额外使其后的宏投影失效，以保持定义捕获正确。首次载入和局部重建直接把常驻 Source 中已有的 Equation `SyntaxNode` 交给结构转换器，不再把公式切成字符串后二次解析。预览引擎位于另一个进程，无法共享同一个内存节点；它也长期保存自己的 Source 并增量更新。
 
@@ -92,4 +102,4 @@ python -m unittest desktop.test_desktop -v
 cargo test --offline --locked --test desktop
 ```
 
-Qt 测试使用 `QT_QPA_PLATFORM=offscreen`，不打开可见应用窗口。覆盖实际键盘输入、选区复制、公式替换、跨栏同步、撤销、不可展开宏、预热缓存、字号比值、公式字体解析（含"未安装的家族名不得进入布局"）、无图片段的左右进入与标注、超宽公式、绝对路径文件、真实 Tinymist 高亮、预览定位数据及多页导出。原生绘图截图位于 `target/desktop-test.png`。
+Qt 测试使用 `QT_QPA_PLATFORM=offscreen`，不打开可见应用窗口。覆盖实际键盘输入、选区复制、公式替换、跨栏同步、撤销、不可展开宏、预热缓存、字号比值、公式字体解析（含"未安装的家族名不得进入布局"）、无图片段的左右进入与标注、超宽公式、绝对路径文件、真实 Tinymist 高亮、预览定位数据及多页导出。原生绘图截图位于 `target/desktop-test.png`。`desktop/test_desktop.py::BridgeTest` 用脚本书写的子进程替身覆盖辅助进程的预算、重启与源码重放，不需要 Rust 后端。

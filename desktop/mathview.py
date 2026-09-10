@@ -92,9 +92,17 @@ class Typesetter:
             self.lines.clear()
         return self.math_family
 
+    def style_size(self, factor):
+        """Point size of one math style: script levels step down, never below .55."""
+        return self.settings["font_size"] * max(.55, factor)
+
+    def style_em(self, factor, metrics):
+        """One em of this style in device pixels, for the ratios Typst reports in em."""
+        return self.style_size(factor) * metrics.fontDpi() / 72
+
     def line(self, factor):
         """(font, metrics, height, ascent, descent) of one math style's line box."""
-        size = self.settings["font_size"] * max(.55, factor)
+        size = self.style_size(factor)
         entry = self.lines.get(size)
         if entry is None:
             font = QFont(self.settings.get("font_family") or "")
@@ -152,6 +160,16 @@ class Typesetter:
         children = node.get("children", [])
         if kind == "absent":
             return Box(0,0,0)
+        if kind == "empty-cell":
+            # An empty editable slot is drawn as a hole, not as a glyph: after
+            # `\frac` + Enter the numerator and denominator must show where the
+            # content goes (LyX draws the same dashed box). The cell's own stop is
+            # folded in, so the caret can still sit inside the box.
+            width=max(6,em*.45);height=em
+            box=Box(width,height,ascent,[("slot",0,0,(width,height))])
+            for child in children: box.add(self.layout(child,factor,text_mode),0,0)
+            if node.get("selected"): box.operations.insert(0,("selection",0,0,(box.width,box.height)))
+            return box
         if kind == "stop":
             return Box(2,em,ascent,stops=[(1,0,em,node["cursor"],node.get("active",False))])
         if kind == "raw":
@@ -176,9 +194,12 @@ class Typesetter:
                 return box
         if not children:
             text = node.get("display_glyph") or node.get("text", "")
-            if kind == "empty-cell": text = "□"
             if kind == "draft-caret": text = "│"
-            if kind == "raw": glyph, draw_font, width = self.source_run(text, factor)
+            if kind in ("raw","draft-text","draft-placeholder","draft-caret"):
+                # Raw fragments and command drafts are Typst source, not math: they
+                # keep the editor's own font, so a half-typed command reads like the
+                # text around the formula instead of like the compiled glyphs.
+                glyph, draw_font, width = self.source_run(text, factor)
             else: glyph, draw_font, width = self.run(text, factor, text_mode)
             box = Box(width,em,ascent,[("text",0,ascent,(glyph,draw_font,kind))])
             if kind == "raw": box.raws.append((QRectF(0,0,width,em),node))
@@ -202,14 +223,41 @@ class Typesetter:
             up,down = [self.layout(child,factor*.7) for child in children[1:3]]
             placement=node.get("_placement") or {}
             centered_up=placement.get("upper")=="limits";centered_down=placement.get("lower")=="limits"
-            core_width=max(base.width,up.width if centered_up else 0,down.width if centered_down else 0)
-            side_width=max(0 if centered_up else up.width,0 if centered_down else down.width)
-            lift=up.height+2 if centered_up else max(0,up.height-base.height*.4)
-            down_y=lift+base.height+2 if centered_down else lift+base.baseline
-            box=Box(core_width+side_width,max(lift+base.height,down_y+down.height),lift+base.baseline)
-            box.add(base,(core_width-base.width)/2,lift)
-            box.add(up,(core_width-up.width)/2 if centered_up else core_width,0)
-            box.add(down,(core_width-down.width)/2 if centered_down else core_width,down_y)
+            if not (centered_up or centered_down):
+                # Side scripts use Typst's own shifts for the bundled font, measured
+                # from the compiled SVG of `x^2` and `x_1`: a superscript's baseline
+                # sits .36 em above the base's baseline and a subscript's .25 em below
+                # it. A composed base (fraction, root, delimiter, fragment image) has
+                # its real geometry, so the script clears its ascent/descent the way
+                # Typst's `max(shift, ascent - drop)` does; a single glyph has only
+                # the line box's metrics, which are leading-inflated, so it keeps the
+                # flat shift. Before this the subscript was put on its own ascent,
+                # which dropped it ~0.6 em instead of .25 em.
+                em=self.style_em(factor,metrics)
+                atoms=[child for child in children[0].get("children",[]) if child.get("kind")!="stop"]
+                leaf=len(atoms)==1 and atoms[0].get("kind") in ("char","symbol","text","empty-cell")
+                ascent=0.0 if leaf else base.baseline
+                descent=0.0 if leaf else base.height-base.baseline
+                rise=max(em*.36,ascent-em*.4)
+                drop=max(em*.25,descent+em*.05)
+                lift=max(0,rise+up.baseline-base.baseline)
+                baseline=lift+base.baseline
+                up_y=baseline-rise-up.baseline
+                down_y=baseline+drop-down.baseline
+                box=Box(base.width+max(up.width,down.width),
+                        max(lift+base.height,up_y+up.height,down_y+down.height),baseline)
+                box.add(base,0,lift)
+                box.add(up,base.width,up_y)
+                box.add(down,base.width,down_y)
+            else:
+                core_width=max(base.width,up.width if centered_up else 0,down.width if centered_down else 0)
+                side_width=max(0 if centered_up else up.width,0 if centered_down else down.width)
+                lift=up.height+2 if centered_up else max(0,up.height-base.height*.4)
+                down_y=lift+base.height+2 if centered_down else lift+base.baseline
+                box=Box(core_width+side_width,max(lift+base.height,down_y+down.height),lift+base.baseline)
+                box.add(base,(core_width-base.width)/2,lift)
+                box.add(up,(core_width-up.width)/2 if centered_up else core_width,0)
+                box.add(down,(core_width-down.width)/2 if centered_down else core_width,down_y)
         elif kind in ("grid","aligned"):
             cells=[self.layout(child,factor) for child in children]
             columns=max(1,node.get("columns",1));rows=(len(cells)+columns-1)//columns
@@ -280,6 +328,13 @@ class Typesetter:
                 painter.setPen(QPen(QColor("#b3654e"),1,Qt.DashLine))
                 painter.drawRoundedRect(QRectF(px-.5,py+1,width+1,max(2,height-2)),2,2)
                 painter.setBrush(Qt.NoBrush)
+            elif kind == "slot":
+                # An empty slot is a hole: a dashed box with no fill, so the caret
+                # inside it stays readable.
+                width,height=value
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor("#a9b4c0"),1,Qt.DashLine))
+                painter.drawRect(QRectF(px+.5,py+.5,max(1,width-1),max(1,height-1)))
             elif kind == 'mode':
                 width,height,mode=value
                 painter.setBrush(QColor('#fff8e9' if mode=='string' else '#edf4ff'))

@@ -5,7 +5,7 @@ import re
 import base64,tempfile
 from pathlib import Path
 from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSizeF, QUrl
-from PyQt5.QtGui import QFont, QKeySequence, QTextCursor, QTextCharFormat, QPainter, QPdfWriter, QPageSize, QPageLayout, QCursor, QDesktopServices
+from PyQt5.QtGui import QFont, QKeySequence, QTextCursor, QTextCharFormat, QTextBlockFormat, QPainter, QPdfWriter, QPageSize, QPageLayout, QCursor, QDesktopServices
 from PyQt5.QtSvg import QSvgWidget, QSvgRenderer
 from PyQt5.QtWidgets import (QApplication,QMainWindow,QWidget,QSplitter,QDockWidget,QTreeWidget,QTreeWidgetItem,
     QPlainTextEdit,QScrollArea,QVBoxLayout,QAction,QFileDialog,QMessageBox,QInputDialog,QDialog,QDialogButtonBox,
@@ -62,6 +62,8 @@ class Window(QMainWindow):
         self.raw_signature=None
         # (revision, fragments) of the last failed render request, if any.
         self.raw_error=None
+        # Source lines whose height the dock copies from the editor, by block number.
+        self.source_line_heights={}
         self.formula_serial=0;self.last_reparsed=None
         self.core=Core(self);self.services=None;self.lsp=None;self.workspace=None
         screen=screen or QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
@@ -70,12 +72,12 @@ class Window(QMainWindow):
         self.setWindowTitle("Visual Typst")
         self.splitter=QSplitter();self.setCentralWidget(self.splitter)
         self.editor=Editor(self);self.editors=[self.editor];self.splitter.addWidget(self.editor)
-        self.source_view=SourceEditor();self.source_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.source_view=SourceEditor();self.source_view.setLineWrapMode(QTextEdit.NoWrap)
         self.source_dock=QDockWidget("Typst 源码",self);self.source_dock.setWidget(self.source_view)
         self.addDockWidget(Qt.RightDockWidgetArea,self.source_dock);self.source_dock.hide()
         # Token colours are applied per visible view; open the dock and it is
         # coloured at once instead of paying for a hidden widget on every reply.
-        self.source_dock.visibilityChanged.connect(lambda _:self.apply_highlights())
+        self.source_dock.visibilityChanged.connect(lambda _:(self.apply_highlights(),self.sync_source_lines()))
         self.source_view.textChanged.connect(self.source_changed)
         self.outline=QTreeWidget();self.outline.setHeaderHidden(True)
         dock=QDockWidget("大纲",self);dock.setWidget(self.outline);self.addDockWidget(Qt.LeftDockWidgetArea,dock)
@@ -97,6 +99,8 @@ class Window(QMainWindow):
         for editor in self.editors:
             editor.verticalScrollBar().valueChanged.connect(self.reposition_math)
             editor.verticalScrollBar().valueChanged.connect(lambda _:self.raw_timer.start())
+            editor.verticalScrollBar().valueChanged.connect(lambda _,editor=editor:self.mirror_scroll(editor))
+        self.source_view.verticalScrollBar().valueChanged.connect(lambda _:self.mirror_scroll(self.source_view))
         self.loading=False;self.load(path)
         Window.windows.append(self)
 
@@ -184,6 +188,59 @@ class Window(QMainWindow):
                 item=QTreeWidgetItem([style["text"].strip()]);item.setData(0,Qt.UserRole,style["start"]);self.outline.addTopLevelItem(item)
         self.setWindowTitle(("* " if self.source!=self.saved else "")+(self.path.name if self.path else "未命名.typ")+" — Visual Typst")
         self.loading=False;self.reposition_math();self.apply_highlights()
+        self.loading=True;self.sync_source_lines();self.loading=False
+
+    def mirror_scroll(self,source):
+        """Keep the dock and the editor on the same lines.
+
+        `sync_source_lines` gives both panes the same line heights, so their scroll
+        values are directly comparable: whichever pane is scrolled, the other follows.
+        The equality check ends the ping-pong after one step.
+        """
+        target=self.editor if source is self.source_view else self.source_view
+        value=source.verticalScrollBar().value()
+        if target.verticalScrollBar().value()!=value:target.verticalScrollBar().setValue(value)
+
+    def sync_source_lines(self):
+        """Put the source dock's lines on the editor's lines.
+
+        Both panes show the same text, but the editor replaces each formula with one
+        placeholder, so a line carrying a tall formula is taller there. The dock gets
+        the editor's document font, the editor's top offset, and the height each such
+        line needs, which is what makes source line N land at the same place in both.
+        Only the lines that need it are touched, so this stays proportional to the
+        formulas on screen rather than to the document.
+        """
+        dock=self.source_view;editor=self.editor
+        font=QFont(self.settings["font_family"]);font.setPointSizeF(self.settings["font_size"])
+        if dock.document().defaultFont().family()!=font.family() or dock.document().defaultFont().pointSizeF()!=font.pointSizeF():
+            dock.document().setDefaultFont(font)
+        top=editor.viewport().mapTo(editor,editor.viewport().rect().topLeft()).y()+editor.document().documentMargin()
+        margin=top-dock.viewport().mapTo(dock,dock.viewport().rect().topLeft()).y()
+        if dock.document().documentMargin()!=margin:dock.document().setDocumentMargin(max(0,margin))
+        heights={}
+        for formula in self.analysis.get("formulas",[]):
+            if not formula.get("view"):continue
+            line=self.source.count('\n',0,from_byte(self.source,formula["start"]))
+            heights[line]=max(heights.get(line,0),editor.handler.box(formula).height+6)
+        # A text line can differ too: a bold heading falls back to a CJK face with a
+        # taller line than the dock's plain text. Copy what the editor measured, so
+        # every line below it stays on the same ruler. An unlaid-out document (a
+        # hidden window) reports zero heights and keeps the formula estimate.
+        layout=editor.document().documentLayout()
+        block=editor.document().begin()
+        while block.isValid():
+            height=layout.blockBoundingRect(block).height()
+            if height>0:heights[block.blockNumber()]=max(heights.get(block.blockNumber(),0),int(height+0.5))
+            block=block.next()
+        for line in set(self.source_line_heights)|set(heights):
+            block=dock.document().findBlockByNumber(line)
+            if not block.isValid():continue
+            wanted=int(round(heights.get(line,0)))
+            if self.source_line_heights.get(line)==wanted:continue
+            fmt=block.blockFormat();fmt.setLineHeight(wanted,QTextBlockFormat.MinimumHeight)
+            cursor=QTextCursor(block);cursor.setBlockFormat(fmt)
+        self.source_line_heights=heights
 
     def focused_editor(self):
         focus=QApplication.focusWidget()
@@ -382,6 +439,7 @@ class Window(QMainWindow):
             editor=Editor(self);self.editors.append(editor);self.splitter.addWidget(editor);editor.project((0,0))
             editor.verticalScrollBar().valueChanged.connect(self.reposition_math)
             editor.verticalScrollBar().valueChanged.connect(lambda _:self.raw_timer.start())
+            editor.verticalScrollBar().valueChanged.connect(lambda _,editor=editor:self.mirror_scroll(editor))
 
     def change_font(self,delta):
         self.settings["font_size"]=max(6,min(72,self.settings["font_size"]+delta));self.project()

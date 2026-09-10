@@ -447,4 +447,163 @@ if p.directly_at(SyntaxKind::LeftParen) || p.directly_at(SyntaxKind::LeftBracket
 
 改动文件：`src/typst.rs`（`write_cell`）、`tests/structured_input.rs`（两条旧断言 + 新增 `a_separator_keeps_typed_characters_from_becoming_one_shorthand`）、`tests/source_modes.rs`（一条断言），以及 `web/core.wasm`、`extensions/vscode/media/` 两个构建产物。
 
+# 桌面端显示细项：命令字体、空槽、行间居中、上下标、源码栏对齐 · 2026-09-10
+
+五项前端调整，全部只改 `desktop/`，核心与适配器未动。
+
+## 1. 命令草稿用编辑器字体
+
+`mathview.py` 的 `source_run`（Raw 源码用的"编辑器正文字体"路径）现在也覆盖草稿节点（`draft-text` / `draft-placeholder` / `draft-caret`）。实测键入 `\alph` 后画布的操作：
+
+```
+mode command  at 2.0,0.0 size 51.0x22.0
+text 'a' at 6.0,16.0 font=Consolas    （改前是 NewComputerModern Math）
+text 'l' … text 'p' … text 'h' … text '│' 全部 font=Consolas
+```
+
+草稿是正在输入的 Typst 源码，和编译出的字形不是一回事；字符串模式共用这条路径。
+
+## 2. 空编辑块画成虚线方框
+
+`empty-cell` 视图以前画的是 `□` 字符，现在是 `("slot", …)` 操作，画成虚线矩形（宽 ≈ .45 em、高一行），光标进去时竖线光标落在框内。实测 `\frac` + Enter（源码 `$frac("", "")$`）：
+
+```
+slot (dash) at 6.0,0.0  size 7.2x16.0     ← 分子
+slot (dash) at 6.0,22.0 size 7.2x16.0     ← 分母
+```
+
+静态投影同样生效：`$frac("", "")$` 的文档视图里也是两个方框。矩阵空格、空公式本身同理。
+
+**回归与修复**：第一版把 `empty-cell` 直接 `return` 了一个只有方框的 Box，把该槽自己的 `stop` 丢了——实测 `$ $` 的 `box.stops` 变成空表，`$frac("", "")$` 只剩公式外层的两个 stop（分子、分母的都没了），于是画布上光标画不出来，核心那边也拿不到位置：`MathCanvas.refresh` 把 stops 发回核心，而 `move_vertical`（`src/cursor.rs:648`）正是按这份几何找落点，找不到就只能停在 `original.pos`，也就是"光标移进空编辑框就失去位置"。现在方框会把子节点（stop）折进同一个 Box（`box.add(self.layout(child,…),0,0)`），实测：
+
+| 源码 | 修复前 stops | 修复后 stops |
+| --- | --- | --- |
+| `$ $` | `[]` | `[(1, 0, active=True)]` |
+| `$frac("", "")$` | `[(1, 12.9), (18.2, 12.9)]`（只有公式外层） | 外层两个 + 分子 `(7, 0)`、分母 `(7, 22)` |
+| `$frac(a, "")$` | 外层 + 分子，**分母缺失** | 分母 `(9.4, 22)` 也在 |
+
+用例 `desktop/test_desktop.py::test_the_caret_survives_inside_an_empty_slot`：`\frac` + Enter 后两个空槽各有 stop、当前光标画在所在槽内；点击下槽后光标移到分母且仍可见。（把折入子节点的那行去掉，该用例报 `0 != 2`。）
+
+## 3. 行间公式整行居中
+
+`Editor.apply_alignment`：**独占一行**的 `display` 公式所在段落设为 `AlignHCenter`（Typst 的行间公式是块级元素，自己居中）；与正文同行的 display 公式保持左对齐——Typst 会把它断到单独一行，这个投影不会，所以居中一行含正文的段落只会把正文也拉过去。实测段落对齐值（Qt 枚举）：
+
+```
+block 5 alignment=4 text='￼'                 ← $ frac(a, b) = sum_(i = 1)^(n) x_i $，居中
+block 7 alignment=1 text='行内 ￼ 与 ￼ 混排'    ← 保持左对齐
+```
+
+## 4. 上下标位置：按编译器自己的移位
+
+先从 Typst 编译出的 SVG 里量出脚标的真实基线差（11pt 文档，`translate(x y)` 的 y 就是基线，页面 y 向下）：
+
+| 公式 | 基底基线 | 脚标基线 | 差值 |
+| --- | --- | --- | --- |
+| `$x^2$` | 7.513 | 3.520 | **−3.993 pt = −0.363 em**（上标） |
+| `$x_1$` | 7.513 | 10.230 | **+2.717 pt = +0.247 em**（下标） |
+| `$x_1^2$` | 7.513 | 3.4386 / 10.3114 | −0.370 em / +0.254 em |
+| `$sum_(n = 1)^(oo)$`（limits） | 7.513 | 2.013 / 12.463 | −0.500 em / +0.450 em |
+
+于是 `mathview.py` 的侧向脚标改成：上标 `max(.36 em, ascent − .4 em)`、下标 `max(.25 em, descent + .05 em)`，`ascent`/`descent` 只在基底是**组合对象**（分式、根式、定界符、片段图）时取盒子的真实几何——单个字符的盒子是行盒度量（Qt 的 ascent 含 leading，约为字号 .94 倍），用了反而把脚标推远，所以单字符基底走固定移位。改动前下标是按脚标自身的上伸部放的，落到基线下约 .6 em，视觉上就是"偏右下"；
+
+清单里的下标移位实测（`font_size=12`，1 em = 16.67 px）：`$x_1$` 基线差 **4.17 px = .25 em**，`$x^2$` **6.00 px = .36 em**，与 Typst 的 .247 em / .363 em 一致（用例 `test_side_scripts_follow_the_shifts_the_compiler_uses`）。
+
+已知差别：Typst 还会按字体的 MATH 表把脚标**向左**收（`math_kern` 的 bottom-right/top-right 斜体修正），对箭头、伸缩字形这类基底可达 −0.68 em；编辑器只看得到片段图的宽高，拿不到角部 kern，因此脚标仍从基底的右边缘开始。这是"对箭头类基底仍略偏右"的原因。
+
+## 5. 源码栏与编辑器逐行对齐
+
+改动前：源码栏是 `QPlainTextEdit`，文档默认字体是应用字体（正文括号里的 CJK 回退到另一款字），顶部偏移 1px，而编辑器样式表有 16px 内边距；更关键的是编辑器把每个公式换成一个占位字符，带高公式的行高 45px 而源码栏一律 20px。实测第 9 行差 **约 59px**。
+
+改法（`Window.sync_source_lines` + `mirror_scroll`）：
+
+- 源码栏与编辑器用同一个**文档默认字体**（`document().setDefaultFont`），于是纯文本行的高度一致；
+- `documentMargin` 按"编辑器视口偏移 + 编辑器文档边距 − 源码栏视口偏移"算出来（实测 19 + 1 = 20 = 16 + 4），两栏顶行同高；
+- 把编辑器**实测**的每行高度以 `MinimumHeight` 写给源码栏对应块（编辑器尚未布局时退回"公式盒高 + 6"的估算，离屏测试走这条）；
+- 因为行高逐一相等，两栏滚动值可直接换算，滚动任意一栏另一栏跟随。
+
+源码栏因此从 `QPlainTextEdit` 改为 `QTextEdit`：**QPlainTextDocumentLayout 忽略块行高**（实测写入 `lineHeight=45/type=MinimumHeight` 后 `blockBoundingRect` 仍是 20），换成 `QTextEdit` 后行高生效。
+
+实测同一份文档十行的行顶（编辑器文档坐标 + 16px 内边距 vs 源码栏 1px 边框 + 19px 边距）：
+
+| 行 | 编辑器（屏幕） | 源码栏（屏幕） |
+| --- | --- | --- |
+| 1（标题，行高 25） | 20 | 20 |
+| 2 | 45 | 45 |
+| 3 | 65 | 65 |
+| 4 | 85 | 85 |
+| 5（行间公式，行高 45） | 105 | 105 |
+| 6 | 150 | 150 |
+| 7（行内公式，行高 44） | 170 | 170 |
+| 8 | 214 | 214 |
+| 9 | 234 | 234 |
+| 10 | 254 | 254 |
+
+## 本轮实测
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m unittest desktop.test_desktop` | 62 通过（离屏，22.9s，新增 6） |
+| `cargo test --offline --locked` | 87 通过，5 个本机服务集成用例忽略（未改核心） |
+| `npm test` | 27 通过（未改 Web 侧） |
+
+新增用例：`test_a_command_draft_is_drawn_in_the_editor_font`、`test_an_empty_slot_is_a_dashed_box`、`test_the_caret_survives_inside_an_empty_slot`、`test_a_display_formula_gets_a_centred_line`、`test_side_scripts_follow_the_shifts_the_compiler_uses`、`test_the_source_dock_lines_up_with_the_editor`。
+
+改动文件：`desktop/mathview.py`（草稿字体、空槽、脚标移位、`style_size`/`style_em`）、`desktop/editor.py`（`apply_alignment`、`SourceEditor` 改为 `QTextEdit`）、`desktop/window.py`（`sync_source_lines`、`mirror_scroll`、源码栏字体与边距）、`desktop/test_desktop.py`。
+
+# 公式核心的 5 秒死线 · 2026-09-10
+
+现象：同时开两个 desktop 时，第二个窗口弹出/提示「公式核心没有响应…Unknown error」，此后该窗口的公式服务一直唤不起来。
+
+## 定位：不是两个实例互斥
+
+`公式核心没有响应：` 全仓只出现在 `desktop/bridge.py:42`，条件是子进程**已经启动**却在 5 秒内没有吐出完整一行回复（启动失败会走 `waitForStarted` 的另一条报错）；`errorString()` 显示 `Unknown error`，说明那一刻进程还活着。
+
+先排除"两个实例抢同一份资源"。每个窗口自带 `--desktop-core` 与两个 `--stdio` 子进程，取图引擎与 Tinymist 再由各自的 `--stdio` 惰性启动；没有端口、锁文件、命名互斥或固定临时路径（唯一共用的是文档、设置文件和 `%LOCALAPPDATA%/typst/packages`，都不在公式链路上）。实测两个完整实例（含用户文档 `pygbz2d-details.typ`，61 公式，两侧都走完 载入 → 进入公式 → 取图 → 附件 → LSP）：
+
+| 观测 | A | B |
+| --- | --- | --- |
+| 核心 / 服务进程状态 | Running / Running | Running / Running |
+| 载入后取图缓存 / 被拒片段 | 41 / 0 | 41 / 0 |
+| `/api/attachments` | limits / limits | limits / limits |
+| 进入公式（stop 数） | 25 | 25 |
+| 状态栏报错、`raw_error` | 无 / None | 无 / None |
+
+单进程两窗口（文件 → 新窗口）同样正常：两个核心 PID 不同，各自进入公式都是 25 个 stop。**第二个实例并没有抢占第一个的资源。**
+
+## 测得的原因：最重的请求正好撞在统一的 5 秒死线上
+
+载入文档时窗口同步发两次核心调用（`desktop/window.py:167-168`：`set_source` + `analyze`）。用 1500 公式（67 KB）实测：
+
+| 场景 | `set_source` | `analyze` |
+| --- | --- | --- |
+| 单实例 | 0.03 s | 2.79 s |
+| 两实例同时载入（各 1500 公式） | 0.03 s | 3.85 s / 3.74 s |
+
+`analyze` 是超线性的（每个公式都要重扫它之前的整段源码，同一规模在本机更忙时曾量到约 7 s），而两个窗口同时载入还要叠加两边的整页编译、取图编译、两个 Tinymist，以及两个各自把系统字体全量载入的 Typst 引擎。第一个窗口载入时机器是空的，于是活了下来；第二个撞上这条对所有动作统一的 5 秒死线，`waitForReadyRead` 超时后 `Core.call` 直接 `kill()` 核心，而窗口没有任何重建路径——此后每次 `activate_formula` 都失败，表现就是"唤不起公式服务"。
+
+## 改动（`desktop/bridge.py`）
+
+| 项 | 改前 | 改后 |
+| --- | --- | --- |
+| 预算 | 所有动作统一 5 s | `set_source`/`analyze`/`analyze_formula`/`activate_formula`/`macro_warmup`/`preview_results` 各 60 s（`BUDGETS`），其余 10 s，可按实例覆盖 |
+| 超时 | `kill()` 子进程，该窗口此后再无公式服务 | 不杀进程；只有确实判定子进程退出时才报"已退出" |
+| 恢复 | 无 | 退出或超时后重启核心、重放 `set_source`（含当时打开的公式会话），再重试该请求一次 |
+| 报错 | `errorString()` ＝ `Unknown error` | 动作名 + 等待时长 / 退出码 + 核心 stderr 尾部（`Stderr` 只留最后 4 KB 中的三行） |
+| `--stdio` 后端 | 退出即整场不可用，必须重开窗口 | 下一次请求自动重启该子进程 |
+
+镜像之所以正确，是因为协议本身给了依据：每个会改动文档的回复都带完整 `source` 与 `active_range`（`src/document.rs::response`），`Core` 据此镜像源码与公式会话，所以重启后重放的是**当前**文档而不是载入时那一份；`analyze`/`scan` 不带 `active_range`，因此它们的回复不会把已打开的会话误判成"没有公式"。
+
+## 本轮实测
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m unittest desktop.test_desktop` | 67 通过（离屏，30.1s，新增 5） |
+| 两实例各载入 1500 公式（真实 Rust 核心） | 都成功：2.99 s / 2.88 s，镜像源码一致 |
+| 杀掉活窗口的核心后再调用（真实 Rust 核心） | 0.06 s 内重启并恢复：文档与公式会话都已重放（新 PID，`scan` 正常） |
+| `BridgeTest` | 5 例；其中一例故意慢 6.0 s（＞ 旧死线 5 s），改前会报「没有响应」 |
+
+新增用例（`desktop/test_desktop.py::BridgeTest`）：`test_a_slow_core_is_waited_for_instead_of_killed`、`test_a_core_that_died_mid_request_is_replaced_with_the_document_replayed`、`test_a_core_that_stopped_answering_is_replaced_instead_of_abandoned`、`test_a_core_that_keeps_failing_reports_the_request_and_its_stderr`、`test_a_backend_that_exited_is_replaced_for_the_next_request`。
+
+改动文件：`desktop/bridge.py`、`desktop/test_desktop.py`、`docs/desktop.md`。Rust 核心未改动，无需重建后端。
+
 

@@ -8,6 +8,10 @@ Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`�
 
 公式排版结果按视图缓存：`FormulaObject.box` 为每个视图保留一份 Box，Qt 在一次布局/绘制周期内对同一公式的 `intrinsicSize` 与 `drawObject` 调用因此只排版一次，鼠标命中判定复用同一结果。Raw SVG 或附件位置变化（`Typesetter.touch`）以及编辑字号、SVG 倍率、`math_font` 变化时缓存失效。片段位图一律按**黑色**栅格化（`desktop/svg.py` 的单色转换只在编辑器缓存这条路上启用）：片段是从文档里切出来的图，文档可能把数学排成白色，浅色编辑区上就看不见了；导出路径仍用原始 SVG。
 
+编辑器自己画的公式有三个约定，都与编译结果对齐：**脚标移位**取 Typst 的 `.36 em / .25 em`（从编译 SVG 的基线差量出），基底是组合对象时再按它的真实升降部让开；**空槽**（`empty-cell`）画成虚线方框而不是 `□` 字形，`\frac` + Enter 之后分子分母各一个，方框会把该槽的 stop 一起折进 Box，否则光标画不出来、核心的 `move_vertical` 也找不到落点；**独占一行的行间公式**整行居中（`Editor.apply_alignment` 设块的 `AlignHCenter`），与正文同行的保持左对齐，因为 Typst 会把块级公式断到单独一行而投影不会。命令草稿与 Raw 源码共用 `source_run`，都走编辑器正文字体：它们是待编译的源码，不是编译出的字形。
+
+源码栏（`SourceDock`）与编辑器**逐行对齐**：同一个文档默认字体、同一个顶部偏移，并把编辑器实测的每行高度以 `MinimumHeight` 写进源码栏的块（带高公式的行比纯文本行高）。行高逐一相等之后两栏的滚动值可以直接对应，`Window.mirror_scroll` 双向跟随。源码栏是 `QTextEdit` 而非 `QPlainTextEdit`：后者的文档布局忽略块行高。
+
 公式字体分两件事：**结构行度量**（em、基线、下降部）取编辑器正文字体，**字形**取数学字体。`desktop/mathfont.py` 注册随附字体并读回 Qt 报告的真实家族名，只在已安装的家族里解析设置里的 `math_font`；名字不存在时退回随附数学字体而不是交给 `QFont`，因为 Qt 的替换是静默的，随后逐字回退又会把多个设计混进同一个公式。数学字体本身不能提供行度量：`NewComputerModern Math` 必须容纳四层高的定界符，12pt 下报告 `ascent=99`、`height=185`，直接当行高会得到几乎空白的巨框。数学变量的字形来自 Unicode 数学斜体区间（`a→𝑎`、`h→ℎ`），与编译结果同一套字形；文本单元保持直立。
 
 每个 Raw 片段的源码区间由 `Document::annotate` 给出，它是"片段图像"与"源码"之间唯一的连接：桌面端与 Web 端都用 `render.raw` 的区间请求 Typst。规范序列化只用于估算位置——它补空格、把 `a/b` 写成 `frac(a, b)`——最终以"该区间里恰好是这段文本"为准，所以按自己习惯书写的公式同样出图。区间无法确定的片段退回源码显示并标出，核心允许左右键进入它的源码（`failed_previews` + `Action::PreviewResults`），这是它唯一的修复入口。

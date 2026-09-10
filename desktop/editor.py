@@ -19,7 +19,18 @@ def completion_key(editor,event):
         event.accept();return True
     return False
 
-class SourceEditor(QPlainTextEdit):
+class SourceEditor(QTextEdit):
+    """The raw source beside the editor.
+
+    A QTextEdit rather than a QPlainTextEdit: the document layout of a
+    QPlainTextEdit ignores block line heights, and the dock copies the editor's
+    per-line heights so that source line N sits at the same place in both panes.
+    """
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.setAcceptRichText(False);self.setUndoRedoEnabled(False)
+        self.setReadOnly(False)
+
     def keyPressEvent(self,event):
         if not completion_key(self,event):super().keyPressEvent(event)
 
@@ -125,6 +136,32 @@ class Editor(QTextEdit):
             if dirty is not None and formula['start']<dirty[1] and dirty[0]<formula['end']:
                 self.document().markContentsDirty(position,1)
 
+    def apply_alignment(self,only=None):
+        """Centre a display formula that has its line to itself, the way Typst sets it.
+
+        A display equation is a block-level element in Typst, so the projection puts
+        it on its own line; centring that paragraph matches the compiled page. A
+        display formula sharing its line with text stays left aligned: Typst would
+        break the line, this projection does not.
+        """
+        wanted=set()
+        for index,formula in self.mapping.objects.items():
+            if not formula.get("display"):continue
+            block=self.document().findBlock(u16(self.mapping.text[:index]))
+            if not block.isValid() or block.text().replace('\ufffc','').strip():continue
+            wanted.add(block.blockNumber())
+        last=self.document().blockCount()-1
+        first,last=(0,last) if only is None else (
+            self.document().findBlock(self.mapping.display_position(min(only[0],len(self.owner.source)))).blockNumber(),
+            self.document().findBlock(self.mapping.display_position(min(only[1],len(self.owner.source)))).blockNumber())
+        for number in range(first,last+1):
+            block=self.document().findBlockByNumber(number)
+            if not block.isValid():continue
+            alignment=Qt.AlignHCenter if number in wanted else Qt.AlignLeft
+            if block.blockFormat().alignment()==alignment:continue
+            fmt=block.blockFormat();fmt.setAlignment(alignment)
+            cursor=QTextCursor(block);cursor.setBlockFormat(fmt)
+
     def decorate_incremental(self,source,selection,scroll,schedule_raw,reparsed):
         dirty=(reparsed or {'start':0,'end':len(source.encode('utf-8'))})
         a=from_byte(source,min(dirty['start'],len(source.encode('utf-8'))));b=from_byte(source,min(dirty['end'],len(source.encode('utf-8'))))
@@ -132,6 +169,7 @@ class Editor(QTextEdit):
         cursor=QTextCursor(self.document());cursor.setPosition(da);cursor.setPosition(max(da,db),QTextCursor.KeepAnchor)
         default=QTextCharFormat();default.setFont(self.font());cursor.setCharFormat(default)
         self.base_selections=[];self.install_objects(dirty=(dirty['start'],dirty['end']))
+        self.apply_alignment(only=(a,b))
         self.apply_styles(source,only=(a,b))
         cursor=QTextCursor(self.document());cursor.setPosition(self.mapping.display_position(min(selection[0],len(source))))
         cursor.setPosition(self.mapping.display_position(min(selection[1],len(source))),QTextCursor.KeepAnchor)
@@ -145,6 +183,7 @@ class Editor(QTextEdit):
         default=QTextCharFormat();default.setFont(self.font());cursor.setCharFormat(default)
         self.base_selections=[]
         self.install_objects(force=True)
+        self.apply_alignment()
         self.apply_styles(source)
         cursor=QTextCursor(self.document())
         cursor.setPosition(self.mapping.display_position(min(selection[0],len(source))))

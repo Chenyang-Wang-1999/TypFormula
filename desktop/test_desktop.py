@@ -637,6 +637,94 @@ class NativeTest(unittest.TestCase):
         drawn=[node['text'] for node in nodes if isinstance(window.typesetter.raw(node),dict)]
         self.assertEqual(drawn,[node['text'] for node in nodes],'a fragment followed by `(` must keep its image')
 
+    def test_a_command_draft_is_drawn_in_the_editor_font(self):
+        """The draft is Typst source, so it reads like the text around the formula."""
+        window=self.window
+        self.load('$ $');window.activate(0)
+        for character in "\\alph":window.math_action('input',text=character)
+        drawn=[value for kind,_,_,value in window.math_canvas.box.operations if kind=='text']
+        self.assertTrue(drawn)
+        self.assertEqual({font.family() for _,font,_ in drawn},{window.settings['font_family']})
+        self.assertNotIn(window.settings['math_font'],{font.family() for _,font,_ in drawn})
+
+    def test_an_empty_slot_is_a_dashed_box(self):
+        """`\\frac` + Enter must show where the numerator and denominator go."""
+        window=self.window
+        self.load('$ $');window.activate(0)
+        for character in "\\frac":window.math_action('input',text=character)
+        window.math_action('key',key='Enter')
+        slots=[value for kind,_,_,value in window.math_canvas.box.operations if kind=='slot']
+        self.assertEqual(len(slots),2,'numerator and denominator are both empty')
+        self.assertTrue(all(width>3 and height>3 for width,height in slots),slots)
+        # The static projection of a formula with empty slots shows them too.
+        self.load('$frac("", "")$')
+        static=[kind for kind,_,_,_ in window.editor.handler.box(window.analysis['formulas'][0]).operations]
+        self.assertEqual(static.count('slot'),2)
+
+    def test_a_display_formula_gets_a_centred_line(self):
+        window=self.window
+        self.load('正文 $ x^2 $ 后文\n\n$ y^2 $\n')
+        alignments=[(block.text(),int(block.blockFormat().alignment())) for block in
+                    [window.editor.document().findBlockByNumber(number) for number in range(window.editor.document().blockCount())]]
+        self.assertIn(('\ufffc',int(Qt.AlignHCenter)),alignments,'a display formula alone on its line is centred')
+        self.assertIn(('正文 \ufffc 后文',int(Qt.AlignLeft)),alignments,'sharing a line with text keeps it left aligned')
+
+    def test_side_scripts_follow_the_shifts_the_compiler_uses(self):
+        """A subscript sits .25 em below the base's baseline, a superscript .36 em above."""
+        window=self.window
+        metrics=window.typesetter.line(1.0)[1]
+        em=window.typesetter.style_em(1.0,metrics)
+        for formula,sign in [('$x_1$',1),('$x^2$',-1)]:
+            self.load(formula);window.activate(0)
+            runs=sorted(((x,y,value[0]) for kind,x,y,value in window.math_canvas.box.operations if kind=='text'))
+            self.assertEqual(len(runs),2,'one base and one script')
+            offset=sign*(runs[-1][1]-runs[0][1])
+            expected=em*(.25 if sign>0 else .36)
+            self.assertAlmostEqual(offset,expected,delta=1.0,
+                                   msg='%s: %.2f px, wanted %.2f' % (formula,offset,expected))
+        self.load('$ $')
+
+    def test_the_source_dock_lines_up_with_the_editor(self):
+        window=self.window
+        self.load('第一行\n\n$ frac(a, b) $\n\n尾部\n')
+        window.source_dock.show()
+        dock=window.source_view;editor=window.editor
+        self.assertEqual(dock.document().defaultFont().family(),editor.document().defaultFont().family())
+        offset=(editor.viewport().mapTo(editor,editor.viewport().rect().topLeft()).y()+editor.document().documentMargin()
+                -dock.viewport().mapTo(dock,dock.viewport().rect().topLeft()).y())
+        self.assertEqual(dock.document().documentMargin(),offset,'both panes start at the same height')
+        formula=window.analysis['formulas'][0]
+        line=window.source.count('\n',0,from_byte(window.source,formula['start']))
+        height=dock.document().findBlockByNumber(line).blockFormat().lineHeight()
+        self.assertGreater(height,dock.fontMetrics().height(),'the formula line is taller than a text line')
+        self.assertGreaterEqual(height,editor.handler.box(formula).height)
+        # Both panes show the same lines, whichever one is scrolled.
+        editor.verticalScrollBar().setValue(0);dock.verticalScrollBar().setValue(0)
+        dock.verticalScrollBar().setValue(dock.verticalScrollBar().maximum())
+        self.assertEqual(editor.verticalScrollBar().value(),dock.verticalScrollBar().value())
+
+    def test_the_caret_survives_inside_an_empty_slot(self):
+        """A dashed slot must keep its stop, or the caret has nowhere to sit."""
+        window=self.window
+        self.load('$ $');window.activate(0)
+        for character in "\\frac":window.math_action('input',text=character)
+        window.math_action('key',key='Enter')
+        box=window.math_canvas.box
+        slots=sorted((y,x,value[0],value[1]) for kind,x,y,value in box.operations if kind=='slot')
+        self.assertEqual(len(slots),2)
+        inside=[stop for stop in box.stops
+                if any(sx<=stop[0]<=sx+width and sy<=stop[1]<=sy+height for sy,sx,width,height in slots)]
+        self.assertEqual(len(inside),2,'both empty slots keep a caret position')
+        self.assertTrue(any(stop[4] for stop in inside),'the caret is drawn inside the slot it is in')
+        # Clicking the lower slot moves the caret there and it stays visible.
+        lower=[stop for stop in inside if stop[1]>=slots[-1][0]][0]
+        window.math_action('click',cursor=lower[3])
+        box=window.math_canvas.box
+        active=[stop for stop in box.stops if stop[4]]
+        self.assertEqual(len(active),1)
+        self.assertGreaterEqual(active[0][1],slots[-1][0]-1,'the caret sits in the denominator')
+        self.load('$ $')
+
     def test_fragments_render_even_when_the_document_has_a_later_error(self):
         """The request compiles only as far as the fragments reach, so an error
         further down the document cannot take their images with it."""
@@ -747,5 +835,124 @@ class NativeTest(unittest.TestCase):
             from .model import ROOT
             self.assertTrue(image.save(str(ROOT/'target/desktop-test.png')))
             self.window.load();self.window.compile_timer.stop()
+
+# A scripted child for the pipe bookkeeping below. It answers every request with
+# the source it holds, the actions it has seen and its own pid, so a test can
+# tell a replayed session from a fresh one. Only the first child behaves as the
+# test asked; a replacement answers at once and survives, unless `all` is set.
+FAKE_CORE='''
+import base64, json, os, sys, time
+config = json.loads(base64.b64decode(sys.argv[1]))
+source = ""
+seen = []
+while True:
+    line = sys.stdin.readline()
+    if not line: break
+    request = json.loads(line)
+    action = request.get("action", "")
+    if action == "set_source": source = request.get("source", "")
+    seen.append(action)
+    if action == config.get("die", ""):
+        sys.stderr.write(config.get("stderr", "fake core exploded") + "\\n"); sys.stderr.flush()
+        sys.exit(config.get("code", 7))
+    if action == config.get("slow", "") and config.get("delay", 0.0) > 0:
+        time.sleep(config["delay"]); config["delay"] = 0.0
+    print(json.dumps({"result": {"source": source, "active_range": None, "action": action,
+        "pid": os.getpid(), "seen": seen}}), flush=True)
+'''
+FAKE_SERVICES='''
+import base64, json, os, sys
+config = json.loads(base64.b64decode(sys.argv[1]))
+dying = bool(config.get("die"))
+while True:
+    line = sys.stdin.readline()
+    if not line: break
+    request = json.loads(line)
+    if dying:
+        dying = False
+        sys.stderr.write("fake backend exploded\\n"); sys.stderr.flush()
+        sys.exit(9)
+    print(json.dumps({"id": request.get("id"), "result": {"route": request.get("route"), "pid": os.getpid()}}), flush=True)
+'''
+
+class BridgeTest(unittest.TestCase):
+    """One slow or dead helper must not cost the window its formula service."""
+    def scripted(self,script,config):
+        """Run a scripted child instead of the real backend; returns the launches."""
+        import json,sys
+        from PyQt5.QtCore import QProcess
+        launches=[]
+        def spawn(parent,arguments,workspace=None):
+            generation=len(launches);launches.append(list(arguments))
+            settings=dict(config) if (not generation or config.get("all")) else {"die":"","slow":"","stderr":""}
+            child=QProcess(parent);child.setProcessChannelMode(QProcess.SeparateChannels)
+            child.start(sys.executable,["-c",script,base64.b64encode(json.dumps(settings).encode()).decode()])
+            self.assertTrue(child.waitForStarted(5000),child.errorString())
+            return child
+        patcher=patch('desktop.bridge.process',spawn);patcher.start();self.addCleanup(patcher.stop)
+        return launches
+
+    def core(self,config,budgets=None):
+        launches=self.scripted(FAKE_CORE,config)
+        core=Core(budgets=budgets);self.addCleanup(core.close)
+        return core,launches
+
+    def backend(self,config):
+        from .bridge import Services
+        launches=self.scripted(FAKE_SERVICES,config)
+        services=Services(ROOT/'workspace');self.addCleanup(services.close)
+        return services,launches
+
+    def answer(self,services,route,body):
+        """Wait for one service reply, whichever way it went."""
+        result=[];loop=QEventLoop();timer=QTimer();timer.setSingleShot(True);timer.timeout.connect(loop.quit)
+        services.request(route,body,lambda value,error:(result.append((value,error)),loop.quit()))
+        if not result:
+            timer.start(20000);loop.exec_();timer.stop()
+        self.assertTrue(result,'scripted backend timed out')
+        return result[0]
+
+    def test_a_slow_core_is_waited_for_instead_of_killed(self):
+        """Five seconds used to be the deadline for every request, and a core that
+        missed it was killed along with the rest of the window's formula service."""
+        from PyQt5.QtCore import QProcess
+        core,launches=self.core({'slow':'analyze','delay':6.0})
+        reply=core.call('analyze')
+        self.assertEqual(reply['action'],'analyze')
+        self.assertEqual(len(launches),1,'one slow answer must not restart the core')
+        self.assertEqual(core.child.state(),QProcess.Running)
+
+    def test_a_core_that_died_mid_request_is_replaced_with_the_document_replayed(self):
+        core,launches=self.core({'die':'analyze'})
+        core.call('set_source',source='$ a+b $')
+        reply=core.call('analyze')
+        self.assertEqual(len(launches),2)
+        self.assertEqual(reply['seen'],['set_source','analyze'],'a fresh core gets the document before the retried request')
+
+    def test_a_core_that_stopped_answering_is_replaced_instead_of_abandoned(self):
+        core,launches=self.core({'slow':'analyze','delay':1.5},budgets={'analyze':0.4})
+        core.call('set_source',source='$ a+b $')
+        reply=core.call('analyze')
+        self.assertEqual(len(launches),2)
+        self.assertEqual(reply['seen'],['set_source','analyze'])
+
+    def test_a_core_that_keeps_failing_reports_the_request_and_its_stderr(self):
+        core,launches=self.core({'die':'analyze','stderr':'fake core exploded','code':7,'all':True})
+        core.call('set_source',source='$ a+b $')
+        with self.assertRaises(RuntimeError) as caught:core.call('analyze')
+        message=str(caught.exception)
+        self.assertIn('analyze',message)
+        self.assertIn('退出码 7',message)
+        self.assertIn('fake core exploded',message)
+        self.assertEqual(len(launches),2,'one recovery attempt, then a report')
+
+    def test_a_backend_that_exited_is_replaced_for_the_next_request(self):
+        services,launches=self.backend({'die':True})
+        value,error=self.answer(services,'/api/status',{})
+        self.assertIsNone(value);self.assertIn('后端进程退出',error)
+        value,error=self.answer(services,'/api/status',{})
+        self.assertIsNone(error)
+        self.assertEqual(value['route'],'/api/status')
+        self.assertEqual(len(launches),2)
 
 if __name__=="__main__":unittest.main()
