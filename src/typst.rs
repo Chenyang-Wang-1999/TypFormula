@@ -28,6 +28,8 @@ pub struct MacroDefinition {
     #[serde(skip)]
     pub function: bool,
     #[serde(skip)]
+    pub definition_start: usize,
+    #[serde(skip)]
     names: Vec<String>,
     #[serde(skip)]
     input: String,
@@ -37,7 +39,7 @@ pub struct MacroDefinition {
 // The name table describes the current scope. TemplateCall edges instead point
 // to immutable definition versions, including ones subsequently shadowed.
 #[derive(Clone, Copy)]
-enum Binding { Expandable(usize), Opaque(usize) }
+enum Binding { Expandable(usize), Opaque(usize), Hidden }
 #[derive(Default)]
 pub struct MacroRegistry {
     pub entries: Vec<MacroDefinition>,
@@ -46,7 +48,7 @@ pub struct MacroRegistry {
 impl MacroRegistry {
     pub fn is_bound(&self, name: &str) -> bool { self.names.contains_key(name) }
     pub fn get(&self, name: &str) -> Option<&MacroDefinition> {
-        let (Binding::Expandable(index) | Binding::Opaque(index)) = self.names.get(name)?;
+        let (Binding::Expandable(index) | Binding::Opaque(index)) = self.names.get(name)? else { return None; };
         self.entries.get(*index)
     }
     fn expandable(&self, name: &str) -> Option<(usize, &MacroDefinition)> {
@@ -64,8 +66,56 @@ thread_local! {
     // Retain one definition set. Prefix templates are reused on source edits;
     // removed suffixes are freed once no caller holds the previous registry.
     static MACROS: RefCell<Option<(String, Rc<MacroRegistry>)>> = const { RefCell::new(None) };
+    static FAILED_WARMUPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static EMPTY_MACROS: Rc<MacroRegistry> = Rc::new(MacroRegistry::default());
+}
+pub fn warmup_key(def: &MacroDefinition) -> String { format!("{}{}", def.context, def.input) }
+pub fn warmup_within_limit(def: &MacroDefinition) -> bool {
+    def.size.depth <= 64 && def.size.params.iter().fold(def.size.fixed, |n,w| capped_add(n,*w)) <= PROJECTION_LIMIT
+}
+pub fn set_warmup_results(results: &[(String, bool)]) {
+    FAILED_WARMUPS.with(|failed| { let mut failed = failed.borrow_mut();
+        for (key, error) in results { if *error { failed.insert(key.clone()); } else { failed.remove(key); } }
+    });
+    MACROS.with(|cache| *cache.borrow_mut() = None);
+}
+pub fn clear_warmup_results() {
+    FAILED_WARMUPS.with(|failed| failed.borrow_mut().clear());
+    MACROS.with(|cache| *cache.borrow_mut() = None);
+}
+
+// A prefix ends at the formula being edited. Traverse only its open lexical
+// ancestors: completed sibling blocks must never export their local bindings.
+enum ScopeBinding<'a> { Let(&'a SyntaxNode, usize), Hidden(Vec<String>) }
+fn scope_bindings<'a>(node: &'a SyntaxNode, offset: usize, out: &mut Vec<ScopeBinding<'a>>) {
+    if matches!(node.kind(), SyntaxKind::ContentBlock | SyntaxKind::CodeBlock)
+        && node.children().last().is_some_and(|n| matches!(n.kind(), SyntaxKind::RightBracket | SyntaxKind::RightBrace)) { return; }
+    if let Some(binding) = node.cast::<ast::LetBinding>() {
+        if node.errors_and_warnings().0.is_empty() { out.push(ScopeBinding::Let(node, offset)); return; }
+        // A formula inside a function definition sees its parameters, not an
+        // older same-name binding or the unfinished function as an expansion.
+        if let Some(ast::Expr::Closure(closure)) = binding.init() {
+            let mut names = Vec::new();
+            if let Some(name) = closure.name() { names.push(name.as_str().to_owned()); }
+            for param in closure.params().children() {
+                match param {
+                    ast::Param::Pos(pattern) => names.extend(pattern.bindings().iter().map(|n| n.as_str().to_owned())),
+                    ast::Param::Named(named) => names.push(named.name().as_str().to_owned()),
+                    ast::Param::Spread(spread) => { if let Some(name) = spread.sink_ident() { names.push(name.as_str().to_owned()); } }
+                }
+            }
+            out.push(ScopeBinding::Hidden(names));
+        }
+    }
+    if node.kind() == SyntaxKind::Equation && node.errors_and_warnings().0.is_empty() { return; }
+    let mut at = offset;
+    for child in node.children() { scope_bindings(child, at, out); at += child.len(); }
 }
 pub fn macro_registry(definitions: &str) -> Rc<MacroRegistry> {
+    // The desktop passes the full lexical prefix. Most documents and most
+    // early formulas contain no bindings at all; avoid parsing that markup a
+    // second time merely to construct an empty registry.
+    if !definitions.contains("let") { return EMPTY_MACROS.with(Rc::clone); }
     MACROS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some((key, registry)) = cache.as_ref() {
@@ -161,12 +211,17 @@ pub fn validate_definitions(text: &str) -> Result<(), String> {
 fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry {
     let source = Source::detached(text.to_string());
     let mut registry = MacroRegistry::default();
-    let mut offset = 0;
     let mut start = 0;
     let mut reuse_prefix = true;
-    for node in source.root().children() {
-        offset += node.len();
-        let Some(binding) = node.cast::<ast::LetBinding>() else { continue; };
+    let mut bindings = vec![];
+    scope_bindings(source.root(), 0, &mut bindings);
+    for item in bindings {
+        let ScopeBinding::Let(node, at) = item else {
+            if let ScopeBinding::Hidden(names) = item { for name in names { registry.names.insert(name, Binding::Hidden); } }
+            reuse_prefix = false; continue;
+        };
+        let binding = node.cast::<ast::LetBinding>().unwrap();
+        let offset = at + node.len();
         let context_end = start;
         let input = &text[start..offset];
         start = offset;
@@ -183,7 +238,7 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
         let names: Vec<String> = binding.kind().bindings().iter().map(|n| n.as_str().to_string()).collect();
         let mut def = MacroDefinition { source: input.to_string(), input: input.to_string(), name: names.join(", "), names,
             params: vec![], expandable: false, shadowed: false, reason: "仅支持直接返回数学公式的位置参数函数或公式常量".into(),
-            template: Rc::new(vec![]), context: Rc::new(text[..context_end].to_string()), function: false, size: TemplateSize::default() };
+            template: Rc::new(vec![]), context: Rc::new(text[..context_end].to_string()), function: false, definition_start: at, size: TemplateSize::default() };
         let mut body = binding.init();
         let mut supported = def.names.len() == 1;
         let mut locals = HashSet::new();
@@ -223,8 +278,9 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
             } else if used.contains(&false) {
                 def.reason = "存在未显示的参数，无法提供全部参数输入框".into();
             } else {
-                def.expandable = true;
+                def.expandable = !FAILED_WARMUPS.with(|failed| failed.borrow().contains(&warmup_key(&def)));
                 def.reason = "所有参数均可在结构槽位中编辑".into();
+                if !def.expandable { def.reason = "空字符串实例预热失败，按普通调用渲染".into(); }
                 def.size = template_size(&template, &registry, def.params.len());
                 def.template = Rc::new(template);
             }
@@ -235,7 +291,7 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
     for (index, def) in registry.entries.iter_mut().enumerate() {
         def.shadowed = def.names.iter().all(|name| match registry.names.get(name) {
             Some(Binding::Expandable(current) | Binding::Opaque(current)) => *current != index,
-            None => true,
+            Some(Binding::Hidden) | None => true,
         });
     }
     registry
@@ -247,9 +303,17 @@ pub struct Parsed { pub root: MathData, pub definitions: String, pub display: bo
 /// surrounding markup as part of the editable math tree.
 pub fn parse_formula(text: &str, context: &str) -> Result<Parsed, String> {
     let source = Source::detached(text.to_owned());
-    let (errors, _) = source.root().errors_and_warnings();
+    let eq = source.root().children().find(|n| n.kind()==SyntaxKind::Equation).ok_or("缺少公式")?;
+    parse_formula_node(eq,context)
+}
+
+/// Build the structural model from an equation already owned by the document
+/// syntax tree. This preserves Typst's incremental AST and avoids reparsing the
+/// equation string for every static projection during import.
+pub fn parse_formula_node(node:&SyntaxNode,context:&str)->Result<Parsed,String> {
+    let (errors, _) = node.errors_and_warnings();
     if let Some(error) = errors.first() { return Err(error.message.to_string()); }
-    let eq = source.root().children().find_map(|n| n.cast::<ast::Equation>()).ok_or("缺少公式")?;
+    let eq=node.cast::<ast::Equation>().ok_or("缺少公式")?;
     let registry = macro_registry(context);
     let ctx = ParseContext { params: &[], locals: &HashSet::new(), registry: &registry, template: false };
     Ok(Parsed { root: parse_cell(eq.body().to_untyped(), &ctx), definitions: context.to_owned(), display: eq.block() })

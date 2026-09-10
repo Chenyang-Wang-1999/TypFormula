@@ -20,10 +20,19 @@ mod render;
 #[derive(Deserialize)]
 struct Request { #[serde(default="default_path")] path: String, expression: String, #[serde(default)] definitions: String, display: bool }
 
-struct FormulaWorld { library: LazyHash<Library>, book: LazyHash<FontBook>, font: Font, source: Source }
+struct FormulaWorld { library: LazyHash<Library>, fonts: typst_kit::fonts::FontStore, source: Source, overlays: std::collections::HashMap<String,String>, time: typst_kit::datetime::Time }
+fn font_store(system:bool)->typst_kit::fonts::FontStore {
+    let mut fonts=typst_kit::fonts::FontStore::new();
+    // Prefer the exact math font used by the structural editor.
+    let font=Font::new(Bytes::new(include_bytes!("../../web/fonts/NewCMMath-Regular.otf").as_slice()),0).expect("embedded math font");
+    fonts.push((font.clone(),font.info().clone()));
+    fonts.extend(typst_kit::fonts::embedded());
+    if system { fonts.extend(typst_kit::fonts::system()); }
+    fonts
+}
 impl World for FormulaWorld {
     fn library(&self) -> &LazyHash<Library> { &self.library }
-    fn book(&self) -> &LazyHash<FontBook> { &self.book }
+    fn book(&self) -> &LazyHash<FontBook> { self.fonts.book() }
     fn main(&self) -> FileId { self.source.id() }
     fn source(&self, id: FileId) -> FileResult<Source> {
         if id == self.main() { return Ok(self.source.clone()); }
@@ -32,6 +41,7 @@ impl World for FormulaWorld {
     }
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         if id == self.main() { return Ok(Bytes::from_string(self.source.text().to_owned())); }
+        if matches!(id.root(),VirtualRoot::Project) { if let Some(text)=self.overlays.get(id.vpath().get_without_slash()) { return Ok(Bytes::from_string(text.clone())); } }
         let root=match id.root() {
             VirtualRoot::Project=>std::env::current_dir().map_err(|_|FileError::AccessDenied)?,
             VirtualRoot::Package(spec)=>{
@@ -49,8 +59,8 @@ impl World for FormulaWorld {
         if !path.starts_with(root) { return Err(FileError::AccessDenied); }
         std::fs::read(path).map(Bytes::new).map_err(|_|FileError::AccessDenied)
     }
-    fn font(&self, index: usize) -> Option<Font> { (index == 0).then(|| self.font.clone()) }
-    fn today(&self, _: Option<Duration>) -> Option<Datetime> { None }
+    fn font(&self, index: usize) -> Option<Font> { self.fonts.font(index) }
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> { self.time.today(offset) }
 }
 
 // Only unwrap a singleton group. Never mistake a nested script inside the
@@ -98,12 +108,10 @@ fn collect_equations<'a>(
     }
 }
 fn resolve(req: Request) -> Result<Value, String> {
-    let font = Font::new(Bytes::new(include_bytes!("../../web/fonts/NewCMMath-Regular.otf").as_slice()), 0)
-        .ok_or("无法读取公式字体")?;
     let space = if req.display { " " } else { "" };
     let source = Source::detached(format!("#set text(font: \"New Computer Modern Math\", size: 24pt)\n{}\n${space}{}{space}$", req.definitions, req.expression));
     let source = Source::new(source_id(&req.path)?,source.text().into());
-    let world = FormulaWorld { library: LazyHash::new(Library::default()), book: LazyHash::new(FontBook::from_fonts([&font])), font, source };
+    let world = FormulaWorld { library: LazyHash::new(Library::default()), fonts:font_store(false), source, overlays:Default::default(), time:typst_kit::datetime::Time::system() };
     let world_ref: &dyn World = &world;
     let traced = Traced::default();
     let mut sink = Sink::new();
@@ -133,8 +141,8 @@ fn main() {
         let mut input = input.lock();
         loop {
             let mut line = String::new();
-            match input.by_ref().take(256*1024+1).read_line(&mut line) { Ok(0) | Err(_) => break, _ => {} }
-            if line.len() > 256*1024 { break; }
+            match input.by_ref().take(8*1024*1024+1).read_line(&mut line) { Ok(0) | Err(_) => break, _ => {} }
+            if line.len() > 8*1024*1024 { break; }
             let result = serde_json::from_str(&line).map_err(|e|e.to_string()).and_then(|req|render::render(req,&mut world));
             println!("{}",result.unwrap_or_else(|error|json!({"error":error})));
             let _ = io::stdout().flush();
@@ -144,8 +152,8 @@ fn main() {
     }
     let result = (|| {
         let mut body = String::new();
-        io::stdin().take(256 * 1024 + 1).read_to_string(&mut body).map_err(|e| e.to_string())?;
-        if body.len() > 256 * 1024 { return Err("请求过大".into()); }
+        io::stdin().take(8 * 1024 * 1024 + 1).read_to_string(&mut body).map_err(|e| e.to_string())?;
+        if body.len() > 8 * 1024 * 1024 { return Err("请求过大".into()); }
         resolve(serde_json::from_str(&body).map_err(|e| e.to_string())?)
     })();
     println!("{}", result.unwrap_or_else(|error| json!({"error":error})));

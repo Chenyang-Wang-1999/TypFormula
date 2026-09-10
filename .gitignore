@@ -9,3 +9,10 @@ prototypes/lyx-rust/upstream
 !/Cargo.lock
 !/native-adapter/Cargo.lock
 !/web/fonts/*.otf
+/extensions/vscode/media/
+/extensions/vscode/bin/
+/extensions/vscode/LICENSE
+/extensions/vscode/TYPST-NOTICE
+/dist/
+__pycache__/
+*.pyc

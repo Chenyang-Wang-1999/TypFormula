@@ -12,6 +12,9 @@ typst = { path = "../vendor/typst/crates/typst" }
 typst-eval = { path = "../vendor/typst/crates/typst-eval" }
 typst-layout = { path = "../vendor/typst/crates/typst-layout" }
 typst-svg = { path = "../vendor/typst/crates/typst-svg" }
+typst-pdf = { path = "../vendor/typst/crates/typst-pdf" }
+typst-kit = { path = "../vendor/typst/crates/typst-kit", features = ["scan-fonts", "embedded-fonts", "datetime"] }
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -16,6 +16,28 @@ fn download(url:&str, limit:u64) -> Result<Vec<u8>,String> {
     if bytes.len() as u64>limit { return Err("包下载超过大小限制".into()); } Ok(bytes)
 }
 pub fn handle(req:Value) -> Result<Value,String> {
+    if req["action"]=="local" {
+        let mut roots=vec![];
+        if let Some(path)=std::env::var_os("TYPST_PACKAGE_PATH") { roots.push(PathBuf::from(path)); }
+        if let Some(path)=std::env::var_os("APPDATA") { roots.push(PathBuf::from(path).join("typst/packages")); }
+        if let Some(home)=std::env::var_os("HOME") { let home=PathBuf::from(home);roots.extend([home.join(".local/share/typst/packages"),home.join("Library/Application Support/typst/packages")]); }
+        let query=req["query"].as_str().unwrap_or("").to_lowercase();
+        let mut items=vec![];let mut seen=std::collections::HashSet::new();
+        for root in roots {
+            let Ok(names)=fs::read_dir(root.join("local")) else {continue};
+            for name in names.flatten() {
+                let Ok(versions)=fs::read_dir(name.path()) else {continue};
+                for version in versions.flatten() {
+                    let name=name.file_name().to_string_lossy().into_owned();let version_name=version.file_name().to_string_lossy().into_owned();
+                    let spec=format!("@local/{name}:{version_name}");
+                    if !name.to_lowercase().contains(&query)||spec.parse::<typst_syntax::package::PackageSpec>().is_err()||!version.path().join("typst.toml").is_file()||!seen.insert(spec) {continue;}
+                    items.push(json!({"namespace":"local","name":name,"version":version_name,"installed":true,"path":version.path()}));
+                }
+            }
+        }
+        items.sort_by_key(|v|format!("{}:{}",v["name"],v["version"]));
+        return Ok(json!({"items":items}));
+    }
     if req["action"]=="search" {
         let mut index=INDEX.lock().map_err(|e|e.to_string())?;
         if index.is_none() { *index=Some(serde_json::from_slice(&download("https://packages.typst.org/preview/index.json",16*1024*1024)?).map_err(|e|e.to_string())?); }

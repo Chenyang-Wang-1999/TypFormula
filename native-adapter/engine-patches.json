@@ -7,7 +7,7 @@
   {
     "file": "crates/typst-library/src/math/ir/resolve.rs",
     "before": "    if let Some(elem) = elem.to_packed::<SymbolElem>() {\n        resolve_symbol(elem, ctx, styles)?;",
-    "after": "    if let Some(equation) = elem.to_packed::<EquationElem>() {\n        let mut item = ctx.resolve_into_item(&equation.body, styles)?;\n        if let MathItem::Component(comp) = &mut item {\n            comp.props.editor_label = elem.label();\n        }\n        ctx.push(item);\n    } else if let Some(elem) = elem.to_packed::<SymbolElem>() {\n        resolve_symbol(elem, ctx, styles)?;"
+    "after": "    if let Some(equation) = elem.to_packed::<EquationElem>() {\n        let mut item = ctx.resolve_into_item(&equation.body, styles)?;\n        if let MathItem::Component(comp) = &mut item {\n            comp.props.editor_label = elem.label().map(|label| {\n                if !label.resolve().starts_with(\"visual-typst-raw-\") { return label; }\n                // Record the environment at the Raw boundary, before its body\n                // can introduce local styles. Resolve the base without the\n                // math Script/ScriptScript factor; keep that factor in the SVG.\n                let text_size = EquationElem::size.set(MathSize::Text).wrap();\n                let base = styles.chain(&text_size).resolve(TextElem::size).to_pt();\n                crate::foundations::Label::new(\n                    typst_utils::PicoStr::intern(&format!(\"{}:base-font-pt:{base}\", label.resolve())),\n                ).unwrap()\n            });\n        }\n        ctx.push(item);\n    } else if let Some(elem) = elem.to_packed::<SymbolElem>() {\n        resolve_symbol(elem, ctx, styles)?;"
   },
   {
     "file": "crates/typst-library/src/math/ir/resolve.rs",

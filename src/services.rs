@@ -38,7 +38,7 @@ impl Services {
         let file = crate::workspace::resolve(&self.workspace, path)?;
         let source = req["source"].as_str().ok_or("缺少文档源码")?;
         let method = req["method"].as_str().unwrap_or("diagnostics");
-        if !["diagnostics", "completion", "hover", "definition", "formatting"].contains(&method) { return Err("不支持的 LSP 方法".into()); }
+        if !["diagnostics", "completion", "hover", "definition", "formatting", "semanticTokens/full"].contains(&method) { return Err("不支持的 LSP 方法".into()); }
         let mut guard = self.document_lsp.lock().map_err(|e|e.to_string())?;
         let result = (|| {
             if guard.as_ref().is_none_or(|s|s.path != path) {
@@ -75,14 +75,14 @@ impl Services {
             }
             let diagnostics = if session.lsp.diagnostic_version.is_none_or(|v|v == session.version) { session.lsp.diagnostics.clone() } else { json!([]) };
             let root_uri=url::Url::from_directory_path(&self.workspace).map_err(|_|"无效项目目录")?;
-            Ok(json!({"result":value,"diagnostics":diagnostics,"version":session.version,"uri":session.lsp.uri,"rootUri":root_uri.as_str()}))
+            Ok(json!({"result":value,"legend":session.lsp.semantic_legend,"diagnostics":diagnostics,"version":session.version,"uri":session.lsp.uri,"rootUri":root_uri.as_str()}))
         })();
         if result.is_err() { *guard = None; }
         result
     }
 }
 
-pub(crate) struct Lsp { child: Child, input: ChildStdin, messages: mpsc::Receiver<Value>, next_id: u64, uri: String, diagnostics: Value, diagnostic_version: Option<i64> }
+pub(crate) struct Lsp { child: Child, input: ChildStdin, messages: mpsc::Receiver<Value>, next_id: u64, uri: String, diagnostics: Value, diagnostic_version: Option<i64>, semantic_legend: Value }
 impl Drop for Lsp { fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); } }
 impl Lsp {
     pub(crate) fn start(bin: &Path, root: &Path) -> Result<Self, String> {
@@ -108,8 +108,9 @@ impl Lsp {
         });
         let url = url::Url::from_directory_path(root).map_err(|_| "无效的项目路径")?;
         let uri = url.join("command-buffer.typ").map_err(|e| e.to_string())?.to_string();
-        let mut lsp = Self { child, input, messages, next_id: 0, uri, diagnostics: json!([]), diagnostic_version: None };
-        lsp.request("initialize", json!({"processId":std::process::id(),"rootUri":url.as_str(),"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"completion":{"completionItem":{"snippetSupport":false}}}},"initializationOptions":{"exportPdf":"never","semanticTokens":"disable","fontPaths":[]}}))?;
+        let mut lsp = Self { child, input, messages, next_id: 0, uri, diagnostics: json!([]), diagnostic_version: None, semantic_legend: Value::Null };
+        let initialized=lsp.request("initialize", json!({"processId":std::process::id(),"rootUri":url.as_str(),"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"completion":{"completionItem":{"snippetSupport":false}},"semanticTokens":{"requests":{"full":true},"tokenTypes":["comment","string","keyword","operator","number","function","variable","type"],"tokenModifiers":[],"formats":["relative"]}}},"initializationOptions":{"exportPdf":"never","semanticTokens":"enable","fontPaths":[]}}))?;
+        lsp.semantic_legend=initialized["capabilities"]["semanticTokensProvider"]["legend"].clone();
         lsp.notify("initialized", json!({}))?;
         Ok(lsp)
     }
@@ -121,7 +122,7 @@ impl Lsp {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.next_id += 1; let id = self.next_id;
         self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-        let until = Instant::now() + Duration::from_secs(12);
+        let until = Instant::now() + Duration::from_secs(30);
         loop {
             let value = self.messages.recv_timeout(until.saturating_duration_since(Instant::now())).map_err(|_| "Tinymist 响应超时".to_string())?;
             if value.get("method").is_some() && value.get("id").is_some() {
@@ -142,7 +143,7 @@ pub struct CompletionRequest { pub source: String, pub start: usize, pub end: us
 #[derive(Serialize)]
 pub struct CompletionReply { pub engine: &'static str, pub items: Vec<crate::cursor::CommandCompletion> }
 #[derive(Deserialize, Serialize)]
-pub struct RenderRequest { #[serde(default="default_path")] pub path: String, pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange> }
+pub struct RenderRequest { #[serde(default)] pub preview: bool, #[serde(default)] pub pdf:bool, #[serde(default)] pub overlays: std::collections::HashMap<String,String>, #[serde(default="default_path")] pub path: String, pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange>, #[serde(default)] pub preview_hashes:Vec<String> }
 #[derive(Deserialize, Serialize)]
 pub struct RawRange { pub id: String, pub start: usize, pub end: usize }
 
@@ -162,8 +163,8 @@ impl RenderAdapter {
             let mut reader = BufReader::new(stdout);
             loop {
                 let mut line = String::new();
-                match reader.by_ref().take(16*1024*1024+1).read_line(&mut line) { Ok(0) | Err(_) => break, _ => {} }
-                if line.len() > 16*1024*1024 { let _ = sender.send(Err("Typst SVG 响应过大".into())); break; }
+                match reader.by_ref().take(64*1024*1024+1).read_line(&mut line) { Ok(0) | Err(_) => break, _ => {} }
+                if line.len() > 64*1024*1024 { let _ = sender.send(Err("Typst SVG 响应过大".into())); break; }
                 if sender.send(serde_json::from_str(&line).map_err(|e|e.to_string())).is_err() { break; }
             }
         });
@@ -171,7 +172,7 @@ impl RenderAdapter {
     }
     fn request(&mut self, req: &RenderRequest) -> Result<Value,String> {
         self.requests.send(serde_json::to_vec(req).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
-        let value = self.replies.recv_timeout(Duration::from_secs(12)).map_err(|_|"Typst 实时编译超时；源码已保留")??;
+        let value = self.replies.recv_timeout(Duration::from_secs(30)).map_err(|_|"Typst 实时编译超时；源码已保留")??;
         // A document diagnostic is a valid protocol reply; keep the warm engine.
         Ok(value)
     }
@@ -180,10 +181,14 @@ impl RenderAdapter {
 #[derive(Deserialize, Serialize)]
 pub struct AttachmentRequest { #[serde(default="default_path")] pub path: String, pub expression: String, #[serde(default)] pub definitions: String, pub display: bool }
 
-pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, document_lsp: Mutex<Option<DocumentLsp>>, pub workspace: PathBuf, render_adapter: Mutex<Option<RenderAdapter>> }
+pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, document_lsp: Mutex<Option<DocumentLsp>>, pub workspace: PathBuf, render_adapter: Mutex<Option<RenderAdapter>>, pub(crate) warmups: Mutex<std::collections::HashMap<String,Value>> }
 impl Services {
-    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("VISUAL_TYPST_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None) } }
-    fn adapter_bin(&self) -> PathBuf { self.root.join("target/adapter").join(if cfg!(debug_assertions) { "debug" } else { "release" }).join(if cfg!(windows) { "visual-typst-layout.exe" } else { "visual-typst-layout" }) }
+    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("VISUAL_TYPST_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None), warmups: Mutex::new(std::collections::HashMap::new()) } }
+    fn adapter_bin(&self) -> PathBuf {
+        if let Some(path)=std::env::var_os("VISUAL_TYPST_ADAPTER") { return path.into(); }
+        let name=if cfg!(windows) { "visual-typst-layout.exe" } else { "visual-typst-layout" };
+        let packaged=self.root.join(name); if packaged.is_file() { return packaged; }
+        self.root.join("target/adapter").join(if cfg!(debug_assertions) { "debug" } else { "release" }).join(if cfg!(windows) { "visual-typst-layout.exe" } else { "visual-typst-layout" }) }
     pub fn status(&self) -> Value { match &self.bin { Ok(path) => json!({"available":true,"attachments":self.adapter_bin().is_file(),"engine":"Tinymist LSP + Typst","path":path}), Err(error) => json!({"available":false,"attachments":self.adapter_bin().is_file(),"error":error}) } }
     pub fn attachments(&self, req: AttachmentRequest) -> Result<Value, String> {
         crate::workspace::resolve(&self.workspace, &req.path)?;
@@ -196,9 +201,9 @@ impl Services {
         // the request timeout. Dropping stdin tells the adapter the request ends.
         let writer = std::thread::spawn(move || input.write_all(&body));
         let stdout = child.stdout.take().unwrap(); let stderr = child.stderr.take().unwrap();
-        let output = std::thread::spawn(move || { let mut b = vec![]; let _ = stdout.take(16*1024*1024).read_to_end(&mut b); b });
+        let output = std::thread::spawn(move || { let mut b = vec![]; let _ = stdout.take(64*1024*1024).read_to_end(&mut b); b });
         let errors = std::thread::spawn(move || { let mut b = vec![]; let _ = stderr.take(1024*1024).read_to_end(&mut b); b });
-        let until = Instant::now() + Duration::from_secs(12);
+        let until = Instant::now() + Duration::from_secs(30);
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,

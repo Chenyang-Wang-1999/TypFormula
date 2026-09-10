@@ -5,7 +5,7 @@ use visual_typst_core::{Action, Editor, services::{Services, CompletionRequest, 
 fn render(service: &Services, expression: &str, definitions: &str) -> Result<serde_json::Value,String> {
     let prefix=format!("{definitions}\n$ ");
     let start=prefix.len();
-    let result=service.render(RenderRequest {path:"main.typ".into(),source:format!("{prefix}{expression} $"),raw:vec![RawRange{id:"raw".into(),start,end:start+expression.len()}],formulas:vec![]})?;
+    let result=service.render(RenderRequest {preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),source:format!("{prefix}{expression} $"),raw:vec![RawRange{id:"raw".into(),start,end:start+expression.len()}],formulas:vec![],preview_hashes:vec![]})?;
     Ok(result["items"][0].clone())
 }
 

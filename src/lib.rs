@@ -5,12 +5,19 @@ pub mod math;
 pub mod typst;
 pub mod view;
 pub mod document;
+pub mod prewarm;
+#[cfg(not(target_arch = "wasm32"))]
+mod warmup_service;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod services;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod workspace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod packages;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod rpc;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod desktop;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 

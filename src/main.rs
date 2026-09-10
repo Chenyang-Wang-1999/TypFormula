@@ -3,6 +3,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::{io::Read, sync::Arc};
+    if std::env::args().nth(1).as_deref()==Some("--desktop-core") { return visual_typst_core::desktop::serve(); }
+    if std::env::args().nth(1).as_deref()==Some("--stdio") { return visual_typst_core::rpc::serve(std::env::args_os().nth(2).map(std::path::PathBuf::from).ok_or("Missing workspace")?); }
     use tiny_http::{Header, Method, Response, Server};
     use visual_typst_core::services::Services;
     let port = std::env::args().nth(1).unwrap_or_else(|| "4320".into()).parse::<u16>()?;
@@ -29,10 +31,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     if body.len() > 4*1024*1024 { return Err("请求过大".into()); }
                     match url.as_str() {
                         "/api/lsp" => services.language(serde_json::from_str(&body).map_err(|e|e.to_string())?),
+                        "/api/prewarm" => services.prewarm(serde_json::from_str(&body).map_err(|e|e.to_string())?),
                         "/api/file" => visual_typst_core::workspace::file(&services.workspace,serde_json::from_str(&body).map_err(|e|e.to_string())?),
                         "/api/packages" => visual_typst_core::packages::handle(serde_json::from_str(&body).map_err(|e|e.to_string())?),
                         "/api/completion" => serde_json::to_value(services.complete(serde_json::from_str(&body).map_err(|e| e.to_string())?)?).map_err(|e| e.to_string()),
-                        "/api/render" => services.render(serde_json::from_str(&body).map_err(|e| e.to_string())?),
+                        "/api/render" | "/api/preview" | "/api/pdf" => services.render(serde_json::from_str(&body).map_err(|e| e.to_string())?),
                         "/api/attachments" => services.attachments(serde_json::from_str(&body).map_err(|e| e.to_string())?),
                         _ => Err("未知请求".into()),
                     }

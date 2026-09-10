@@ -1,10 +1,19 @@
+import {request,assetUrl,inVSCode} from './transport.js';
+import {slotForEntry} from './navigation.js';
+import {revealInFormula,visibleCaret} from './formula-layout.js';
+import {normalizedMetrics,applySvgMetrics,rawPreviewKey} from './svg-metrics.js';
+import {MacroWarmup} from './macro-warmup.js';
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Painter/event bridge only. Rust/WASM owns MathData, all commands and the cursor.
 import { mathGlyph } from './math-font.js';
 const $ = selector => document.querySelector(selector);
 const keyboard = $('#keyboard'), canvas = $('#canvas'), caret = $('#caret'), popup = $('#completions');
 const encoder = new TextEncoder(), decoder = new TextDecoder();
+let beforeRequest = async () => {};
 let changed = () => {}, exit = () => {}, history = () => {}, documentPath = () => "main.typ";
+let previewSession=0;
+let macroWarmup;
+let warmupPath;
 let wasm, state, composing = false, suppressComposition = false;
 let completionTimer, completionBusy = false, requestedCommand = '', serviceReady = false;
 const previews = new Map();
@@ -69,10 +78,8 @@ async function runAttachments() {
 }
 async function api(path, body) {
   if(body && ["/api/render","/api/attachments"].includes(path))body={...body,path:documentPath()};
-  const response = await fetch(path, body === undefined ? {} : {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(16000)});
-  const result = await response.json();
-  if(!response.ok || result.error)throw new Error(result.error || `HTTP ${response.status}`);
-  return result;
+  if(path!=='/api/status')await beforeRequest();
+  return request(path,body);
 }
 function serviceLabel(text, detail='') { const badge=$('.badge');badge.textContent=text;badge.title=detail; }
 function commandSignature() { return state?.command ? JSON.stringify(state.command) : ''; }
@@ -99,13 +106,14 @@ function scheduleCompletion() {
 }
 function redraw() { if(!redrawQueued){redrawQueued=true;requestAnimationFrame(()=>{redrawQueued=false;render();paintCaret();});} }
 let renderTimer, renderBusy=false, contextFocus=null;
-// Editor previews deliberately outlive their original document context and
-// source offsets. The first successful SVG for this Raw spelling is reused
-// until an explicit refresh, including after deletion and undo.
-function invalidatePreview(source) {
-  const record=previews.get(source);
-  if(record?.url)URL.revokeObjectURL(record.url);
-  previews.delete(source);
+// Different occurrences and entry sessions can have different environment
+// sizes. Keep the dimensions and their denominator in the same cache record.
+function invalidatePreview(sourceOrKey) {
+  for(const [key,record] of previews){
+    if(key!==sourceOrKey&&(record.expression!==sourceOrKey||record.session!==previewSession))continue;
+    if(record.url)URL.revokeObjectURL(record.url);
+    previews.delete(key);
+  }
 }
 function invalidateAttachment(key) {
   attachments.delete(key);
@@ -163,7 +171,8 @@ function updateAttachmentEdits(snapshot,focused=true) {
   if(refreshed){schedulePreviews();scheduleAttachments();}
 }
 function previewFor(node) {
-  return previews.get(node.text) || {status:'waiting'};
+  const actual=previews.get(rawPreviewKey(previewSession,node));
+  return actual?.status==='ready'?actual:macroWarmup?.lookup(node)||actual||{status:'waiting'};
 }
 function visitRaw(callback) {
   for(const block of state.blocks) {
@@ -178,8 +187,9 @@ function schedulePreviews() {
   clearTimeout(renderTimer);
   let waiting=false;
   visitRaw(node=>{
-    if(!previews.has(node.text))previews.set(node.text,{status:'waiting',expression:node.text});
-    if(previews.get(node.text).status==='waiting')waiting=true;
+    const key=rawPreviewKey(previewSession,node);
+    if(!previews.has(key))previews.set(key,{key,session:previewSession,status:'waiting',expression:node.text});
+    if(previews.get(key).status==='waiting')waiting=true;
   });
   if(waiting && !state.pending)renderTimer=setTimeout(runPreviews,160);
 }
@@ -195,7 +205,7 @@ async function runPreviews() {
   // typing, source-offset shifts and formula insertion cannot redirect replies.
   const targets=new Map();
   visitRaw(node=>{
-    const record=previews.get(node.text);
+    const record=previews.get(rawPreviewKey(previewSession,node));
     if(node.render_id && record?.status==='waiting')targets.set(node.render_id,record);
   });
   if(!targets.size)return;
@@ -207,9 +217,10 @@ async function runPreviews() {
     const result=await api('/api/render',request);
     for(const item of result.items) {
       const record=targets.get(item.id);
-      if(!record || previews.get(record.expression)!==record || record.status==='ready')continue;
+      if(!record || previews.get(record.key)!==record || record.status==='ready')continue;
       const svg=new DOMParser().parseFromString(item.svg,'image/svg+xml').documentElement;
       if(svg.localName!=='svg'||![item.width,item.height].every(n=>Number.isFinite(n)&&n>=0))throw new Error('无效的 Typst SVG');
+      normalizedMetrics(item);
       Object.assign(record,item,{status:'ready',mapped:true,url:URL.createObjectURL(new Blob([item.svg],{type:'image/svg+xml'}))});
     }
     for(const record of records)if(record.status==='loading')Object.assign(record,{status:'error',error:'当前文档没有此 Raw 的可见排版结果'});
@@ -240,12 +251,14 @@ function send(action, focus = true) {
     if(action.action==='undo' || action.action==='redo') { history(action.action); return; }
     const before=state?.source; state = call(action);
     if(state.source!==before)changed(state);
+    if(state.source!==before)macroWarmup?.schedule();
+    macroWarmup?.flush();
     updateAttachmentEdits(state,focus || document.activeElement===keyboard);
     if(action.action==='key' && action.key==='Enter' && !state.pending && draft) {
       for(const [key,record] of previews)if(record.status==='error' && record.expression===draft.trim())previews.delete(key);
       for(const [key,record] of attachments)if(record.status==='error')attachments.delete(key);
     }
-    render(); if (focus) keyboard.focus({preventScroll:true}); paintCaret(); scheduleCompletion();
+    render(); if (focus) {keyboard.focus({preventScroll:true});revealActiveCaret();} paintCaret(); scheduleCompletion();
   }
   catch(error) { $('#status').textContent = error.message; $('#status').classList.add('error'); }
 }
@@ -262,8 +275,13 @@ function draw(node, inText=false) {
     const record=rawReady?previewFor(node):{status:'unavailable'};
     if(record.status==='ready') {
       el.classList.add('rendered');const img=document.createElement('img');img.src=record.url;img.alt=node.text;
-      img.style.width=(record.width/24)+'em';img.style.height=(record.height/24)+'em';img.addEventListener('load',measure,{once:true});el.append(img);
-      el.title=`${node.text}\nTypst 渲染的整体公式，可整块删除`;
+      // Mapped SVGs already include Typst's script sizing; do not shrink them
+      // a second time by using the attachment's local em.
+      const metrics=normalizedMetrics(record);
+      img.dataset.baseFontWidth=metrics.width;img.dataset.baseFontHeight=metrics.height;
+      img.dataset.environmentFontSizePt=metrics.environment;
+      applySvgMetrics(img);img.addEventListener('load',measure,{once:true});el.append(img);
+      el.title=`${node.text}\n环境基准字号 ${metrics.environment}pt；宽度/字号 ${metrics.width.toFixed(4)}`;
     } else {
       el.textContent=node.text;el.classList.toggle('render-error',record.status==='error');
       el.title=record.status==='error'?`Typst 未能渲染：${record.error}\n从左侧按 → 或右侧按 ← 可进入源码编辑` :['waiting','loading'].includes(record.status)?'Typst 正在渲染…':node.text;
@@ -348,15 +366,25 @@ function measure() {
   call({action:'geometry',stops});
   paintCaret();
 }
-function paintCaret() {
+function activeCaretElement() {
   const stop=canvas.querySelector('[data-active]');
-  const active=state?.pending ? stop?.previousElementSibling?.querySelector('.draft-caret') : stop;
-  caret.hidden=!active || document.activeElement!==keyboard || !!state?.selected_source;
-  if(!active)return;
-  const r=active.getBoundingClientRect();
-  caret.style.cssText=`left:${r.x}px;top:${r.y}px;height:${Math.max(16,r.height)}px`;
-  keyboard.style.left=r.x+'px';keyboard.style.top=r.bottom+'px';
-  if(!popup.hidden){const width=220;popup.style.left=Math.max(8,Math.min(r.x,innerWidth-width-8))+'px';popup.style.top=Math.min(r.bottom+8,innerHeight-220)+'px';popup.querySelector('.chosen')?.scrollIntoView({block:'nearest'});}
+  return state?.pending ? stop?.previousElementSibling?.querySelector('.draft-caret') : stop;
+}
+function revealActiveCaret(){
+  const active=activeCaretElement();if(!active)return;
+  if(revealInFormula(canvas.closest('.formula-widget'),active.getBoundingClientRect()))measure();
+}
+function paintCaret() {
+  const active=activeCaretElement();
+  const rect=active?.getBoundingClientRect();
+  const r=rect?visibleCaret({left:rect.left,right:rect.right,top:rect.top,bottom:rect.bottom},canvas.closest('.formula-widget')):null;
+  const focused=document.activeElement===keyboard;
+  caret.hidden=!r || !focused || !!state?.selected_source;
+  popup.hidden=!r || !focused || !state?.pending || !state.candidates.length;
+  if(!r)return;
+  caret.style.cssText=`left:${r.left}px;top:${r.top}px;height:${Math.max(1,r.bottom-r.top)}px`;
+  keyboard.style.left=r.left+'px';keyboard.style.top=r.bottom+'px';
+  if(!popup.hidden){const width=220;popup.style.left=Math.max(8,Math.min(r.left,innerWidth-width-8))+'px';popup.style.top=Math.min(r.bottom+8,innerHeight-220)+'px';popup.querySelector('.chosen')?.scrollIntoView({block:'nearest'});}
 }
 canvas.addEventListener('pointerdown',event=>{
   event.preventDefault();const cell=event.target.closest('.cell,.empty-cell');
@@ -392,19 +420,32 @@ keyboard.addEventListener('copy',event=>{if(state?.selected_source){event.preven
 keyboard.addEventListener('cut',event=>{if(state?.selected_source){event.preventDefault();event.clipboardData.setData('text/plain',state.selected_source);send({action:'key',key:'Backspace'});}});
 
 export async function initMath(callbacks) {
-  changed=callbacks.changed; exit=callbacks.exit; history=callbacks.history; documentPath=callbacks.path;
-  const {instance}=await WebAssembly.instantiateStreaming(fetch('/core.wasm'),{}); wasm=instance.exports;
+  changed=callbacks.changed; exit=callbacks.exit; history=callbacks.history; documentPath=callbacks.path; beforeRequest=callbacks.beforeRequest||beforeRequest;
+  const {instance}=await WebAssembly.instantiateStreaming(fetch(assetUrl('core.wasm')),{}); wasm=instance.exports;
   state=call({action:'state'});
-  const result=await api('/api/status');
+  const result=await api('/api/status').catch(error=>({available:false,attachments:false,error:error.message}));
   serviceReady=result.available; attachmentReady=result.attachments; rawReady=result.attachments;
+  if(rawReady&&!inVSCode)macroWarmup=new MacroWarmup({
+    request:body=>api('/api/prewarm',body),
+    snapshot:()=>callbacks.warmupSnapshot?.()||({path:documentPath(),source:state.source}),
+    apply:results=>{if(state.pending)return false;state=call({action:'macro_warmup',results});previewSession++;callbacks.projectionChanged?.(state);return true;},
+    updated:()=>{callbacks.projectionChanged?.(state);redraw();}
+  });
   serviceLabel(serviceReady?'Tinymist':'Tinymist 未找到',result.error||'');
   document.fonts.ready.then(measure);
-  window.addEventListener('resize',measure);document.addEventListener('scroll',paintCaret,true);document.addEventListener('focusin',paintCaret);
+  window.addEventListener('resize',measure);document.addEventListener('scroll',event=>{if(event.target===canvas.closest('.formula-widget'))measure();else paintCaret();},true);document.addEventListener('focusin',paintCaret);
 }
-export function syncSource(source) { state=call({action:'set_source',source});return state; }
-export function enterMath(start) { state=call({action:'activate_formula',start});render();return state; }
+export function resizeMathSvg(){document.querySelectorAll('img[data-base-font-width]').forEach(applySvgMetrics);measure();}
+export function syncSource(source) { const path=documentPath(),reset_warmups=warmupPath!==path;warmupPath=path;previewSession++;state=call({action:'set_source',source,reset_warmups});macroWarmup?.schedule();return state; }
+export function disposeMath(){macroWarmup?.dispose();clearTimeout(renderTimer);clearTimeout(attachmentTimer);clearTimeout(completionTimer);}
+export function refreshMacroWarmup(){if(warmupPath!==documentPath()){state=call({action:'macro_warmup',clear:true,results:[]});warmupPath=documentPath();}macroWarmup?.schedule();}
+export function enterMath(start) { state=call({action:'activate_formula',start});previewSession++;render();return state; }
 export function leaveMath() { state=call({action:'deactivate_formula'});popup.hidden=true;caret.hidden=true;return state; }
-export function focusMath() { keyboard.focus({preventScroll:true});requestAnimationFrame(measure); }
+export function focusMath() { keyboard.focus({preventScroll:true});requestAnimationFrame(()=>{revealActiveCaret();measure();}); }
+export function enterMathFromArrow(key,x=0) {
+  const stops=[...canvas.querySelectorAll('[data-cursor]')].map(el=>{const r=el.getBoundingClientRect();return {cursor:JSON.parse(el.dataset.cursor),x:r.left,y:(r.top+r.bottom)/2};});
+  const stop=slotForEntry(stops,key,x);if(stop)send({action:'click',cursor:stop.cursor});else focusMath();
+}
 export function mathState() { return state; }
 export function mathAction(action) { send(action); }
 export function passiveMath() {
@@ -412,4 +453,4 @@ export function passiveMath() {
   for(const el of clone.querySelectorAll('[data-cursor],[data-active]')) {el.removeAttribute('data-cursor');el.removeAttribute('data-active');}
   clone.querySelectorAll('button').forEach(el=>el.remove());return clone;
 }
-export { refreshAllSvg };
+export { refreshAllSvg, measure as measureMath };

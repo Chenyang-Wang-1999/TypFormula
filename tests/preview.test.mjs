@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {JSDOM} from 'jsdom';
+import {Preview} from '../web/preview.js';
+test('preview toggle compiles current unsaved source and dependencies, and invalidates pending work on close',async()=>{
+  const dom=new JSDOM('<button id="toggle"></button><aside id="preview-pane" hidden><p id="status"></p><div id="pages"></div></aside>');globalThis.document=dom.window.document;
+  let received,resolve;
+  const preview=new Preview({request:body=>{received=body;return new Promise(done=>{resolve=done;});},snapshot:()=>({path:'main.typ',source:'#include "draft.typ"',overlays:{'draft.typ':'Unsaved'}}),container:document.getElementById('pages'),status:document.getElementById('status'),button:document.getElementById('toggle')});
+  preview.toggle();clearTimeout(preview.timer);
+  assert.equal(document.getElementById('preview-pane').hidden,false);
+  assert.equal(preview.button.getAttribute('aria-expanded'),'true');
+  const pending=preview.render();
+  assert.equal(received.preview,true);assert.equal(received.source,'#include "draft.typ"');assert.equal(received.overlays['draft.typ'],'Unsaved');
+  preview.toggle();preview.toggle();clearTimeout(preview.timer);
+  resolve({pages:[{width:100,svg:'<svg/>'}]});await pending;
+  assert.equal(preview.urls.length,0,'closing and reopening must reject the previous compilation');
+  preview.toggle();assert.equal(preview.button.textContent,'预览');
+  assert.equal(document.getElementById('preview-pane').hidden,true);
+  preview.dispose();dom.window.close();
+});
+test('preview discards late pages and keeps the last good pages on compile errors',async()=>{
+  const dom=new JSDOM('<aside id="preview-pane"><p id="status"></p><div id="pages"></div></aside>');globalThis.document=dom.window.document;
+  const resolvers=[];let source='first';
+  const preview=new Preview({request:()=>new Promise((resolve,reject)=>resolvers.push({resolve,reject})),snapshot:()=>({source}),container:document.getElementById('pages'),status:document.getElementById('status')});
+  preview.visible=true;
+  const first=preview.render();resolvers.shift().resolve({pages:[{width:100,svg:'<svg xmlns="http://www.w3.org/2000/svg"/>'}]});await first;assert.equal(preview.urls.length,1);const last=preview.urls[0];
+  const second=preview.render();resolvers.shift().reject(new Error('broken source'));await second;assert.equal(preview.urls[0],last);assert.match(preview.status.textContent,/保留上次/);
+  const late=preview.render();preview.visible=false;resolvers.shift().resolve({pages:[]});await late;assert.equal(preview.urls[0],last);
+  preview.dispose();dom.window.close();
+});

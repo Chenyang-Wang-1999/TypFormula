@@ -20,10 +20,14 @@ pub struct View {
     pub definitions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warmup_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warmup_range: Option<[usize;2]>,
 }
 impl View {
     fn new(kind: &str, text: impl Into<String>, children: Vec<View>) -> Self {
-        Self { kind: kind.into(), text: text.into(), display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None, origin: None }
+        Self { kind: kind.into(), text: text.into(), display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None, origin: None, warmup_key: None, warmup_range: None }
     }
 }
 #[derive(Serialize)]
@@ -180,13 +184,21 @@ impl Editor {
         }
     }
     fn bind_template(&self, view: &mut View, def: &typst::MacroDefinition, registry: &typst::MacroRegistry, args: &[View]) {
+        self.bind_template_inner(view,def,registry,args,&mut std::collections::HashMap::new());
+    }
+    fn bind_template_inner(&self, view: &mut View, def: &typst::MacroDefinition, registry: &typst::MacroRegistry, args: &[View], counts: &mut std::collections::HashMap<String,usize>) {
         if view.kind == "parameter" {
             *view = args[view.columns].clone();
             return;
         }
-        if view.kind == "raw" { view.definitions = Some(def.context.as_ref().clone()); view.origin = Some(def.source.clone()); }
+        if view.kind == "raw" {
+            view.definitions = Some(def.context.as_ref().clone()); view.origin = Some(def.source.clone()); view.warmup_key = Some(typst::warmup_key(def));
+            let ranges=crate::prewarm::definition_raw_ranges(def,&view.text);
+            let ordinal=counts.entry(view.text.clone()).or_default();
+            view.warmup_range=ranges.get(*ordinal).map(|(a,b)|[*a,*b]);*ordinal+=1;
+        }
         for child in &mut view.children {
-            self.bind_template(child, def, registry, args);
+            self.bind_template_inner(child, def, registry, args, counts);
         }
         if view.kind == "template-call" {
             let callee = &registry.entries[view.columns];

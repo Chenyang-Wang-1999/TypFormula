@@ -1,0 +1,236 @@
+{
+  "name": "visual-typst",
+  "displayName": "Visual Typst",
+  "description": "Typst source editing with shared structural math, live page preview and configurable commands.",
+  "version": "0.2.1",
+  "publisher": "visual-typst-local",
+  "license": "GPL-2.0-or-later",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "main": "./src/extension.cjs",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Source editing works; native compilation and package installation require a trusted workspace."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "visualTypst.editor",
+        "displayName": "Visual Typst",
+        "selector": [
+          {
+            "filenamePattern": "*.typ"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "commands": [
+      {
+        "command": "visualTypst.open",
+        "title": "Visual Typst: 打开混合编辑器"
+      },
+      {
+        "command": "visualTypst.save",
+        "title": "Visual Typst: 保存文档"
+      },
+      {
+        "command": "visualTypst.saveCopy",
+        "title": "Visual Typst: 另存副本"
+      },
+      {
+        "command": "visualTypst.format",
+        "title": "Visual Typst: 格式化文档"
+      },
+      {
+        "command": "visualTypst.undo",
+        "title": "Visual Typst: 撤销"
+      },
+      {
+        "command": "visualTypst.redo",
+        "title": "Visual Typst: 重做"
+      },
+      {
+        "command": "visualTypst.insertInline",
+        "title": "Visual Typst: 插入行内公式"
+      },
+      {
+        "command": "visualTypst.insertDisplay",
+        "title": "Visual Typst: 插入行间公式"
+      },
+      {
+        "command": "visualTypst.editFormula",
+        "title": "Visual Typst: 编辑光标处公式"
+      },
+      {
+        "command": "visualTypst.toggleSource",
+        "title": "Visual Typst: 切换纯源码显示"
+      },
+      {
+        "command": "visualTypst.finishFormula",
+        "title": "Visual Typst: 完成公式"
+      },
+      {
+        "command": "visualTypst.addRow",
+        "title": "Visual Typst: 矩阵增加一行"
+      },
+      {
+        "command": "visualTypst.addColumn",
+        "title": "Visual Typst: 矩阵增加一列"
+      },
+      {
+        "command": "visualTypst.refreshMath",
+        "title": "Visual Typst: 刷新公式 SVG"
+      },
+      {
+        "command": "visualTypst.definition",
+        "title": "Visual Typst: 跳转到定义"
+      },
+      {
+        "command": "visualTypst.newFile",
+        "title": "Visual Typst: 新建 Typst 文件"
+      },
+      {
+        "command": "visualTypst.togglePreview",
+        "title": "Visual Typst: 显示或隐藏整页预览"
+      },
+      {
+        "command": "visualTypst.refreshPreview",
+        "title": "Visual Typst: 刷新整页预览"
+      },
+      {
+        "command": "visualTypst.zoomIn",
+        "title": "Visual Typst: 放大预览"
+      },
+      {
+        "command": "visualTypst.zoomOut",
+        "title": "Visual Typst: 缩小预览"
+      },
+      {
+        "command": "visualTypst.zoomReset",
+        "title": "Visual Typst: 预览适应宽度"
+      },
+      {
+        "command": "visualTypst.togglePackages",
+        "title": "Visual Typst: 显示或隐藏包管理"
+      },
+      {
+        "command": "visualTypst.searchPackages",
+        "title": "Visual Typst: 搜索 Typst 包"
+      },
+      {
+        "command": "visualTypst.installPackage",
+        "title": "Visual Typst: 安装所选包并插入 import"
+      },
+      {
+        "command": "visualTypst.configureShortcuts",
+        "title": "Visual Typst: 配置编辑快捷键"
+      },
+      {
+        "command": "visualTypst.acceptRemote",
+        "title": "Visual Typst: 冲突：采用 VS Code 文档"
+      },
+      {
+        "command": "visualTypst.keepLocal",
+        "title": "Visual Typst: 冲突：保留当前编辑内容"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "visualTypst.save",
+        "key": "ctrl+s",
+        "mac": "cmd+s",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.format",
+        "key": "ctrl+alt+f",
+        "mac": "cmd+alt+f",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.redo",
+        "key": "ctrl+y",
+        "mac": "cmd+shift+z",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.insertInline",
+        "key": "ctrl+alt+i",
+        "mac": "cmd+alt+i",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.insertDisplay",
+        "key": "ctrl+alt+b",
+        "mac": "cmd+alt+b",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.editFormula",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.finishFormula",
+        "key": "ctrl+alt+enter",
+        "mac": "cmd+alt+enter",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.definition",
+        "key": "f12",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      },
+      {
+        "command": "visualTypst.togglePreview",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p",
+        "when": "activeCustomEditorId == visualTypst.editor"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "visualTypst.open",
+          "when": "resourceExtname == .typ",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Visual Typst",
+      "properties": {
+        "visualTypst.previewOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开混合编辑器时显示整页实时预览。"
+        },
+        "visualTypst.backendPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "可选：本机 visual-typst 后端路径，旁边须有匹配的 visual-typst-layout。默认使用扩展随附的后端。"
+        }
+      }
+    }
+  }
+}

@@ -155,7 +155,17 @@ fn resolve_realized<'a, 'v, 'e>(
     if let Some(equation) = elem.to_packed::<EquationElem>() {
         let mut item = ctx.resolve_into_item(&equation.body, styles)?;
         if let MathItem::Component(comp) = &mut item {
-            comp.props.editor_label = elem.label();
+            comp.props.editor_label = elem.label().map(|label| {
+                if !label.resolve().starts_with("visual-typst-raw-") { return label; }
+                // Record the environment at the Raw boundary, before its body
+                // can introduce local styles. Resolve the base without the
+                // math Script/ScriptScript factor; keep that factor in the SVG.
+                let text_size = EquationElem::size.set(MathSize::Text).wrap();
+                let base = styles.chain(&text_size).resolve(TextElem::size).to_pt();
+                crate::foundations::Label::new(
+                    typst_utils::PicoStr::intern(&format!("{}:base-font-pt:{base}", label.resolve())),
+                ).unwrap()
+            });
         }
         ctx.push(item);
     } else if let Some(elem) = elem.to_packed::<SymbolElem>() {
