@@ -34,8 +34,6 @@ pub fn dispatch(services: &Services, request: &Value) -> Result<Value,String> {
     let body=request["body"].clone();
     match request["route"].as_str().unwrap_or("") {
         "/api/status"=>Ok(services.status()),
-        "/api/prewarm"=>services.prewarm(body),
-        "/api/cache/clear"=>{services.warmups.lock().map_err(|e|e.to_string())?.clear();Ok(json!({"cleared":true}))},
         "/api/render"|"/api/preview"|"/api/pdf"=>services.render(serde_json::from_value(body).map_err(|e|e.to_string())?),
         "/api/attachments"=>services.attachments(serde_json::from_value(body).map_err(|e|e.to_string())?),
         "/api/completion"=>serde_json::to_value(services.complete(serde_json::from_value(body).map_err(|e|e.to_string())?)?).map_err(|e|e.to_string()),

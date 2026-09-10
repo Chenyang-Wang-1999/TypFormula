@@ -608,4 +608,53 @@ block 7 alignment=1 text='行内 ￼ 与 ￼ 混排'    ← 保持左对齐
 
 改动文件：`desktop/bridge.py`、`desktop/test_desktop.py`、`docs/desktop.md`。Rust 核心未改动，无需重建后端。
 
+# 宏内片段改走普通取图路径 · 2026-09-10
+
+可展宏原先有一套私有渲染机制：给每个可展定义生成一份**空串实例**投影（定义之后接 `#name("", …)`），编译后按 `warmup_key`（其实"到定义末尾的文档前缀"）+ 源区间缓存 SVG，并由"预热是否失败"决定这个宏还能不能展开（失败则降级为普通调用）。这一轮整套删掉，宏内片段与正文片段走同一条路。
+
+## 为什么不再需要
+
+`Document::annotate` 早就给了宏内片段一个**文档区间**（`definition_raw_ranges` 在"到定义末尾的前缀"里按序数取第 n 次出现），并把它写进 `render.raw` —— 也就是普通片段请求里的那种区间。此前不走这条路只有两个原因：预热先把图塞进了 `typesetter.cache`（`load_raw` 见到缓存就跳过），而那份图来自空串实例。现在请求照常发出，文档里对该宏的**调用**就是编译它并产出那一帧的地方。
+
+实测（`workspace/main.typ`，其中 `#let pd(f, x) = $ frac(partial #f, partial #x) $` 与 `$ pd(f, x) $`）：
+
+| 片段 | 位置 | 改前 | 改后 |
+| --- | --- | --- | --- |
+| 定义体 `partial` / `#f` / `partial` / `#x` | 384:391 / 392:394 / 396:403 / 404:406 | 空串实例出图 | 普通区间出图 |
+| 调用点 `partial` ×2 | 同上两个 `partial` 区间 | 空串实例出图 | 与定义体**同一张图**（`('raw', 文本)` 共享） |
+| 该文档缓存 | — | 9 项，**3 项被拒** | 7 项，**0 项被拒** |
+
+## 截断：定义片段必须看到调用
+
+`context_end` 是"只编译到最后一个需要出图的公式"的优化。片段在定义里、排版结果产生在调用处，而调用可能在文档更后面——实测同一份文件里，只把定义体公式算作可见时截断点落在 409（定义结尾），请求回来的 `items` 是**空的**（定义从未被实例化）；不截断则四个片段全部返回：
+
+| 请求 | items |
+| --- | --- |
+| `context_end = 409`（定义结尾） | `[]` |
+| 不截断（全文） | `384:391:0`、`392:394:0`、`396:403:0`、`404:406:0` |
+
+因此只要本次请求含定义内的片段，窗口就把 `context_end` 取全文（`window.py::load_raw` 用 `styles` 里的 `let` 区间判断）。代价是含可展宏的文档失去"后文错误不带走本屏图"这一层保护，由既有的分半重试（`salvaged`/`failed`）兜底；定义从未被调用时片段没有图，按"暂无图像"显示。
+
+## 删除面
+
+| 层 | 删除 |
+| --- | --- |
+| Rust | `src/prewarm.rs`（只剩取区间两个函数，移入 `typst.rs` 为 `definition_raw_ranges`/`raw_ranges`）、`src/warmup_service.rs`、`Services::prewarm` 与 `Services.warmups`、`/api/prewarm` 与 `/api/cache/clear` 路由、`macro_warmup` 动作、`reset_warmups`、`FAILED_WARMUPS`/`warmup_failed`/`set_warmup_results`/`clear_warmup_results`/`warmup_within_limit`、`MacroCache::clear`、`equation_at`；`warmup_key` 改名 `definition_prefix`（保留，它就是取区间要用的前缀）；视图字段 `warmup_key` 删除、`warmup_range` 改名 `source_range` |
+| 可展性 | 只由结构检查决定（体是公式、位置参数唯一、参数不落在 Raw 里、每个参数都有槽位），"空串实例预热失败→按普通调用渲染"这条降级路径取消 |
+| Python | `/api/prewarm` 与 `warmup_status`、`macro_warmup` 调用、`reset_warmups`、`load_raw` 里的 `warmup_key` 跳过分支、`classification_changed` 重新 `analyze`、`Typesetter.raw` 的 `(warmup_key, range)` 查表、`rawcache` 身份里的 `warmup_key`、`incremental` 的 `warmup_range` 平移、`BUDGETS` 的 `macro_warmup` |
+
+## 本轮实测
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | 86 通过 / 5 忽略（`macro_scope` 6 通过，其中 3 条为改写后的新用例） |
+| `cargo test --test macro_scope -- --ignored`（真实渲染器） | 通过：调用点片段由普通请求出图，`items` 一条、含 `<svg>`、`start` 等于定义内偏移 |
+| `python -m unittest desktop.test_desktop` | **68 通过**（离屏，31.7s） |
+| 真实窗口 `workspace/main.typ` | 7 公式全部可编辑；定义体与调用点片段均出图（7 项缓存，0 被拒）；进入宏体公式 8 个 stop、324 个墨点 |
+
+新增/改写用例：`tests/macro_scope.rs::expandability_is_decided_by_structure_alone`、`a_template_fragment_is_asked_for_at_its_own_place_in_the_definition`、`a_call_site_fragment_carries_the_definition_range_it_is_rendered_from`、`duplicate_fragments_in_one_definition_keep_distinct_ranges`、`a_call_site_fragment_renders_from_the_document_its_own_call`；`desktop/test_desktop.py::test_a_macro_fragment_is_rendered_from_its_call_site_like_any_other`、`test_a_definition_fragment_keeps_the_call_that_renders_it`。
+
+改动文件：`src/typst.rs`、`src/view.rs`、`src/document.rs`、`src/services.rs`、`src/rpc.rs`、`src/lib.rs`（+ 删除 `src/prewarm.rs`、`src/warmup_service.rs`）、`tests/macro_scope.rs`、`desktop/window.py`、`desktop/mathview.py`、`desktop/rawcache.py`、`desktop/incremental.py`、`desktop/bridge.py`、`desktop/test_desktop.py`、`README.md`、`docs/desktop.md`、`docs/architecture.md`、`docs/lyx-desktop-rendering-study.md`。
+
+
 

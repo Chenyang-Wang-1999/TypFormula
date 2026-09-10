@@ -142,7 +142,9 @@ class Typesetter:
         """The rendered record of a Raw node, or False once a request failed.
 
         False and None are different answers: False means the fragment was asked
-        for and produced no image, None that nothing has been asked yet.
+        for and produced no image, None that nothing has been asked yet. A fragment
+        inside a macro template is asked for like any other, at the definition's
+        own source range, so there is one namespace for every fragment.
         """
         shared = ("raw", node.get("text", ""))
         if shared in self.cache:
@@ -150,9 +152,7 @@ class Typesetter:
         for key in (node.get("_raw_key"), node.get("render_id")):
             if key and key in self.cache:
                 return self.cache[key]
-        warm_key = node.get("warmup_key")
-        bounds = node.get("warmup_range")
-        return self.cache.get((warm_key, tuple(bounds))) if warm_key and bounds else None
+        return None
 
     def layout(self, node, factor=1.0, text_mode=False):
         font, metrics, em, ascent, descent = self.line(factor)

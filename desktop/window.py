@@ -57,7 +57,6 @@ class Window(QMainWindow):
         # Attachment requests per live formula view, so a background cycle does
         # not walk every view node and rebuild every definition prefix.
         self.attachments={}
-        self.warmup_status={}
         # Reported fragment status, so only a change costs a core round trip.
         self.raw_signature=None
         # (revision, fragments) of the last failed render request, if any.
@@ -164,8 +163,8 @@ class Window(QMainWindow):
         else:text="";self.newline="\n"
         self.path=path;self.source=text;self.saved=text;self.history=[];self.future=[];self.semantic_spans=[];self.engine_spans=[]
         self.typesetter.cache.clear();self.typesetter.svg.clear();self.typesetter.placements.clear();self.ensure_services()
-        self.core.call("set_source",source=text,reset_warmups=True)
-        self.analysis=self.core.call("analyze");self.bind_formula_ids({},self.analysis);self.raw_cache.edits.clear();self.raw_cache.rebind({},self.analysis);self.raw_pending.clear();self.warmup_status.clear();self.revision+=1
+        self.core.call("set_source",source=text)
+        self.analysis=self.core.call("analyze");self.bind_formula_ids({},self.analysis);self.raw_cache.edits.clear();self.raw_cache.rebind({},self.analysis);self.raw_pending.clear();self.revision+=1
         for editor in self.editors:editor.expanded.clear()
         self.project((0,0));self.compile_timer.start()
 
@@ -449,46 +448,26 @@ class Window(QMainWindow):
         self.finish_formula();position=from_byte(self.source,offset);self.editor.project((position,position));self.editor.setFocus();self.editor.ensureCursorVisible()
 
     def background(self):
+        """Follow every edit without blocking the editor.
+
+        Fragment images are requested by `load_raw` on the same timer; this pass
+        keeps the attachment placements and the token colours current. Nothing here
+        changes the document or which macros the editor expands: that is decided by
+        the structure of their definitions alone.
+        """
         revision=self.revision;body=self.body()
-        def warmed(result,error):
-            if revision!=self.revision:return
-            if error:self.report(error);return
-            results=[]
-            for record in result.get("results",[]):
-                results.append([record["key"],record["failed"]])
-                for item in record.get("items",[]):
-                    key=(record["key"],(item["start"],item["end"]))
-                    self.typesetter.cache.setdefault(key,item)
-            self.typesetter.touch()
-            if self.math_state and self.math_state.get("pending"):
-                self.compile_timer.start();return
-            classification_changed=any(self.warmup_status.get(key,False)!=failed for key,failed in results if failed or key in self.warmup_status)
-            self.warmup_status.update(results)
-            self.report_raw_fragments()
-            before=[(f.get('editable'),signature(f.get('view',{}))) for f in self.analysis.get('formulas',[])]
-            state=self.core.call("macro_warmup",results=results)
-            if classification_changed:
-                old=self.analysis;self.analysis=self.core.call("analyze");self.bind_formula_ids(old,self.analysis);self.raw_cache.rebind(old,self.analysis)
-                self.last_reparsed={'start':0,'end':len(self.source.encode('utf-8'))}
-            after=[(f.get('editable'),signature(f.get('view',{}))) for f in self.analysis.get('formulas',[])]
-            changed=before!=after
-            if self.math_state and any(not formula["editable"] and formula["start"]==state["active_range"]["start"] for formula in self.analysis["formulas"]):
-                self.math_state=state;self.finish_formula()
-            elif self.math_state and changed:self.math_state=state;self.math_canvas.refresh(state)
-            if changed:self.project(schedule_raw=False,incremental=True)
-            for formula in self.analysis.get("formulas",[]):
-                for definitions,expression,display in self.attachment_nodes(formula):
-                    key=(definitions,expression,display)
-                    if key in self.typesetter.placements:continue
-                    def attached(value,error,key=key):
-                        if revision!=self.revision:return
-                        self.typesetter.placements[key]=value if not error else {}
-                        self.typesetter.touch()
-                        for formula in self.analysis.get('formulas',[]):
-                            if 'view' in formula:self.remember_attachments(formula,self.prepare_view(formula['view'],self.source[:from_byte(self.source,formula['start'])],formula['display']))
-                        self.repaint_formulas()
-                    self.services.request("/api/attachments",{"path":body["path"],"expression":expression,"definitions":definitions,"display":display},attached,key="attachment:"+str(key))
-        self.services.request("/api/prewarm",body,warmed,key="prewarm")
+        for formula in self.analysis.get("formulas",[]):
+            for definitions,expression,display in self.attachment_nodes(formula):
+                key=(definitions,expression,display)
+                if key in self.typesetter.placements:continue
+                def attached(value,error,key=key):
+                    if revision!=self.revision:return
+                    self.typesetter.placements[key]=value if not error else {}
+                    self.typesetter.touch()
+                    for formula in self.analysis.get('formulas',[]):
+                        if 'view' in formula:self.remember_attachments(formula,self.prepare_view(formula['view'],self.source[:from_byte(self.source,formula['start'])],formula['display']))
+                    self.repaint_formulas()
+                self.services.request("/api/attachments",{"path":body["path"],"expression":expression,"definitions":definitions,"display":display},attached,key="attachment:"+str(key))
         self.semantic_highlight()
 
     @staticmethod
@@ -570,7 +549,8 @@ class Window(QMainWindow):
 
     def load_raw(self):
         if self.math_state and self.math_state.get('pending'):return
-        revision=self.revision;targets={};ranges=[];seen=set();stuck=False;context_end=0
+        revision=self.revision;targets={};ranges=[];seen=set();stuck=False;context_end=0;in_definition=False
+        definitions=[(style['start'],style['end']) for style in self.analysis.get('styles',[]) if style.get('kind')=='let']
         # A failed request leaves every fragment it covered without an image, and a
         # fragment the renderer refused leaves that one without an image. Either
         # verdict belongs to the revision it was made in: the next edit (usually the
@@ -591,20 +571,28 @@ class Window(QMainWindow):
                 if node.get('kind')!='raw':continue
                 stable=node.get('_raw_key');shared=('raw',node.get('text',''))
                 if not node.get('render_id'):
-                    # No range means the service can never be asked for this fragment,
-                    # and no warmup instance means no other way to an image. Record it
-                    # as failed: its source is shown, and a horizontal key enters it.
-                    if not node.get('warmup_key') and shared not in self.typesetter.cache:
+                    # No range means the service can never be asked for this fragment.
+                    # Record it as failed: its source is shown, and a horizontal key
+                    # enters it.
+                    if shared not in self.typesetter.cache:
                         self.typesetter.cache[shared]=False;stuck=True
                     continue
                 if stable in self.typesetter.cache or shared in self.typesetter.cache or shared in self.raw_pending or shared in seen:continue
                 source_id=':'.join(node['render_id'].split(':')[:2]);source_range=by_id.get(source_id)
                 if not source_range:continue
                 seen.add(shared);targets[source_id]=(stable,shared);ranges.append(source_range);wanted+=1
+                in_definition=in_definition or any(a<=source_range['start']<b for a,b in definitions)
             # Ask for a source that reaches only as far as the last fragment does:
             # the service then cuts the document there, so a mistake further down
             # cannot take the images of this viewport with it.
             if wanted:context_end=max(context_end,formula['end'])
+        if in_definition:
+            # A fragment inside a macro definition has no typeset result of its own:
+            # Typst renders it where the macro is called, and that call can be later
+            # in the document than the definition the fragment was asked from. The
+            # cut would drop the call and leave the fragment with no image at all, so
+            # one definition fragment compiles the whole document instead.
+            context_end=len(self.source.encode('utf-8'))
         if stuck:self.typesetter.touch();self.repaint_formulas()
         if not targets:return
         body=self.body()|{'raw':ranges,'formulas':[],'context_end':context_end}
@@ -729,11 +717,7 @@ class Window(QMainWindow):
         self.typesetter.cache.clear();self.typesetter.svg.clear()
         self.typesetter.placements.clear()
         qt_svg.cache_clear()
-        self.core.call("macro_warmup",clear=True,results=[])
-        def cleared(result,error):
-            if error:self.report(error)
-            else:self.background()
-        self.services.request("/api/cache/clear",{},cleared)
+        self.background()
 
     def export(self,kind):
         if kind=='pdf':self.compile_pdf(save_as=True,open_after=False);return

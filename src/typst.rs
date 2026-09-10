@@ -79,7 +79,6 @@ impl MacroRegistry {
 // thread, so a thread-local cache is empty for every request; the desktop is
 // single-threaded and keeps reusing the entries it already built.
 static MACROS: Mutex<MacroCache> = Mutex::new(MacroCache::new());
-static FAILED_WARMUPS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static EMPTY_MACROS: OnceLock<Arc<MacroRegistry>> = OnceLock::new();
 fn empty_macros() -> Arc<MacroRegistry> { EMPTY_MACROS.get_or_init(|| Arc::new(MacroRegistry::default())).clone() }
 struct MacroCache { entries: Vec<CacheEntry>, text: usize, misses: u32, saturated: bool }
@@ -94,7 +93,6 @@ fn key_hash(text: &str) -> u64 {
 }
 impl MacroCache {
     const fn new() -> Self { Self { entries: Vec::new(), text: 0, misses: 0, saturated: false } }
-    fn clear(&mut self) { self.entries.clear(); self.text = 0; self.misses = 0; self.saturated = false; }
     // Only a matching hash and length is verified as a whole string, so a
     // collision cannot return a registry for different definitions.
     fn find(&self, definitions: &str, hash: u64) -> Option<usize> {
@@ -127,27 +125,30 @@ impl MacroCache {
 // A poisoned lock still holds usable data: the caches are plain maps of derived
 // values, so recover instead of propagating a panic from an unrelated thread.
 fn poison_free<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { lock.lock().unwrap_or_else(|error| error.into_inner()) }
-fn warmup_failed(key: &str) -> bool {
-    // Takes the warmup lock on its own: analyze_macros runs while the registry
-    // lock is held, and no path may hold both in the opposite order.
-    poison_free(&FAILED_WARMUPS).as_ref().is_some_and(|failed| failed.contains(key))
+// The document prefix that ends where this definition ends. A fragment inside the
+// definition body sits at an offset in exactly this text, so that offset — not a
+// private rendering instance — is how its image is asked for.
+pub fn definition_prefix(def: &MacroDefinition) -> String { format!("{}{}", def.context, def.input) }
+// The offsets in the document at which a definition's own text spells `text`.
+// A fragment inside a macro template is rendered from its call site, but the
+// source range it is asked for is the one in the definition, so one definition
+// that writes the same fragment twice is disambiguated by ordinal, not by text.
+pub fn definition_raw_ranges(def: &MacroDefinition, text: &str) -> Vec<(usize, usize)> {
+    raw_ranges(&definition_prefix(def), 0, text).into_iter().filter(|(start, _)| *start >= def.definition_start).collect()
 }
-pub fn warmup_key(def: &MacroDefinition) -> String { format!("{}{}", def.context, def.input) }
-pub fn warmup_within_limit(def: &MacroDefinition) -> bool {
-    def.size.depth <= 64 && def.size.params.iter().fold(def.size.fixed, |n,w| capped_add(n,*w)) <= PROJECTION_LIMIT
-}
-pub fn set_warmup_results(results: &[(String, bool)]) {
-    {
-        let mut failed = poison_free(&FAILED_WARMUPS);
-        let failed = failed.get_or_insert_with(HashSet::new);
-        for (key, error) in results { if *error { failed.insert(key.clone()); } else { failed.remove(key); } }
+pub fn raw_ranges(source: &str, offset: usize, text: &str) -> Vec<(usize, usize)> {
+    fn visit(node: &SyntaxNode, at: usize, text: &str, out: &mut Vec<(usize, usize)>) {
+        if node.full_text().as_str() == text { out.push((at, at + node.len())); return; }
+        let mut pos = at;
+        let children: Vec<_> = node.children().collect();
+        for (i, child) in children.iter().enumerate() {
+            if child.kind() == SyntaxKind::Hash && children.get(i + 1).is_some_and(|next| format!("#{}", next.full_text()) == text) {
+                out.push((pos, pos + text.len()));
+            } else { visit(child, pos, text, out); }
+            pos += child.len();
+        }
     }
-    // Classified definitions changed, so every cached registry is stale.
-    poison_free(&MACROS).clear();
-}
-pub fn clear_warmup_results() {
-    *poison_free(&FAILED_WARMUPS) = None;
-    poison_free(&MACROS).clear();
+    let mut out = vec![]; visit(Source::detached(source).root(), offset, text, &mut out); out
 }
 
 // A prefix ends at the formula being edited. Traverse only its open lexical
@@ -362,9 +363,8 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
             } else if used.contains(&false) {
                 def.reason = "存在未显示的参数，无法提供全部参数输入框".into();
             } else {
-                def.expandable = !warmup_failed(&warmup_key(&def));
+                def.expandable = true;
                 def.reason = "所有参数均可在结构槽位中编辑".into();
-                if !def.expandable { def.reason = "空字符串实例预热失败，按普通调用渲染".into(); }
                 def.size = template_size(&template, &registry, def.params.len());
                 def.template = Arc::new(template);
             }

@@ -14,7 +14,7 @@ class RawCache:
     def bind(self,old,new):
         before=[n for n in nodes(old) if n.get('kind')=='raw']
         after=[n for n in nodes(new) if n.get('kind')=='raw']
-        def identity(n):return (n.get('text'),n.get('warmup_key'),n.get('origin'))
+        def identity(n):return (n.get('text'),n.get('origin'))
         matcher=SequenceMatcher(a=list(map(identity,before)),b=list(map(identity,after)),autojunk=False)
         for block in matcher.get_matching_blocks():
             for i in range(block.size):

@@ -20,14 +20,16 @@ pub struct View {
     pub definitions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    // Where the fragment's own text sits in the document. For a fragment inside a
+    // macro template that is the definition's text, which is also what its image
+    // is asked for: the call site compiles the template, so the fragment needs no
+    // rendering instance of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub warmup_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warmup_range: Option<[usize;2]>,
+    pub source_range: Option<[usize;2]>,
 }
 impl View {
     fn new(kind: &str, text: impl Into<String>, children: Vec<View>) -> Self {
-        Self { kind: kind.into(), text: text.into(), display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None, origin: None, warmup_key: None, warmup_range: None }
+        Self { kind: kind.into(), text: text.into(), display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None, origin: None, source_range: None }
     }
 }
 #[derive(Serialize)]
@@ -198,10 +200,10 @@ impl Editor {
             return;
         }
         if view.kind == "raw" {
-            view.definitions = Some(def.context.as_ref().clone()); view.origin = Some(def.source.clone()); view.warmup_key = Some(typst::warmup_key(def));
-            let ranges=crate::prewarm::definition_raw_ranges(def,&view.text);
+            view.definitions = Some(def.context.as_ref().clone()); view.origin = Some(def.source.clone());
+            let ranges=typst::definition_raw_ranges(def,&view.text);
             let ordinal=counts.entry(view.text.clone()).or_default();
-            view.warmup_range=ranges.get(*ordinal).map(|(a,b)|[*a,*b]);*ordinal+=1;
+            view.source_range=ranges.get(*ordinal).map(|(a,b)|[*a,*b]);*ordinal+=1;
         }
         for child in &mut view.children {
             self.bind_template_inner(child, def, registry, args, counts);

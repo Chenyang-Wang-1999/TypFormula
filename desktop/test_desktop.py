@@ -233,18 +233,40 @@ class NativeTest(unittest.TestCase):
         self.assertEqual(self.window.source,before)
         self.window.math_action('key',key='Escape')
 
-    def test_macro_background_warmup_updates_native_cache_without_source_edits(self):
+    def test_a_macro_fragment_is_rendered_from_its_call_site_like_any_other(self):
+        """The ordinary render batch covers a fragment inside a macro template.
+
+        The fragment's own text lives in the definition, so that is the range the
+        batch asks for; the document's call to the macro is what compiles it.
+        """
         self.load('#let fixed(x) = $#x + cancel(a)$\n$fixed(y)$')
-        before=self.window.source;history=list(self.window.history)
-        self.window.background()
-        loop=QEventLoop();poll=QTimer();deadline=QTimer();deadline.setSingleShot(True)
-        def ready():
-            if not self.window.services.active and not self.window.services.queue and not self.window.lsp.active and not self.window.lsp.queue:loop.quit()
-        poll.timeout.connect(ready);poll.start(20);deadline.timeout.connect(loop.quit);deadline.start(45000)
-        loop.exec_();poll.stop();deadline.stop()
-        self.assertTrue(self.window.typesetter.cache)
-        self.assertEqual(self.window.source,before);self.assertEqual(self.window.history,history)
-        self.assertEqual(self.window.preview_revision,-1,'macro warmup must not compile a live page preview')
+        window=self.window;window.compile_timer.stop()
+        before=window.source;history=len(window.history)
+        calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.load_raw()
+        self.assertEqual(len(calls),1)
+        definition=window.source.index('cancel(a)')
+        self.assertIn({'id':f'{definition}:{definition+9}','start':definition,'end':definition+9},calls[0]['raw'])
+        node=next(node for node in window.view_nodes(window.analysis['formulas'][0]['view']) if node['kind']=='raw')
+        self.assertIsInstance(window.typesetter.raw(node),dict,'the batch result is what this fragment draws')
+        self.assertEqual(window.preview_revision,-1,'an image request must not compile a live page preview')
+        self.assertEqual(window.source,before);self.assertEqual(len(window.history),history,'asking for an image never edits the document')
+
+    def test_a_definition_fragment_keeps_the_call_that_renders_it(self):
+        """Typst typesets a definition's fragment where the macro is called, so the
+        context cut may not drop a call that is later in the document."""
+        self.load('#let fixed(x) = $#x + cancel(a)$\n\n$ fixed(y) $')
+        window=self.window;window.compile_timer.stop();window.raw_timer.stop()
+        # Only the definition's own formula is on screen; its call sits below it.
+        with patch.object(window,'visible_formula_starts',return_value={window.source.index('$#x')}):
+            calls,request=self.fake_render()
+            with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+                window.load_raw()
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0]['context_end'],len(window.source.encode('utf-8')),'the call must stay inside the compiled source')
+        node=next(node for node in window.view_nodes(window.analysis['formulas'][0]['view']) if node['kind']=='raw')
+        self.assertIsInstance(window.typesetter.raw(node),dict)
 
     def test_typst_controls_native_limit_placement(self):
         self.load('$ sum_1^2 $')
@@ -262,7 +284,6 @@ class NativeTest(unittest.TestCase):
             if route=='/api/render':
                 calls.append(body)
                 callback({'items':[{'id':r['id']+':0:0','svg':'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>','base_font_size_pt':1,'base_font_height_pt':1,'base_font_baseline_pt':.8} for r in body['raw']]},None)
-            elif route=='/api/prewarm':callback({'results':[]},None)
             elif route=='/api/preview':callback({'pages':[]},None)
             else:callback({},None)
         return calls,request
@@ -384,16 +405,15 @@ class NativeTest(unittest.TestCase):
 
     def test_background_services_do_not_compile_live_preview_or_editor_raw(self):
         from unittest.mock import patch
-        self.load('$cancel(a)$');window=self.window;window.raw_timer.stop();calls=[]
+        self.load('$ sum_1^2 cancel(a) $');window=self.window;window.raw_timer.stop();calls=[]
         def request(route,body,callback,key=None):
             calls.append(route)
-            if route=='/api/prewarm':callback({'results':[]},None)
-            else:callback({},None)
+            callback({},None)
         document_revision=window.editor.document().revision()
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
             window.background()
-        self.assertNotIn('/api/preview',calls);self.assertIn('/api/prewarm',calls)
-        self.assertNotIn('/api/render',calls)
+        self.assertIn('/api/attachments',calls)
+        self.assertNotIn('/api/preview',calls);self.assertNotIn('/api/render',calls)
         self.assertEqual(window.editor.document().revision(),document_revision)
 
     def test_window_has_no_live_preview_pane_and_pdf_button_uses_typst_pdf(self):
@@ -498,7 +518,7 @@ class NativeTest(unittest.TestCase):
         from .incremental import merge
         def formula(start,text):
             return {'start':start,'end':start+3,'editable':True,
-                'view':{'kind':'cell','children':[{'kind':'raw','text':text,'render_id':f'{start}:{start+3}:0:0','warmup_range':[start,start+3]}]},
+                'view':{'kind':'cell','children':[{'kind':'raw','text':text,'render_id':f'{start}:{start+3}:0:0','source_range':[start,start+3]}]},
                 'render':{'source':'old','raw':[{'id':f'{start}:{start+3}:0','start':start,'end':start+3}]}}
         previous={'formulas':[formula(0,'a'),formula(10,'b')],'styles':[]}
         syntax={'formulas':[{'start':0,'end':3,'editable':True},{'start':12,'end':15,'editable':True}],'styles':[]}
@@ -513,12 +533,12 @@ class NativeTest(unittest.TestCase):
         self.assertIsNot(second['view'],previous['formulas'][1]['view'])
         self.assertEqual((second['start'],second['end']),(12,15))
         self.assertEqual(second['view']['children'][0]['render_id'],'12:15:0:0')
-        self.assertEqual(second['view']['children'][0]['warmup_range'],[12,15])
+        self.assertEqual(second['view']['children'][0]['source_range'],[12,15])
         self.assertEqual(second['render']['raw'][0]['id'],'12:15:0')
         old=previous['formulas'][1]
         self.assertEqual((old['start'],old['end']),(10,13))
         self.assertEqual(old['view']['children'][0]['render_id'],'10:13:0:0')
-        self.assertEqual(old['view']['children'][0]['warmup_range'],[10,13])
+        self.assertEqual(old['view']['children'][0]['source_range'],[10,13])
         self.assertEqual(old['render']['raw'][0]['id'],'10:13:0')
 
     def test_the_math_font_covers_every_glyph_the_core_can_draw(self):

@@ -55,7 +55,7 @@ class Stderr:
 QUICK = 10.0
 SLOW = 60.0
 BUDGETS = {"set_source":SLOW,"analyze":SLOW,"analyze_formula":SLOW,
-    "activate_formula":SLOW,"macro_warmup":SLOW,"preview_results":SLOW}
+    "activate_formula":SLOW,"preview_results":SLOW}
 
 class Core(QObject):
     """One document and one formula session, in one child process.
@@ -156,7 +156,7 @@ class Core(QObject):
         """
         self.spawn()
         if self.document is None:return
-        if self.exchange("set_source",{"source":self.document,"reset_warmups":True},self.budget("set_source")) is None:return
+        if self.exchange("set_source",{"source":self.document},self.budget("set_source")) is None:return
         if self.active is not None:self.exchange("activate_formula",{"start":self.active},self.budget("activate_formula"))
 
     def reason(self):

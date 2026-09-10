@@ -53,12 +53,6 @@ fn equations_with_nodes(node:&SyntaxNode,start:usize,out:&mut Vec<(Equation,Synt
     }
     let mut offset=start;for child in node.children(){equations_with_nodes(child,offset,out);offset+=child.len();}
 }
-fn equation_at(node:&SyntaxNode,at:usize,target:usize)->Option<&SyntaxNode> {
-    if node.kind()==SyntaxKind::Equation{return (at==target).then_some(node);}
-    let mut pos=at;
-    for child in node.children(){if pos<=target&&target<pos+child.len(){if let Some(found)=equation_at(child,pos,target){return Some(found);}}pos+=child.len();}
-    None
-}
 impl Document {
     pub fn source(&self) -> String { self.source.clone() }
     pub fn syntax(&self)->&Source {&self.syntax}
@@ -87,7 +81,6 @@ impl Document {
         let name = value["action"].as_str().ok_or("缺少操作")?;
         match name {
             "set_source" => {
-                if value["reset_warmups"].as_bool()==Some(true) { typst::clear_warmup_results(); }
                 let source=value["source"].as_str().ok_or("缺少源码")?;
                 self.last_reparsed=self.syntax.replace(source);self.source=source.into();
                 self.active = None; self.editor = Editor::default(); self.revision += 1;
@@ -114,20 +107,6 @@ impl Document {
                 self.active = None; self.editor = Editor::default();
             }
             "state" => {},
-            "macro_warmup" => {
-                if self.editor.pending().is_some() { return Err("命令草稿期间暂缓更新宏模板".into()); }
-                let results: Vec<(String,bool)> = serde_json::from_value(value["results"].clone()).map_err(|e|e.to_string())?;
-                let before:Vec<_>=typst::macro_registry(&self.editor.definitions).entries.iter().map(|d|d.expandable).collect();
-                if value["clear"].as_bool()==Some(true) { typst::clear_warmup_results(); }
-                typst::set_warmup_results(&results);
-                let after:Vec<_>=typst::macro_registry(&self.editor.definitions).entries.iter().map(|d|d.expandable).collect();
-                if let Some(range) = &self.active && before!=after {
-                    let parsed = typst::parse_formula_node(equation_at(self.syntax.root(),0,range.start).ok_or("公式语法节点已变化")?,&self.editor.definitions)?;
-                    self.editor.root = parsed.root;
-                    self.editor.cursor = Cursor::default();
-                    self.editor.anchor = None;self.editor.geometry.clear();
-                }
-            }
             _ => {
                 let range = self.active.clone().ok_or("请先进入公式")?;
                 let committed = self.source.get(range.start..range.end).unwrap_or_default().to_string();
@@ -159,24 +138,6 @@ impl Document {
         let mut raw = vec![]; let mut blocks = vec![]; let mut formulas = vec![];
         if let Some(range) = &self.active {
             let equation = &self.source[range.start..range.end];
-            fn owner(node: &SyntaxNode, at: usize, target: usize, source: &str) -> Option<String> {
-                if target < at || target >= at+node.len() { return None; }
-                let mut found = (node.kind()==SyntaxKind::LetBinding).then(||source[..at+node.len()].to_owned());
-                let mut pos = at;
-                for child in node.children() { if let Some(key)=owner(child,pos,target,source) { found=Some(key); } pos+=child.len(); }
-                found
-            }
-            fn warmup(view: &mut Value, key: &Option<String>, equation: &str, offset: usize, counts: &mut HashMap<String,usize>) {
-                if view["kind"]=="raw" && view.get("warmup_key").is_none() { if let Some(key)=key {
-                    view["warmup_key"]=json!(key);
-                    let text=view["text"].as_str().unwrap_or_default();
-                    let ordinal=counts.entry(text.to_owned()).or_default();
-                    if let Some((a,b))=crate::prewarm::raw_ranges(equation,offset,text).get(*ordinal) { view["warmup_range"]=json!([a,b]); }
-                    *ordinal+=1;
-                } }
-                if let Some(children)=view["children"].as_array_mut() { for child in children { warmup(child,key,equation,offset,counts); } }
-            }
-            warmup(&mut response["view"], &owner(self.syntax.root(),0,range.start,&self.source),equation,range.start,&mut HashMap::new());
             // Every Raw atom gets a source range, whatever the formula's spelling.
             // Gating this on the canonical serialization was why a formula typed
             // with fewer spaces than the writer emits never rendered its fragments.
@@ -272,14 +233,14 @@ fn annotate(view: &mut Value, root: &MathData, locator: &Locator, raw: &mut Vec<
             cell_mut(&mut copy, &cursor.slices)[cursor.pos] = MathAtom::raw(&marker);
             let marked = typst::write_document_mode(&copy,"",locator.equation.starts_with("$ "));
             locator.locate(&marked, &marker, &text)
-        } else if let Ok([start,end]) = serde_json::from_value::<[usize;2]>(view["warmup_range"].clone()) {
+        } else if let Ok([start,end]) = serde_json::from_value::<[usize;2]>(view["source_range"].clone()) {
             locator.verified(start,end,&text)
         } else {
             // A fragment of a macro template: it lives in the definition text, which
             // is the document prefix the view records alongside it.
             let context = view["definitions"].as_str().unwrap_or_default(); let origin = view["origin"].as_str().unwrap_or_default();
             let start = context.len(); let mut ranges = vec![];
-            if locator.document.get(start..start+origin.len()) == Some(origin) { ranges=crate::prewarm::raw_ranges(origin,start,&text); }
+            if locator.document.get(start..start+origin.len()) == Some(origin) { ranges=typst::raw_ranges(origin,start,&text); }
             ranges.first().and_then(|(a,b)| locator.verified(*a,*b,&text))
         };
         if let Some((start,end)) = range {

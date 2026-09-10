@@ -20,10 +20,10 @@ def _shift_id(value,start,end,delta):
 # being deep copied once per keystroke.
 def _shift_view(node,start,end,delta):
     result=node
-    if isinstance(node.get('warmup_range'),list):
-        shifted=_range(*node['warmup_range'],start,end,delta)
-        if shifted and list(shifted)!=node['warmup_range']:
-            result={**result,'warmup_range':list(shifted)}
+    if isinstance(node.get('source_range'),list):
+        shifted=_range(*node['source_range'],start,end,delta)
+        if shifted and list(shifted)!=node['source_range']:
+            result={**result,'source_range':list(shifted)}
     if 'render_id' in node:
         moved=_shift_id(node['render_id'],start,end,delta)
         if moved!=node['render_id']:result={**result,'render_id':moved}

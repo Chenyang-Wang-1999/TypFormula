@@ -1,4 +1,4 @@
-use visual_typst_core::{typst, prewarm, document::Document};
+use visual_typst_core::{typst, document::Document, services::{RawRange, RenderRequest, Services}};
 use serde_json::json;
 
 #[test]
@@ -26,60 +26,78 @@ fn function_parameters_and_later_bindings_do_not_resolve_outer_macros() {
 }
 
 #[test]
-fn warmups_pass_explicit_empty_strings_and_never_edit_source() {
+fn expandability_is_decided_by_structure_alone() {
+    // A template that no render result can affect: the editor can show every
+    // parameter in a slot, which is the whole condition.
     let source = "#let opaque(x) = x + 1\n#let f(x, y) = $cancel(a) + #x/#y$\n#[#let g(z) = $#z + cancel(b)$\n]";
-    let jobs = prewarm::plans(source);
-    assert_eq!(jobs.len(),2);
-    assert!(jobs[0].request["source"].as_str().unwrap().contains("f(\"\", \"\")"),"{}", jobs[0].request);
-    assert!(!jobs[0].request["raw"].as_array().unwrap().is_empty(),"fixed Raw nodes have source mappings: {}", jobs[0].request);
-    assert!(jobs[1].request["source"].as_str().unwrap().ends_with(']'));
-    assert!(!source.contains("f(\"\""));
-    let key = jobs[0].key.clone();
-    typst::set_warmup_results(&[(key.clone(),true)]);
-    assert!(!typst::macro_registry(&key).get("f").unwrap().expandable);
-    typst::set_warmup_results(&[(key.clone(),false)]);
-    assert!(typst::macro_registry(&key).get("f").unwrap().expandable);
+    let registry = typst::macro_registry(source);
+    assert!(registry.get("f").unwrap().expandable, "{}", registry.get("f").unwrap().reason);
+    // A binding inside a completed content block is out of scope at the end of the
+    // prefix, so it is not a definition of this prefix at all.
+    assert!(registry.get("g").is_none());
+    // A definition whose body is not a formula, or that hides a parameter, stays
+    // source-mode regardless of what its fragments would render as.
+    assert!(!typst::macro_registry("#let opaque(x) = x + 1").get("opaque").unwrap().expandable);
+    assert!(!typst::macro_registry("#let hidden(x) = $cancel(a)$").get("hidden").unwrap().expandable);
 }
 
 #[test]
-fn warmup_failure_reclassifies_active_call_without_source_or_history_edits() {
+fn a_template_fragment_is_asked_for_at_its_own_place_in_the_definition() {
+    let source = "#let f(x, y) = $cancel(a) + #x/#y$";
+    let definition = typst::macro_registry(source).get("f").cloned().unwrap();
+    let ranges = typst::definition_raw_ranges(&definition, "cancel(a)");
+    assert_eq!(ranges.len(),1,"{ranges:?}");
+    assert_eq!(&source[ranges[0].0..ranges[0].1],"cancel(a)");
+    // The prefix the range is measured in is the document prefix, so the offset is
+    // the document's own — nothing here is a private copy of the definition.
+    assert_eq!(typst::definition_prefix(&definition),source);
+}
+
+#[test]
+fn a_call_site_fragment_carries_the_definition_range_it_is_rendered_from() {
     let source="#let fixed(x) = $#x + cancel(a)$\n$ fixed(z) $";
     let mut doc=Document::default();doc.apply(json!({"action":"set_source","source":source})).unwrap();
     doc.apply(json!({"action":"activate_formula","start":source.rfind("$ fixed").unwrap()})).unwrap();
-    let before=doc.response();let key=prewarm::plans(source)[0].key.clone();
-    doc.apply(json!({"action":"macro_warmup","results":[[key,true]]})).unwrap();
-    let after=doc.response();assert_eq!(after["source"],before["source"]);assert_eq!(after["revision"],before["revision"]);assert_eq!(after["undo"],before["undo"]);
-    assert_eq!(after["view"]["children"][1]["kind"],"raw");
-    typst::set_warmup_results(&[(key,false)]);
+    let response=doc.response();
+    let definition=source.find("cancel(a)").unwrap();
+    let raw=response["render"]["raw"].as_array().unwrap().clone();
+    assert_eq!(raw.len(),1,"{response}");
+    assert_eq!(raw[0]["start"].as_u64().unwrap() as usize,definition);
+    assert_eq!(raw[0]["end"].as_u64().unwrap() as usize,definition+"cancel(a)".len());
+    let view=response["view"].to_string();
+    assert!(view.contains(&format!("\"source_range\":[{definition},")),"{view}");
+    assert_eq!(response["source"],source,"asking for an image never edits the document");
 }
 
 #[test]
-fn templates_only_map_their_own_raw_ranges_and_keep_duplicate_occurrences() {
+fn duplicate_fragments_in_one_definition_keep_distinct_ranges() {
     let source="#[#let unused = $cancel(a)$]\n#let fixed(x) = $#x + cancel(a) + b^(cancel(a))$\n$ fixed(z) $";
-    let plans=prewarm::plans(source);let plan=plans.iter().find(|p|p.key.contains("#let fixed")).unwrap();
-    let raw=plan.request["raw"].as_array().unwrap();assert_eq!(raw.len(),2);
-    assert!(raw.iter().all(|r|r["start"].as_u64().unwrap() as usize>source.find("#let fixed").unwrap()));
+    let definition=typst::macro_registry(source).get("fixed").cloned().unwrap();
+    let ranges=typst::definition_raw_ranges(&definition,"cancel(a)");
+    assert_eq!(ranges.len(),2,"{ranges:?}");
+    assert_ne!(ranges[0],ranges[1]);
+    let owner=source.find("#let fixed").unwrap();
+    assert!(ranges.iter().all(|(start,_)| *start>owner),"a fragment of another definition is not this one's: {ranges:?}");
     let mut doc=Document::default();doc.apply(json!({"action":"set_source","source":source})).unwrap();
     doc.apply(json!({"action":"activate_formula","start":source.rfind("$ fixed").unwrap()})).unwrap();
-    let response=doc.response();assert_eq!(response["render"]["raw"].as_array().unwrap().len(),2);
+    let raw=doc.response()["render"]["raw"].as_array().unwrap().clone();
+    assert_eq!(raw.len(),2,"{raw:?}");
+    assert_eq!(raw[0]["start"].as_u64().unwrap() as usize,ranges[0].0);
+    assert_eq!(raw[1]["start"].as_u64().unwrap() as usize,ranges[1].0);
 }
 
 #[test]
 #[ignore = "requires the built native renderer"]
-fn native_warmups_render_without_real_calls_and_isolate_failures() {
-    let service=visual_typst_core::services::Services::new(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    let source="#let fixed(x) = $#x + cancel(a)$\n#let broken(x) = $#x + nonexistent(1)$\n#[#set text(size: 23pt)\n#let local(x) = $#x + cancel(b)$\n]\n#{ let code(x) = $#x + cancel(c)$; }\n#let amount = 7\n#let hashed(x) = $#x + #amount$";
-    let body=json!({"path":"main.typ","source":source});
-    let result=service.prewarm(body.clone()).unwrap();
-    let items=result["results"].as_array().unwrap();assert_eq!(items.len(),5,"{result}");
-    assert_eq!(items[0]["failed"],false,"{result}");
-    assert!(!items[0]["items"].as_array().unwrap().is_empty(),"{result}");
-    assert_eq!(items[0]["items"][0]["template_source"],"cancel(a)");
-    assert_eq!(items[1]["failed"],true,"{result}");
-    assert_eq!(items[2]["failed"],false,"{result}");
-    assert_eq!(items[2]["items"][0]["environment_font_size_pt"],23.0,"{result}");
-    assert_eq!(items[3]["failed"],false,"{result}");
-    assert!(!items[3]["items"].as_array().unwrap().is_empty(),"{result}");
-    assert_eq!(items[4]["failed"],false,"{result}");assert_eq!(items[4]["items"][0]["template_source"],"#amount","{result}");
-    assert_eq!(service.prewarm(body).unwrap(),result,"cached response is stable");
+fn a_call_site_fragment_renders_from_the_document_its_own_call() {
+    let service=Services::new(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let source="#let fixed(x) = $#x + cancel(a)$\n$ fixed(z) $";
+    let definition=typst::macro_registry(source).get("fixed").cloned().unwrap();
+    let (start,end)=typst::definition_raw_ranges(&definition,"cancel(a)")[0];
+    let request=RenderRequest{preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),
+        source:source.into(),raw:vec![RawRange{id:format!("{start}:{end}"),start,end}],formulas:vec![],preview_hashes:vec![],context_end:None};
+    let result=service.render(request).unwrap();
+    let items=result["items"].as_array().unwrap();
+    assert_eq!(items.len(),1,"the call site is what compiles the fragment: {result}");
+    assert_eq!(items[0]["start"].as_u64().unwrap() as usize,start);
+    assert!(items[0]["svg"].as_str().unwrap().contains("<svg"));
 }

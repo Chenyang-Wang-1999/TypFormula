@@ -5,8 +5,6 @@ pub mod math;
 pub mod typst;
 pub mod view;
 pub mod document;
-pub mod prewarm;
-mod warmup_service;
 pub mod services;
 pub mod workspace;
 pub mod packages;

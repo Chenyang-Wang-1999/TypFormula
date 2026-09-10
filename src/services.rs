@@ -207,9 +207,9 @@ impl RenderAdapter {
 #[derive(Deserialize, Serialize)]
 pub struct AttachmentRequest { #[serde(default="default_path")] pub path: String, pub expression: String, #[serde(default)] pub definitions: String, pub display: bool }
 
-pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, document_lsp: Mutex<Option<DocumentLsp>>, pub workspace: PathBuf, render_adapter: Mutex<Option<RenderAdapter>>, pub(crate) warmups: Mutex<std::collections::HashMap<String,Value>> }
+pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, document_lsp: Mutex<Option<DocumentLsp>>, pub workspace: PathBuf, render_adapter: Mutex<Option<RenderAdapter>> }
 impl Services {
-    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("VISUAL_TYPST_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None), warmups: Mutex::new(std::collections::HashMap::new()) } }
+    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("VISUAL_TYPST_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None) } }
     fn adapter_bin(&self) -> PathBuf {
         if let Some(path)=std::env::var_os("VISUAL_TYPST_ADAPTER") { return path.into(); }
         let name=if cfg!(windows) { "visual-typst-layout.exe" } else { "visual-typst-layout" };
