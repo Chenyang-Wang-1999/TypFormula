@@ -16,7 +16,7 @@ from .rawcache import signature
 
 APPLICATION=QApplication.instance() or QApplication([])
 from .model import ROOT
-for font in [ROOT/'web/fonts/NewCMMath-Regular.otf',Path('C:/Windows/Fonts/segoeui.ttf'),Path('C:/Windows/Fonts/msyh.ttc'),Path('C:/Windows/Fonts/consola.ttf')]:
+for font in [ROOT/'fonts/NewCMMath-Regular.otf',Path('C:/Windows/Fonts/segoeui.ttf'),Path('C:/Windows/Fonts/msyh.ttc'),Path('C:/Windows/Fonts/consola.ttf')]:
     if font.exists():QFontDatabase.addApplicationFont(str(font))
 APPLICATION.setFont(QFont('Microsoft YaHei',9))
 

@@ -24,7 +24,7 @@ struct FormulaWorld { library: LazyHash<Library>, fonts: typst_kit::fonts::FontS
 fn font_store(system:bool)->typst_kit::fonts::FontStore {
     let mut fonts=typst_kit::fonts::FontStore::new();
     // Prefer the exact math font used by the structural editor.
-    let font=Font::new(Bytes::new(include_bytes!("../../web/fonts/NewCMMath-Regular.otf").as_slice()),0).expect("embedded math font");
+    let font=Font::new(Bytes::new(include_bytes!("../../fonts/NewCMMath-Regular.otf").as_slice()),0).expect("embedded math font");
     fonts.push((font.clone(),font.info().clone()));
     fonts.extend(typst_kit::fonts::embedded());
     if system { fonts.extend(typst_kit::fonts::system()); }

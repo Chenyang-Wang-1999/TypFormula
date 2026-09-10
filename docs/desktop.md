@@ -1,6 +1,6 @@
 # 原生桌面端
 
-前端使用 Qt Widgets / PyQt5，直接绘制文本和公式。Rust 核心通过私有标准输入输出管道提供一个文档与一个活动公式会话；Tinymist 和 Typst 编译在独立后台管道执行。不需要浏览器、WebView、HTTP 服务或 WASM。
+前端使用 Qt Widgets / PyQt5，直接绘制文本和公式。Rust 核心通过私有标准输入输出管道提供一个文档与一个活动公式会话；Tinymist 和 Typst 编译在独立后台管道执行。整个程序不监听任何端口，也没有浏览器或 WebView 组件。
 
 ## 启动
 
@@ -17,7 +17,7 @@ python -m pip install -r desktop/requirements.txt  # 已安装 PyQt5 时无需�
 
 构建脚本只构建，不启动窗口。当前提供源码运行入口，尚未打包独立安装器。`VISUAL_TYPST_PYTHON` 可指定 Python 可执行文件；`VISUAL_TYPST_BIN` 可指定核心程序。未设置时使用 `target/server/debug/visual-typst.exe`。原生渲染器使用 `target/adapter/debug/visual-typst-layout.exe`。Tinymist 的查找规则与正式版后端相同。
 
-正式版代码与资源不依赖 `prototypes/`。桌面端只从 `web/fonts/` 复用正式版数学字体，不载入 Web 前端代码。`desktop/mathfont.py` 启动时注册随附字体并读回 Qt 报告的真实家族名（数学字体为 `NewComputerModern Math`；同一文件在 Windows 上还以 `NewComputerModernMath` 出现），公式用哪一款由设置项 `math_font` 决定，未安装的名字不会被交给 `QFont`——Qt 对找不到的家族名会静默换成系统字体，随后逐字回退又会在同一个公式里混入第三、第四种设计。`math_font` 需要是有数学字形覆盖的字体，换成正文文本字体会让 `≤`、`∑` 这类字符再次逐字回退。
+正式版代码与资源不依赖 `prototypes/`。随附数学字体位于 `fonts/`，桌面端只从这里加载字体，不载入任何前端代码。`desktop/mathfont.py` 启动时注册随附字体并读回 Qt 报告的真实家族名（数学字体为 `NewComputerModern Math`；同一文件在 Windows 上还以 `NewComputerModernMath` 出现），公式用哪一款由设置项 `math_font` 决定，未安装的名字不会被交给 `QFont`——Qt 对找不到的家族名会静默换成系统字体，随后逐字回退又会在同一个公式里混入第三、第四种设计。`math_font` 需要是有数学字形覆盖的字体，换成正文文本字体会让 `≤`、`∑` 这类字符再次逐字回退。
 
 ## TODO 对应功能
 
@@ -49,7 +49,7 @@ python -m pip install -r desktop/requirements.txt  # 已安装 PyQt5 时无需�
 
 补全覆盖正文源码、刚输入的公式源码以及公式内的 `\` 命令模式。源码候选可用 Enter/Tab 接受；公式候选由方向键选择、点击填入、Enter 确认，内置候选即时出现，Tinymist 使用独立命令投影补充候选。字符串模式不弹出命令补全。命令区域采用淡蓝衬底/细边框，字符串区域采用淡米色衬底/细边框。
 
-普通方向键在结构内部优先移动，无法继续移动时跳回公式前后或上下方正文。Shift 仍用于选区；命令和字符串模式保留自身导航规则。边框上是**没有图片的 Raw 片段**时，左右键先进入它的源码（左右分别把光标放在末尾和开头），Esc 退出并恢复原片段；这条路径与 Web 端共用核心里的同一条规则。
+普通方向键在结构内部优先移动，无法继续移动时跳回公式前后或上下方正文。Shift 仍用于选区；命令和字符串模式保留自身导航规则。边框上是**没有图片的 Raw 片段**时，左右键先进入它的源码（左右分别把光标放在末尾和开头），Esc 退出并恢复原片段；这条规则在核心中，窗口只负责把它接上键盘。
 
 Raw SVG 按可见公式/活动公式按需加载。每个 Raw 的源码区间由 `Document::annotate` 给出：规范序列化只用来估算位置，最终以"该区间里恰好是这段文本"为准，因此按自己习惯书写的公式（`sum_(n=0)` 而规范写法是 `sum_(n = 0)`）同样能出图。结构编辑中，Raw 的缓存身份独立于源码字节位置，编辑相邻字符不会重新请求已有 SVG；修改脚标时保留基底 Raw，离开修改过的脚标槽后只失效该基底。新 Raw、Raw 源码改变、正文/定义重建及显式刷新会按需生成新的结果。桌面端不再自动编译整页预览。
 

@@ -16,7 +16,7 @@ from .model import ROOT
 
 # The editor fonts the project bundles. The family Qt reports for a file is not
 # always the file name, so install() reads the name back instead of assuming it.
-BUNDLED = ("web/fonts/NewCMMath-Regular.otf", "web/fonts/NewCM10-Italic.otf")
+BUNDLED = ("fonts/NewCMMath-Regular.otf", "fonts/NewCM10-Italic.otf")
 # Typst's own math font: the family NewCMMath-Regular.otf reports, and the one
 # its compiled preview is set in.
 DEFAULT_MATH = "NewComputerModern Math"

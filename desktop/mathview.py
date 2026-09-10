@@ -184,9 +184,9 @@ class Typesetter:
                 box.raws.append((QRectF(0,0,width,height),node))
                 return box
             if item is False:
-                # Asked for and refused. Its source is shown instead, marked the way
-                # the web editor marks a failed fragment, and the core lets a
-                # horizontal key enter it so it can be repaired in place.
+                # Asked for and refused. Its source is shown instead, marked with
+                # dashes and warm ground, and the core lets a horizontal key enter
+                # it so it can be repaired in place.
                 glyph, draw_font, width = self.source_run(node.get("text", ""), factor)
                 box = Box(width,em,ascent,[("text",0,ascent,(glyph,draw_font,kind))])
                 box.operations.insert(0,("failed",0,0,(width,em)))
@@ -322,7 +322,7 @@ class Typesetter:
             elif kind == "selection":
                 painter.fillRect(QRectF(px,py,*value),QColor("#a8cdf3"))
             elif kind == "failed":
-                # Same mark as the web editor's render error: dashes, warm ground.
+                # A fragment with no image: dashes, warm ground.
                 width,height=value
                 painter.setBrush(QColor("#fff2eb"))
                 painter.setPen(QPen(QColor("#b3654e"),1,Qt.DashLine))

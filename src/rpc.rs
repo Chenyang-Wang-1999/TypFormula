@@ -1,4 +1,4 @@
-//! Private stdio transport for the VS Code extension. No listening socket.
+//! Private stdio transport for the desktop window. No listening socket.
 use crate::{packages, services::Services};
 use serde_json::{Value, json};
 use std::{io::{self, BufRead, Read, Write}, path::PathBuf, sync::{Arc, Mutex}};

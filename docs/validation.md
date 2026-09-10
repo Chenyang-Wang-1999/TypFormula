@@ -1,5 +1,7 @@
 # 验证记录 · 2026-09-09
 
+> **当前状态（2026-09-10 之后）**：仓库只维护原生桌面编辑器。Web 前端（`web/`）、VS Code 扩展（`extensions/`）、VSIX 产物（`dist/`）、HTTP 模式（`start.cmd`）、WASM 桥（`src/wasm.rs`）和 npm 工具链（`package.json`、`scripts/`、`tests/*.test.mjs`）已删除，随附字体从 `web/fonts/` 移到 `fonts/`。下面按时间顺序保留当时的实测记录：其中 Web/VSIX 相关的构建、`npm test`、`build.cmd`/`start.cmd`、`web/core.wasm` 等条目属于历史证据，不再是可执行的验证入口；当前可用的入口见 [README「验证入口」](../README.md)。
+
 ## 原生 Qt 桌面端
 
 后续桌面交互回归扩展至 32 项：增加源码补全弹窗 Enter 接受与撤销、真实公式命令投影补全、新公式源码自动触发、命令/字符串衬底、四向边界跳出、Raw 源区间移动仍复用 SVG、离开修改过的脚标槽时仅刷新基底 Raw、变量行高与源码行号，以及预览周期不请求 Raw、不重建编辑投影。均为离屏测试。

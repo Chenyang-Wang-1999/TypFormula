@@ -1,4 +1,4 @@
-"""Private pipes; no web server, WebView or WASM. Qt owns child lifetime."""
+"""Private pipes to the native backends. Qt owns child lifetime."""
 import json
 import os
 import time
