@@ -1,6 +1,7 @@
 {
   "font_family": "Consolas",
   "font_size": 12,
+  "math_font": "NewComputerModern Math",
   "svg_scale": 1.0,
   "shortcuts": {}
 }

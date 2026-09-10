@@ -12,7 +12,7 @@
 - 每个编辑按钮都有独立的 **Visual Typst:** 命令。点击 **快捷键** 打开 VS Code 键盘快捷方式配置；可给所有按钮改键或增加键绑定。默认 Ctrl+Alt+I 插入行内公式、Ctrl+Alt+B 插入行间公式、Ctrl+Alt+P 切换预览，macOS 使用 Cmd。
 - 在公式外按左右键，可从紧邻边界跳入；上下键按相邻视觉行和横向位置选择公式槽位。Shift+方向键及纯源码模式保持普通选区/导航。
 - 公式框随内容自然撑开，达到编辑列宽度／高度上限后在框内滚动，不按框缩放内容。深层结构上下标有可读字号下限，滚动时保持光标和槽位导航坐标同步。
-- VS Code 的 TextDocument 负责保存、脏标记和全局撤销。并发冲突时保留当前输入，显示处理按钮。文件树、Git 和普通源码编辑器仍由 VS Code 提供。
+- VS Code 的 TextDocument 负责保存、脏标记和文件状态；撤销／重做由扩展宿主记录本文档的历史并用 WorkspaceEdit 回放。并发冲突时保留当前输入，显示处理按钮。文件树、Git 和普通源码编辑器仍由 VS Code 提供。
 - 推荐安装 Tinymist 扩展，以桥接它的语言功能。原生整页预览随 VSIX 附带，支持系统字体及标准随附字体。
 
 从源码生成扩展：`.\build-vscode.cmd`。该命令只构建并打包，不安装、不发布、不启动 VS Code。当前产物为 Windows x64；其他平台需在对应平台构建原生程序和 VSIX。更多说明见 [扩展 README](extensions/vscode/README.md)。下文仍保留独立版本的运行方式。
@@ -40,6 +40,7 @@ Tinymist 从 PATH、VS Code/Cursor 扩展目录或 `TINYMIST_BIN` 查找。没�
 - **编辑光标处公式**：在已有 `$…$` 内放置光标后点击。进入和离开公式不会仅因解析而重写其源码；实际结构修改只替换该公式区间。
 - 公式内 `\` 输入命令，Enter 确认，Tab 切换槽位，`/` 创建分式，`^` / `_` 创建上下标。在最外层按 Esc 或点击 **完成公式** 返回代码输入。有命令草稿时先确认或取消。
 - 行内公式使用与代码一致的 `--editor-size`（默认 16px），采用数学字体；边框和留白紧贴内容。所有 Raw SVG 按该字号缩放。
+- 公式里"合法但结构编辑器不建模"的片段（`sum`、`integral`、`dif`、`cases(...)` 等）保留为 Raw，由 Typst 渲染成图像，**不是编译失败**。排版结果为空白或后端给不出可见结果的片段（如 `quad`）改为显示源码并标出暖色底 + 红色虚线框：左右键可进入该片段源码修复，Esc 恢复原内容。原生桌面端与 Web 端共用这条规则。
 - **查看纯源码** 可展开全部公式；重新显示后保留已编辑公式的静态投影。点击静态投影复用同一个公式编辑会话。
 - Ctrl+Z / Ctrl+Y 覆盖正文、结构公式和包导入。文件切换保留各文件的未保存源码和撤销历史。
 - Ctrl+S 保存；已有文件被外部修改或新文件同名时拒绝覆盖。可下载 `.typ` 保留当前版本。子目录需预先存在。
@@ -59,7 +60,7 @@ Tinymist 从 PATH、VS Code/Cursor 扩展目录或 `TINYMIST_BIN` 查找。没�
 
 构建、资源和运行路径均位于正式版自己的 `src/`、`web/`、`config/`、`native-adapter/` 和 `vendor/typst/`。删除 `prototypes/` 不影响正式版构建；没有 `include!`、软链接或依赖路径指回原型（字符字典仍通过本地 build.rs 生成并 include）。Typst 固定源码和透明标签桥接已随仓库保存，构建不需要重新克隆引擎。
 
-核心沿用 GPL-2.0-or-later，见 [COPYING](COPYING)、[LyX 作者](docs/LYX-CREDITS)。引擎来源与补丁说明见 [vendor/typst/UPSTREAM.md](vendor/typst/UPSTREAM.md)，字体许可见 [web/fonts/NOTICE](web/fonts/NOTICE)。CodeMirror 和前端依赖的许可随 npm 包及打包输出保留。
+核心沿用 GPL-2.0-or-later，见 [COPYING](COPYING)、[LyX 作者](docs/LYX-CREDITS)。引擎来源与补丁说明见 [vendor/typst/UPSTREAM.md](vendor/typst/UPSTREAM.md)，字体许可见 [web/fonts/NOTICE](web/fonts/NOTICE)。`vendor/typst` 保留上游 Apache-2.0 许可，与本项目 GPL-2.0-**or-later** 的兼容路线是取 GPLv3（Apache-2.0 与 GPLv2-only 不兼容）；分发打包产物时需同时保留两份许可文本。CodeMirror 和前端依赖的许可随 npm 包及打包输出保留。
 
 ## 验证入口
 
@@ -69,6 +70,7 @@ cargo check --offline --locked --features server
 cargo test --offline --locked --manifest-path native-adapter/Cargo.toml --target-dir target/adapter
 npm run build
 npm test
+python -m unittest desktop.test_desktop -v
 ```
 
-测试不启动 HTTP 应用。需要本机 Tinymist/原生进程的服务集成用例默认忽略。浏览器中的输入法、视觉对齐及实际 LSP/网络操作还需人工体验。架构见 [docs/architecture.md](docs/architecture.md)，本次结果见 [docs/validation.md](docs/validation.md)。
+桌面套件使用离屏 Qt（`QT_QPA_PLATFORM=offscreen`），不打开窗口，但需要先构建原生程序（`build-desktop.cmd`）与 `web/core.wasm`。测试不启动 HTTP 应用。需要本机 Tinymist/原生进程的服务集成用例默认忽略。浏览器中的输入法、视觉对齐及实际 LSP/网络操作还需人工体验。架构见 [docs/architecture.md](docs/architecture.md)，本次结果见 [docs/validation.md](docs/validation.md)。

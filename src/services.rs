@@ -143,9 +143,35 @@ pub struct CompletionRequest { pub source: String, pub start: usize, pub end: us
 #[derive(Serialize)]
 pub struct CompletionReply { pub engine: &'static str, pub items: Vec<crate::cursor::CommandCompletion> }
 #[derive(Deserialize, Serialize)]
-pub struct RenderRequest { #[serde(default)] pub preview: bool, #[serde(default)] pub pdf:bool, #[serde(default)] pub overlays: std::collections::HashMap<String,String>, #[serde(default="default_path")] pub path: String, pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange>, #[serde(default)] pub preview_hashes:Vec<String> }
+pub struct RenderRequest { #[serde(default)] pub preview: bool, #[serde(default)] pub pdf:bool, #[serde(default)] pub overlays: std::collections::HashMap<String,String>, #[serde(default="default_path")] pub path: String, pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange>, #[serde(default)] pub preview_hashes:Vec<String>,
+    /// Render the requested fragments on a source cut after this byte offset.
+    ///
+    /// Fragments are images taken out of a full document compile, so one mistake
+    /// anywhere in the document leaves every one of them without an image. This
+    /// value says how far the requested fragments reach; the source is then cut
+    /// after the outermost node that holds them.
+    #[serde(default)] pub context_end: Option<usize> }
 #[derive(Deserialize, Serialize)]
 pub struct RawRange { pub id: String, pub start: usize, pub end: usize }
+
+/// Cut the source after the top-level node the fragments were asked for.
+///
+/// The prefix stays byte-identical, so the fragment ranges keep their meaning and
+/// the formula keeps its enclosing containers; everything after the cut is dropped.
+/// Typst never styles backwards, so nothing that is dropped can change these
+/// fragments, and an error further down the document can no longer take them with
+/// it. Cutting at a node boundary (rather than closing open delimiters by hand)
+/// keeps the result valid Typst whatever the prefix contains.
+fn context_source(source: &str, end: usize) -> Result<String,String> {
+    if end == 0 || end > source.len() || !source.is_char_boundary(end) { return Err("取图上下文位置无效".into()); }
+    let parsed = typst_syntax::Source::detached(source);
+    let root = typst_syntax::LinkedNode::new(parsed.root());
+    let mut cut = end;
+    for node in root.children() {
+        if node.offset() <= end && end <= node.offset() + node.len() { cut = node.offset() + node.len(); break; }
+    }
+    Ok(source[..cut].to_owned())
+}
 
 struct RenderAdapter { child: Child, requests: mpsc::Sender<Vec<u8>>, replies: mpsc::Receiver<Result<Value,String>> }
 impl Drop for RenderAdapter { fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); } }
@@ -237,7 +263,9 @@ impl Services {
         // Browser debouncing and its single in-flight request bound process use.
         let mut lsp = Lsp::start(bin, &self.root)?;
         lsp.notify("textDocument/didOpen", json!({"textDocument":{"uri":lsp.uri,"languageId":"typst","version":1,"text":req.source}}))?;
-        lsp.request("workspace/executeCommand", json!({"command":"tinymist.pinMain","arguments":[url::Url::parse(&lsp.uri).unwrap().to_file_path().unwrap()]}))?;
+        // The URI is built by this module, so a failure here is a bug, not input.
+        let pin = url::Url::parse(&lsp.uri).ok().and_then(|url| url.to_file_path().ok()).ok_or("内部 LSP 文件 URI 无效")?;
+        lsp.request("workspace/executeCommand", json!({"command":"tinymist.pinMain","arguments":[pin]}))?;
         let mut attempt = 0;
         loop {
         let result = lsp.request("textDocument/completion", json!({"textDocument":{"uri":lsp.uri},"position":position(&req.source, req.caret),"context":{"triggerKind":1}}));
@@ -275,8 +303,14 @@ impl Services {
         return Ok(CompletionReply { engine: "Tinymist LSP", items });
         }
     }
-    pub fn render(&self, req: RenderRequest) -> Result<Value, String> {
+    pub fn render(&self, mut req: RenderRequest) -> Result<Value, String> {
         crate::workspace::resolve(&self.workspace, &req.path)?;
+        if let Some(end) = req.context_end.take() {
+            req.source = context_source(&req.source, end)?;
+            // A range that the cut removed cannot be rendered, and the cut is only
+            // ever chosen at the end of a node that holds these ranges.
+            if req.raw.iter().chain(req.formulas.iter()).any(|range| range.end > req.source.len()) { return Err("取图区间不在编译上下文内".into()); }
+        }
         let mut adapter = self.render_adapter.lock().map_err(|e| e.to_string())?;
         if adapter.is_none() { *adapter = Some(RenderAdapter::start(&self.adapter_bin(), &self.workspace)?); }
         let result = adapter.as_mut().unwrap().request(&req);
@@ -353,6 +387,26 @@ mod tests {
         assert_eq!(snippet_text("cases(${1:})${0}"),Some(("cases()".into(),6)));
         assert_eq!(snippet_text("${1:x} + $0"),Some(("x + ".into(),0)));
         assert!(snippet_text("${UNKNOWN}").is_none());
+    }
+    #[test]
+    fn a_fragment_context_ends_at_the_node_that_holds_it() {
+        let source="#set text(size: 11pt)\n\n正文 $ sum_(n=1)^oo x^n $ 之后\n\n#panic(\"坏了\")\n";
+        let formula=source.find("$ sum").unwrap();
+        // A top-level formula is its own context: everything after it is dropped.
+        let cut=context_source(source,source.find(" $ 之后").unwrap()).unwrap();
+        assert_eq!(cut,"#set text(size: 11pt)\n\n正文 $ sum_(n=1)^oo x^n $");
+        assert!(cut.len() > formula);
+        // Inside a container the whole container is kept, so the formula keeps the
+        // styles it is laid out with.
+        let block="#set page(width: 10cm)\n#block(fill: luma(90%))[\n  #set text(size: 20pt)\n  $a+b$ 后面\n]\n#panic(\"坏了\")\n";
+        let cut=context_source(block,block.find("$a+b$").unwrap()+4).unwrap();
+        assert!(cut.starts_with("#set page(width: 10cm)\n#block"));
+        assert!(cut.ends_with("]"),"{cut:?}");
+        assert!(!cut.contains("panic"),"what follows the container cannot affect it");
+        // Offsets inside the prefix keep their meaning, which is what lets the
+        // requested ranges be used unchanged.
+        assert_eq!(context_source(source,source.len()).unwrap(),source);
+        for bad in [0,source.len()+1] { assert!(context_source(source,bad).is_err()); }
     }
 }
 

@@ -1,14 +1,14 @@
 import sys
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFontDatabase
 from PyQt5.QtWidgets import QApplication, QMessageBox
-from .model import ROOT
+from . import mathfont
 
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling,True)
     application=QApplication(sys.argv);application.setApplicationName("Visual Typst")
-    QFontDatabase.addApplicationFont(str(ROOT/"web/fonts/NewCMMath-Regular.otf"))
-    QFontDatabase.addApplicationFont(str(ROOT/"web/fonts/NewCM10-Italic.otf"))
+    # LyX's FontLoader does the same: the bundled math fonts have to be registered
+    # before any family name is resolved, and a missing one is never guessed at.
+    mathfont.install()
     from .window import Window
     def exception(kind,value,traceback):
         import traceback as trace

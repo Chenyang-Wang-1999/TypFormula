@@ -1,22 +1,33 @@
 //! Private stdio transport for the VS Code extension. No listening socket.
 use crate::{packages, services::Services};
 use serde_json::{Value, json};
-use std::{io::{self, BufRead, Read, Write}, path::PathBuf};
+use std::{io::{self, BufRead, Read, Write}, path::PathBuf, sync::{Arc, Mutex}};
 
 pub fn serve(workspace: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let exe = std::env::current_exe()?;
     let mut services = Services::new(exe.parent().unwrap().to_path_buf());
     services.workspace = workspace.canonicalize()?;
-    let stdin = io::stdin(); let mut reader = stdin.lock(); let mut output = io::stdout().lock();
+    // Requests are answered by id, so they run on their own threads exactly like
+    // the HTTP frontend: a long page preview must not queue the formula renders
+    // and language requests behind it. Services is shared the same way there.
+    let services = Arc::new(services);
+    let output = Arc::new(Mutex::new(io::stdout()));
+    let stdin = io::stdin(); let mut reader = stdin.lock();
+    let mut workers = vec![];
     loop {
         let mut line = String::new();
         if reader.by_ref().take(8*1024*1024+1).read_line(&mut line)? == 0 { break; }
         if line.len() > 8*1024*1024 { break; }
         let request: Value = serde_json::from_str(&line)?;
-        let result = dispatch(&services, &request);
-        let reply = match result { Ok(result)=>json!({"id":request["id"],"result":result}), Err(error)=>json!({"id":request["id"],"error":error}) };
-        writeln!(output,"{reply}")?; output.flush()?;
+        let services = services.clone(); let output = output.clone();
+        workers.push(std::thread::spawn(move || {
+            let result = dispatch(&services, &request);
+            let reply = match result { Ok(result)=>json!({"id":request["id"],"result":result}), Err(error)=>json!({"id":request["id"],"error":error}) };
+            // Whole lines only: two replies must never interleave.
+            if let Ok(mut output) = output.lock() { let _ = writeln!(output,"{reply}"); let _ = output.flush(); }
+        }));
     }
+    for worker in workers { let _ = worker.join(); }
     Ok(())
 }
 pub fn dispatch(services: &Services, request: &Value) -> Result<Value,String> {

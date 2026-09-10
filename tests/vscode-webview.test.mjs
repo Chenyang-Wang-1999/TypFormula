@@ -34,5 +34,15 @@ test('VS Code webview edits synchronize through WorkspaceEdit and commands use h
   deliver({type:'command',id:'undo'});await new Promise(r=>setTimeout(r,20));assert.equal(view.state.doc.toString(),'hello $x$');
   assert.ok(requests.some(r=>r.route==='/api/host-command'&&r.body.command==='undo'));
   deliver({type:'command',id:'shortcuts'});await new Promise(r=>setTimeout(r,20));assert.ok(requests.some(r=>r.body?.command==='configureShortcuts'));
+  // The toolbar is bound by id; a typo in the event name or a missing element
+  // must fail here instead of leaving an inert button.
+  for(const id of ['insert-inline','insert-display','edit-formula','save','finish-formula','open-file','open-file-top','editor-font-smaller','svg-scale-apply','undo','redo'])assert.equal(typeof document.getElementById(id).onclick,'function',id);
+  assert.equal(typeof document.getElementById('insert-inline').onpointerdown,'function','insert-inline pointerdown');
+  assert.equal(typeof document.getElementById('new-form').onsubmit,'function','new-form submit');
+  assert.equal(typeof document.getElementById('packages-form').onsubmit,'function','packages-form submit');
+  const beforeInsert=view.state.doc.toString();
+  document.getElementById('insert-inline').click();await new Promise(r=>setTimeout(r,20));
+  assert.notEqual(view.state.doc.toString(),beforeInsert,'clicking 行内公式 must insert a formula');
+  assert.ok(view.state.doc.toString().includes('$'),view.state.doc.toString());
   destroyEditor();win.close();delete globalThis.acquireVsCodeApi;
 });

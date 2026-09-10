@@ -104,27 +104,33 @@ impl Editor {
         let child_path = |idx| path.map(|p| { let mut p = p.to_vec(); p.push(CursorSlice { atom: pos, cell: idx }); p });
         if let Kind::MacroCall { name, function } = &atom.kind {
             let registry = typst::macro_registry(&self.definitions);
-            if let Some(def) = registry.get(name).filter(|d| d.expandable) {
-                if typst::projection_size(atom, &registry, typst::PROJECTION_LIMIT) <= typst::PROJECTION_LIMIT {
-                    let args: Vec<_> = atom.cells.iter().enumerate().map(|(i, arg)| {
-                        let mut view = View::new("macro-argument", &def.params[i], vec![self.view_cell(arg, child_path(i).as_deref(), occurrence)]);
-                        view.columns = i;
-                        view
-                    }).collect();
-                    let mut template = self.view_cell(&def.template, None, occurrence);
-                    self.bind_template(&mut template, def, &registry, &args);
-                    Self::locate_projection(&mut template, &format!("{occurrence}.macro"));
-                    return View::new("macro", name, vec![template]);
-                }
+            let definition = registry.get(name).filter(|d| d.expandable);
+            // A call is only bound while its argument count still matches the
+            // definition it resolves to. Definitions can be adopted mid-edit (a
+            // #let typed inside a formula), which leaves older calls behind, so
+            // this is checked here and never assumed.
+            let bound = definition.filter(|def| def.params.len() == atom.cells.len());
+            if let Some(def) = bound.filter(|_| typst::projection_size(atom, &registry, typst::PROJECTION_LIMIT) <= typst::PROJECTION_LIMIT) {
+                let args: Vec<_> = atom.cells.iter().enumerate().map(|(i, arg)| {
+                    let mut view = View::new("macro-argument", def.params.get(i).map_or("", String::as_str), vec![self.view_cell(arg, child_path(i).as_deref(), occurrence)]);
+                    view.columns = i;
+                    view
+                }).collect();
+                let mut template = self.view_cell(&def.template, None, occurrence);
+                self.bind_template(&mut template, def, &registry, &args);
+                Self::locate_projection(&mut template, &format!("{occurrence}.macro"));
+                return View::new("macro", name, vec![template]);
             }
-            // Bounded projection: retain editable call slots for very large expansions.
+            // Bounded projection: retain editable call slots for very large
+            // expansions and for calls that no longer match their definition.
+            let message = if definition.is_some() { "参数个数与定义不符，显示调用与参数" } else { "展开较大，显示调用与参数" };
             let mut children = vec![View::new("symbol", format!("{name}{}", if *function { "(" } else { "" }), vec![])];
             for (i, arg) in atom.cells.iter().enumerate() {
                 if i > 0 { children.push(View::new("symbol", ", ", vec![])); }
                 children.push(self.view_cell(arg, child_path(i).as_deref(), &format!("{occurrence}.c{i}")));
             }
             if *function { children.push(View::new("symbol", ")", vec![])); }
-            return View::new("macro-collapsed", "展开较大，显示调用与参数", children);
+            return View::new("macro-collapsed", message, children);
         }
         let children: Vec<_> = atom.cells.iter().enumerate().map(|(idx, data)| self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"))).collect();
         match &atom.kind {
@@ -188,7 +194,7 @@ impl Editor {
     }
     fn bind_template_inner(&self, view: &mut View, def: &typst::MacroDefinition, registry: &typst::MacroRegistry, args: &[View], counts: &mut std::collections::HashMap<String,usize>) {
         if view.kind == "parameter" {
-            *view = args[view.columns].clone();
+            *view = args.get(view.columns).cloned().unwrap_or_else(|| View::new("absent", "", vec![]));
             return;
         }
         if view.kind == "raw" {
@@ -201,7 +207,10 @@ impl Editor {
             self.bind_template_inner(child, def, registry, args, counts);
         }
         if view.kind == "template-call" {
-            let callee = &registry.entries[view.columns];
+            let Some(callee) = registry.entries.get(view.columns) else {
+                *view = View::new("absent", "", vec![]);
+                return;
+            };
             let mut template = self.view_cell(&callee.template, None, "");
             self.bind_template(&mut template, callee, registry, &view.children);
             *view = template;

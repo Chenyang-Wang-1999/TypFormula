@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Golden traces derived from the named LyX functions in PORTING.md.
-use visual_typst_core::{Action, Editor, math::*, typst};
+use visual_typst_core::{Action, Editor, cursor::StopGeometry, math::*, typst};
 
 fn input(e: &mut Editor, text: &str) { e.apply(Action::Input { text: text.into() }).unwrap(); }
 fn key(e: &mut Editor, key: &str) { e.apply(Action::Key { key: key.into(), shift: false, ctrl: false }).unwrap(); }
@@ -100,6 +100,25 @@ fn invalid_import_does_not_replace_the_current_tree() {
 fn ordinary_letters_stay_separate_and_slash_opens_a_fraction() {
     let mut e=Editor::default();input(&mut e,"alpha/");
     assert_eq!(source(&e),"a l p h frac(a, \"\")");assert!(e.pending().is_none());
+}
+#[test]
+fn stale_layout_stops_cannot_move_the_cursor_out_of_its_cell() {
+    let mut e=load("frac(1 + 2 + 3, x)");
+    let numerator=Cursor { slices: vec![CursorSlice{atom:0,cell:0}], pos: 0, occurrence: String::new() };
+    e.apply(Action::Click { cursor: numerator, shift: false }).unwrap();
+    // One stop describes this cell, the other claims a position past the end of
+    // the cell the cursor moves into: what a layout measured before the cell
+    // shrank looks like. Both used to be trusted as a cursor source.
+    e.apply(Action::Geometry { stops: vec![
+        StopGeometry { cursor: Cursor { slices: vec![CursorSlice{atom:0,cell:0}], pos: 1, occurrence: String::new() }, x: 10.0, y: 0.0 },
+        StopGeometry { cursor: Cursor { slices: vec![CursorSlice{atom:0,cell:1}], pos: 9, occurrence: String::new() }, x: 10.0, y: 0.0 },
+    ]}).unwrap();
+    key(&mut e,"ArrowDown");
+    assert_eq!(e.cursor.slices,vec![CursorSlice{atom:0,cell:1}]);
+    assert!(valid(&e.root,&e.cursor),"{:?}",e.cursor);
+    // The editor stays usable: no rejected step and no broken cursor is left.
+    input(&mut e,"y");
+    assert_eq!(source(&e),"frac(1 + 2 + 3, y x)");
 }
 
 

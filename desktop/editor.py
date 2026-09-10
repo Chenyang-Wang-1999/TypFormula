@@ -111,6 +111,8 @@ class Editor(QTextEdit):
         self.decorate_incremental(source,selection,scroll,schedule_raw,reparsed)
 
     def install_objects(self,force=False,dirty=None):
+        # The projections below replace the views, so no memoized box survives.
+        self.owner.typesetter.touch()
         self.object_data={};self.object_by_id={}
         for index,formula in self.mapping.objects.items():
             position=u16(self.mapping.text[:index]);identifier=formula['_object_id']
@@ -228,7 +230,7 @@ class Editor(QTextEdit):
                 if formula:
                     c=QTextCursor(self.document());c.setPosition(at)
                     rect=self.cursorRect(c)
-                    box=self.owner.typesetter.layout(formula["view"])
+                    box=self.handler.box(formula)
                     from PyQt5.QtCore import QSizeF
                     size=QSizeF(min(box.width+8,self.viewport().width()-30),box.height+6)
                     if rect.x()-3<=event.pos().x()<=rect.x()+size.width()+3:

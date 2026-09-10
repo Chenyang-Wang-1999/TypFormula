@@ -37,4 +37,39 @@ fn render_status_has_no_source_or_undo_effect_and_is_scoped_to_definitions() {
     assert!(e.pending().is_none());assert_eq!(e.cursor.pos,0);
 }
 
+#[test]
+fn one_batch_reports_every_fragment_of_a_render_pass() {
+    let mut e=load();let definitions=e.definitions.clone();let display=e.display;
+    e.apply(Action::PreviewResults{sources:vec!["undefinedfunc(α)".into()],definitions:definitions.clone(),display,failed:true}).unwrap();
+    key(&mut e,"ArrowRight");assert_eq!(e.pending(),Some("undefinedfunc(α)"));
+    key(&mut e,"Escape");assert_eq!(e.cursor.pos,1);
+    // A fragment that turns out to render after all is taken out of the failed set.
+    e.apply(Action::PreviewResults{sources:vec!["undefinedfunc(α)".into()],definitions,display,failed:false}).unwrap();
+    key(&mut e,"ArrowLeft");
+    assert!(e.pending().is_none());assert_eq!(e.cursor.pos,0);
+}
+
+#[test]
+fn an_unparseable_repair_of_a_fragment_is_kept_as_source() {
+    let mut e=load();status(&mut e,true);key(&mut e,"ArrowRight");
+    e.apply(Action::Key{key:"a".into(),ctrl:true,shift:false}).unwrap();
+    // `cases(1 & x > 0)` is not a formula this parser can structure, and a fragment
+    // that can only be entered to be repaired must not lose the repair on Enter.
+    e.apply(Action::Input{text:"cases(1 & x > 0)".into()}).unwrap();
+    key(&mut e,"Enter");
+    assert!(e.pending().is_none());
+    assert_eq!(typst::write_cell(&e.root),"cases(1 & x > 0)");
+    assert_eq!(e.cursor.pos,1);
+    // Escape after a repair restores the fragment the draft was opened from.
+    e.apply(Action::PreviewResults{sources:vec!["cases(1 & x > 0)".into()],definitions:e.definitions.clone(),display:e.display,failed:true}).unwrap();
+    key(&mut e,"ArrowLeft");
+    assert_eq!(e.pending(),Some("cases(1 & x > 0)"));
+    e.apply(Action::Key{key:"a".into(),ctrl:true,shift:false}).unwrap();
+    e.apply(Action::Input{text:"nonsense(".into()}).unwrap();
+    assert_eq!(e.pending(),Some("nonsense("));
+    key(&mut e,"Escape");
+    assert!(e.pending().is_none());
+    assert_eq!(typst::write_cell(&e.root),"cases(1 & x > 0)");
+}
+
 

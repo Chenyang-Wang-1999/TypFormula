@@ -149,4 +149,21 @@ fn string_sugar_survives_without_a_text_command() {
     raw(&command("text").root[0],"text");raw(&command("lr").root[0],"lr");
 }
 
+#[test]
+fn shift_clicking_into_a_nest_clamps_the_selection_to_the_cell() {
+    let mut e=load("frac(1, 2) + x");
+    let end=Cursor{slices:vec![],pos:e.root.len(),occurrence:String::new()};
+    e.apply(Action::Click{cursor:end,shift:false}).unwrap();
+    // The anchor names a position in the outer cell, the cursor names an atom
+    // inside the fraction. Widening the outer end by one used to exceed the cell.
+    e.apply(Action::Click{cursor:Cursor{slices:vec![CursorSlice{atom:0,cell:0}],pos:0,occurrence:String::new()},shift:true}).unwrap();
+    assert!(valid(&e.root,&e.cursor),"{:?}",e.cursor);
+    assert!(e.cursor.slices.is_empty());
+    assert_eq!(e.cursor.pos,e.root.len());
+    assert_eq!(e.selection(),Some((0,e.root.len())));
+    // A rejected selection must never leave a cursor the next keystroke cannot use.
+    key(&mut e,"ArrowRight");input(&mut e,"y");
+    assert_eq!(typst::write_cell(&e.root),"frac(1, 2) + x y");
+}
+
 

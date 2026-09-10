@@ -18,7 +18,9 @@ pub mod packages;
 pub mod rpc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod desktop;
-#[cfg(target_arch = "wasm32")]
-mod wasm;
+// The JSON bridge is wasm-only, but its buffer ownership rules are worth
+// testing on the host too.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod wasm;
 
 pub use cursor::{Action, Editor};

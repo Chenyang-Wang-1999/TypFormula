@@ -44,11 +44,12 @@ LyX 的高保真公式预览是第二条、可选的显示路径。启用即时�
 
 字符和符号使用 Qt 字体度量及文本绘制。分数递归计算分子、分母尺寸后画一条横线；上下标切换到 script 字号后放置子树；根号、括号和装饰符使用字形或线段。整个过程没有 SVG DOM、图片解码、跨进程调用或完整 Typst 编译。
 
-`MathData::metrics` 构造一个 `MathRow`，计算一次后把行及结点尺寸放进当前 `BufferView` 的缓存；`MathData::draw` 直接取缓存的 `MathRow`。坐标和尺寸以对象指针为键，所以命中不需要字符串哈希或重新定位源码范围。
+`MathData::metrics` 每次调用都构造一个新的 `MathRow` 并递归计算尺寸，`MathData::draw` 再按同样的规则放置子结点。被缓存的是坐标：绘制把结果写进当前 `BufferView` 的 `CoordCache`，键是对象指针与尺寸，所以同一帧内的后续查询不需要字符串哈希，也不需要重新定位源码范围。度量本身按需重算，不能把 `MathData::metrics` 说成命中缓存；`MathData::metrics` 开头还会调用 `updateMacros`，这也是按需执行而不是缓存。
 
 相关实现：
 
-- `D:\tool-base\lyx\src\mathed\MathData.cpp:346`
+- `D:\tool-base\lyx\src\mathed\MathData.cpp:344`
+- `D:\tool-base\lyx\src\mathed\MathData.cpp:356`
 - `D:\tool-base\lyx\src\mathed\MathData.cpp:424`
 - `D:\tool-base\lyx\src\mathed\MathRow.cpp:247`
 - `D:\tool-base\lyx\src\mathed\MathRow.cpp:328`
@@ -62,9 +63,17 @@ LyX 的高保真公式预览是第二条、可选的显示路径。启用即时�
 - `D:\tool-base\lyx\src\frontends\qt\GuiFontMetrics.cpp:77`
 - `D:\tool-base\lyx\src\frontends\qt\GuiFontMetrics.cpp:252`
 
+字体来源同样值得记一笔，因为它决定了"LyX 同款字体"到底是什么。LyX 的 Qt 界面把 `lib/fonts/` 下的 12 个 BaKoMa Computer Modern TTF 注册进 `QFontDatabase`（`cmex10 cmmi10 cmr10 cmsy10 dsrom10 esint10 eufm10 msam10 msbm10 rsfs10 stmary10 wasy10`），符号家族（CMR/CMSY/CMM/CMEX/MSA/MSB/EUFRAK/RSFS/STMARY/WASY/ESINT/DS）按名称映射到这些家族。但数学字母并不用 `cmmi10`：`mathnormal` 是"正文家族 + 斜体形状"（`MathSupport.cpp` 的 `fontinfos` 表），也就是用用户配置的正文衬线字体排斜体，只有命名符号才落到 CM 符号家族。这些 BaKoMa 字体是 **TeX 编码**：`cmmi10` 的小写希腊在槽位 `0x0B–0x21`、`cmsy10` 的 ≤ 在 `0x14`、`cmex10` 的 ∑text 在 `0x50`（字符 `X`），字体 cmap 里没有 U+03B1/U+2264/U+2211。LyX 能这么做是因为它自带字符编码表（`lib/symbols` 给出家族与槽位，如 `leq cmsy 20 163 mathrel &#x2264;`）并按自己的编码取字形；Qt 的 `drawText` 只能按 Unicode 取字形，所以这套字体不能被直接复用。本项目因此用随附的 New Computer Modern Math——Typst 自己的 CM 复刻，也是编译结果所用的字体，Unicode 覆盖齐全。
+
+- `D:\tool-base\lyx\src\frontends\qt\GuiFontLoader.cpp:37`
+- `D:\tool-base\lyx\src\frontends\qt\GuiFontLoader.cpp:77`
+- `D:\tool-base\lyx\src\mathed\MathSupport.cpp:873`
+- `D:\tool-base\lyx\lib\fonts\README`
+- `D:\tool-base\lyx\lib\symbols:319`
+
 ## 3. 更新粒度以段落、可见区和脏行为边界
 
-常见输入命令带 `SingleParUpdate` 标记。LyX 先尝试只重新断行当前段落；如果段落高度没有变化，并且宽度变化不影响外层布局，就保留其他段落的 metrics。只有该快速路径失败时才扩大重排范围。
+常见输入命令带 `Update::SinglePar`（`UpdateFlags.h` 中的单段更新标记）标记。LyX 先尝试只重新断行当前段落；如果段落高度没有变化，并且宽度变化不影响外层布局，就保留其他段落的 metrics。只有该快速路径失败时才扩大重排范围。
 
 即使需要更新文档布局，`TextMetrics::updateMetrics` 也只保证锚点上下覆盖可见窗口的段落有 metrics，并丢弃屏幕外的段落缓存。绘制时再次裁剪不可见行。
 
@@ -159,7 +168,14 @@ LyX 的高保真公式预览是第二条、可选的显示路径。启用即时�
 
 ## 7. 不应照搬的部分
 
-LyX 的原生公式 painter 是对 TeX 数学模型的长期实现，不能简单替代 Typst 的完整排版语义。Visual Typst 应继续采用混合策略：已支持的结构结点用原生 painter 保证编辑速度；无法安全结构化的结点显示稳定缓存的引擎位图；最终 PDF 始终交给 Typst engine。
+LyX 的原生公式 painter 是对 TeX 数学模型的长期实现，不能简单替代 Typst 的完整排版语义。Visual Typst 应继续采用混合策略：已支持的结构结点用原生 painter 保证编辑速度；引擎排版结果用于**叶子**显示来源（Raw、附件位置），最终 PDF 始终交给 Typst engine。
+
+需要更正一点：LyX 不会把无法结构化的内容变成位图。`InsetMathUnknown` 保留源码文本并用原生字体直接画出来（未完成时画成红色），`metricsStrRedBlack` 直接给出尺寸，因此它始终可继续编辑。
+
+- `D:\tool-base\lyx\src\mathed\InsetMathUnknown.cpp:48`
+- `D:\tool-base\lyx\src\mathed\InsetMathUnknown.cpp:57`
+
+所以“无法安全结构化就退回引擎位图”既不是 LyX 的做法，也不适合作为默认策略：能保留源码、可继续原位编辑的原生表示优先，位图只用于那些只有引擎才说得清的排版结果。
 
 LyX 的 `BufferView::processUpdateFlags` 目前仍会调用全局 `buffer_.updateMacros()`，源码注释也承认这很昂贵。我们应借鉴它的常驻展开结果和失效标记，而不是照搬全局宏更新。
 

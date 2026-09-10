@@ -47,7 +47,7 @@
       },
       {
         "command": "visualTypst.saveCopy",
-        "title": "Visual Typst: 另存副本"
+        "title": "Visual Typst: 另存为"
       },
       {
         "command": "visualTypst.format",
@@ -144,6 +144,34 @@
       {
         "command": "visualTypst.keepLocal",
         "title": "Visual Typst: 冲突：保留当前编辑内容"
+      },
+      {
+        "command": "visualTypst.decreaseEditorFont",
+        "title": "Visual Typst: 缩小编辑字号"
+      },
+      {
+        "command": "visualTypst.increaseEditorFont",
+        "title": "Visual Typst: 放大编辑字号"
+      },
+      {
+        "command": "visualTypst.resetEditorFont",
+        "title": "Visual Typst: 还原编辑字号"
+      },
+      {
+        "command": "visualTypst.applySvgScale",
+        "title": "Visual Typst: 应用 SVG 基础倍率"
+      },
+      {
+        "command": "visualTypst.resetSvgScale",
+        "title": "Visual Typst: 还原 SVG 基础倍率"
+      },
+      {
+        "command": "visualTypst.openFile",
+        "title": "Visual Typst: 打开 Typst 文件"
+      },
+      {
+        "command": "visualTypst.openFileToolbar",
+        "title": "Visual Typst: 打开 Typst 文件"
       }
     ],
     "keybindings": [

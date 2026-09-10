@@ -5,7 +5,7 @@ import re
 import base64,tempfile
 from pathlib import Path
 from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSizeF, QUrl
-from PyQt5.QtGui import QFont, QKeySequence, QTextCursor, QPainter, QPdfWriter, QPageSize, QPageLayout, QCursor, QDesktopServices
+from PyQt5.QtGui import QFont, QKeySequence, QTextCursor, QTextCharFormat, QPainter, QPdfWriter, QPageSize, QPageLayout, QCursor, QDesktopServices
 from PyQt5.QtSvg import QSvgWidget, QSvgRenderer
 from PyQt5.QtWidgets import (QApplication,QMainWindow,QWidget,QSplitter,QDockWidget,QTreeWidget,QTreeWidgetItem,
     QPlainTextEdit,QScrollArea,QVBoxLayout,QAction,QFileDialog,QMessageBox,QInputDialog,QDialog,QDialogButtonBox,
@@ -54,7 +54,14 @@ class Window(QMainWindow):
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
         self.settings=load_settings();self.typesetter=Typesetter(self.settings)
         self.raw_cache=RawCache();self.raw_pending=set()
+        # Attachment requests per live formula view, so a background cycle does
+        # not walk every view node and rebuild every definition prefix.
+        self.attachments={}
         self.warmup_status={}
+        # Reported fragment status, so only a change costs a core round trip.
+        self.raw_signature=None
+        # (revision, fragments) of the last failed render request, if any.
+        self.raw_error=None
         self.formula_serial=0;self.last_reparsed=None
         self.core=Core(self);self.services=None;self.lsp=None;self.workspace=None
         screen=screen or QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
@@ -66,6 +73,9 @@ class Window(QMainWindow):
         self.source_view=SourceEditor();self.source_view.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.source_dock=QDockWidget("Typst 源码",self);self.source_dock.setWidget(self.source_view)
         self.addDockWidget(Qt.RightDockWidgetArea,self.source_dock);self.source_dock.hide()
+        # Token colours are applied per visible view; open the dock and it is
+        # coloured at once instead of paying for a hidden widget on every reply.
+        self.source_dock.visibilityChanged.connect(lambda _:self.apply_highlights())
         self.source_view.textChanged.connect(self.source_changed)
         self.outline=QTreeWidget();self.outline.setHeaderHidden(True)
         dock=QDockWidget("大纲",self);dock.setWidget(self.outline);self.addDockWidget(Qt.LeftDockWidgetArea,dock)
@@ -157,8 +167,9 @@ class Window(QMainWindow):
 
     def project(self,selection=None,schedule_raw=True,incremental=False):
         self.loading=True
+        self.attachments.clear()
         for formula in self.analysis.get("formulas",[]):
-            if "view" in formula:self.prepare_view(formula["view"],self.source[:from_byte(self.source,formula["start"])],formula["display"])
+            if "view" in formula:self.remember_attachments(formula,self.prepare_view(formula["view"],self.source[:from_byte(self.source,formula["start"])],formula["display"]))
         for editor in self.editors:
             if incremental:editor.incremental_project(selection,schedule_raw,self.last_reparsed)
             else:editor.project(selection,schedule_raw)
@@ -259,6 +270,8 @@ class Window(QMainWindow):
         if last and self.math_canvas.box.stops:self.math_action("click",cursor=self.math_canvas.box.stops[-1][3])
         self.reposition_math();self.math_scroll.show();self.math_scroll.raise_();self.math_canvas.setFocus()
         self.raw_cache.track(state,self.typesetter.cache);self.raw_timer.start()
+        # A new core session knows nothing about the last one's render results.
+        self.report_raw_fragments(state,force=True)
 
     def math_action(self,action,**arguments):
         if not self.math_state:return
@@ -271,10 +284,12 @@ class Window(QMainWindow):
             self.semantic_spans=[];self.engine_spans=[]
             for key,value in list(self.typesetter.cache.items()):
                 if value is None:del self.typesetter.cache[key]
+            self.typesetter.touch()
             old=self.analysis;a,b,text=difference(before,self.source)
             self.analysis=self.update_analysis(before,a,b,text,core_current=True);self.raw_cache.rebind(old,self.analysis)
             self.project(incremental=True);self.compile_timer.start()
         self.math_canvas.refresh(state);self.reposition_math()
+        self.report_raw_fragments(state)
         invalidated=self.raw_cache.track(state,self.typesetter.cache)
         if invalidated:self.invalidate_raw(invalidated);self.raw_timer.start()
         active=next((stop for stop in self.math_canvas.box.stops if stop[4]),None)
@@ -386,10 +401,12 @@ class Window(QMainWindow):
                 for item in record.get("items",[]):
                     key=(record["key"],(item["start"],item["end"]))
                     self.typesetter.cache.setdefault(key,item)
+            self.typesetter.touch()
             if self.math_state and self.math_state.get("pending"):
                 self.compile_timer.start();return
             classification_changed=any(self.warmup_status.get(key,False)!=failed for key,failed in results if failed or key in self.warmup_status)
             self.warmup_status.update(results)
+            self.report_raw_fragments()
             before=[(f.get('editable'),signature(f.get('view',{}))) for f in self.analysis.get('formulas',[])]
             state=self.core.call("macro_warmup",results=results)
             if classification_changed:
@@ -402,19 +419,17 @@ class Window(QMainWindow):
             elif self.math_state and changed:self.math_state=state;self.math_canvas.refresh(state)
             if changed:self.project(schedule_raw=False,incremental=True)
             for formula in self.analysis.get("formulas",[]):
-                definitions=self.source[:from_byte(self.source,formula["start"])]
-                for node in self.view_nodes(formula.get("view",{})):
-                    expression=node.get("attachment")
-                    key=(definitions,expression,formula["display"])
-                    if not expression or key in self.typesetter.placements:continue
+                for definitions,expression,display in self.attachment_nodes(formula):
+                    key=(definitions,expression,display)
+                    if key in self.typesetter.placements:continue
                     def attached(value,error,key=key):
                         if revision!=self.revision:return
                         self.typesetter.placements[key]=value if not error else {}
+                        self.typesetter.touch()
                         for formula in self.analysis.get('formulas',[]):
-                            if 'view' in formula:self.prepare_view(formula['view'],self.source[:from_byte(self.source,formula['start'])],formula['display'])
-                        for editor in self.editors:editor.document().markContentsDirty(0,editor.document().characterCount());editor.viewport().update()
-                        if self.math_state:self.math_canvas.refresh(self.math_state);self.reposition_math()
-                    self.services.request("/api/attachments",{"path":body["path"],"expression":expression,"definitions":definitions,"display":formula["display"]},attached,key="attachment:"+str(key))
+                            if 'view' in formula:self.remember_attachments(formula,self.prepare_view(formula['view'],self.source[:from_byte(self.source,formula['start'])],formula['display']))
+                        self.repaint_formulas()
+                    self.services.request("/api/attachments",{"path":body["path"],"expression":expression,"definitions":definitions,"display":display},attached,key="attachment:"+str(key))
         self.services.request("/api/prewarm",body,warmed,key="prewarm")
         self.semantic_highlight()
 
@@ -424,9 +439,31 @@ class Window(QMainWindow):
         for child in view.get("children",[]):yield from Window.view_nodes(child)
 
     def prepare_view(self,view,definitions,display):
+        attachments=[]
         for node in self.view_nodes(view):
             if node.get("attachment"):
                 node["_placement"]=self.typesetter.placements.get((definitions,node["attachment"],display),{})
+                attachments.append((definitions,node["attachment"],display))
+        return attachments
+
+    def remember_attachments(self,formula,attachments):
+        view=formula.get("view",{})
+        if not view:return
+        # Projection keeps a view object alive exactly while the text before its
+        # formula is unchanged, so the definition prefix can be cached with it.
+        self.attachments[id(view)]=(view,tuple(attachments))
+        if len(self.attachments)>4*max(1,len(self.analysis.get("formulas",[]))):self.attachments.clear();self.attachments[id(view)]=(view,tuple(attachments))
+
+    def attachment_nodes(self,formula):
+        """Attachment requests for one formula, without walking its view again."""
+        view=formula.get("view",{})
+        if not view:return ()
+        entry=self.attachments.get(id(view))
+        if entry is not None and entry[0] is view:return entry[1]
+        definitions=self.source[:from_byte(self.source,formula["start"])]
+        attachments=self.prepare_view(view,definitions,formula["display"])
+        self.remember_attachments(formula,attachments)
+        return self.attachments[id(view)][1]
 
     def bind_active_raw(self,state):
         bounds=state.get('active_range')
@@ -434,53 +471,115 @@ class Window(QMainWindow):
         formula=next((f for f in self.analysis.get('formulas',[]) if f['start']==bounds['start']),None)
         if formula:self.raw_cache.bind(formula.get('view',{}),state['view'])
 
+    def report_raw_fragments(self,state=None,force=False):
+        """Tell the core which Raw fragments of the active formula have no image.
+
+        The core opens a fragment's own source on a horizontal key at its boundary,
+        and a fragment without an image has nothing to click, so this is the only
+        way to repair one. The two lists are reported as sets: a keystroke that
+        changes nothing costs nothing, and a fragment still waiting for its render
+        is reported as not failed rather than left in the failed set.
+        """
+        state=state if state is not None else self.math_state
+        if not state:return
+        failed=[];rest=[]
+        for node in self.view_nodes(state.get('view',{})):
+            if node.get('kind')!='raw' or not node.get('edit'):continue
+            (failed if self.typesetter.raw(node) is False else rest).append(node.get('text',''))
+        signature=(state.get('definitions',''),bool(state.get('display')),tuple(sorted(set(failed))),tuple(sorted(set(rest))))
+        if not force and signature==self.raw_signature:return
+        self.raw_signature=signature
+        definitions,display,failed,rest=signature
+        for sources,flag in ((failed,True),(rest,False)):
+            if sources:self.core.call('preview_results',sources=list(sources),definitions=definitions,display=display,failed=flag)
+
+    def visible_formula_starts(self):
+        """Formula starts currently on screen in any editor.
+
+        Grouping the object positions once keeps load_raw linear in the number of
+        objects instead of scanning every object for every formula.
+        """
+        visible=set()
+        if self.math_state:visible.add(self.math_state['active_range']['start'])
+        for editor in self.editors:
+            if editor.source_only:continue
+            height=editor.viewport().height()
+            for position,item in editor.object_data.items():
+                cursor=QTextCursor(editor.document());cursor.setPosition(position)
+                rect=editor.cursorRect(cursor)
+                if rect.bottom()>=0 and rect.top()<height:visible.add(item['start'])
+        return visible
+
     def load_raw(self):
         if self.math_state and self.math_state.get('pending'):return
-        revision=self.revision;targets={};ranges=[];seen=set()
+        revision=self.revision;targets={};ranges=[];seen=set();stuck=False;context_end=0
+        # A failed request leaves every fragment it covered without an image. That
+        # verdict belongs to the revision it failed in: the next edit (usually the
+        # one that fixes the document) clears it, so one bad compile cannot leave a
+        # viewport full of source text for the rest of the session.
+        if self.raw_error and self.raw_error[0]!=revision:
+            for shared in self.raw_error[1]:
+                if self.typesetter.cache.get(shared) is False:del self.typesetter.cache[shared]
+            self.raw_error=None;stuck=True
+        visible=self.visible_formula_starts()
         for formula in self.analysis.get('formulas',[]):
-            visible=self.math_state and self.math_state['active_range']['start']==formula['start']
-            for editor in self.editors:
-                if editor.source_only:continue
-                for position,item in editor.object_data.items():
-                    if item['start']!=formula['start']:continue
-                    cursor=QTextCursor(editor.document());cursor.setPosition(position)
-                    rect=editor.cursorRect(cursor)
-                    visible=visible or (rect.bottom()>=0 and rect.top()<editor.viewport().height())
-            if not visible:continue
+            if formula['start'] not in visible:continue
             request=formula.get('render')
             if not request:continue
             by_id={item['id']:item for item in request.get('raw',[])}
+            wanted=0
             for node in self.view_nodes(formula.get('view',{})):
-                if node.get('kind')!='raw' or not node.get('render_id'):continue
-                stable=node['_raw_key'];shared=('raw',node.get('text',''))
+                if node.get('kind')!='raw':continue
+                stable=node.get('_raw_key');shared=('raw',node.get('text',''))
+                if not node.get('render_id'):
+                    # No range means the service can never be asked for this fragment,
+                    # and no warmup instance means no other way to an image. Record it
+                    # as failed: its source is shown, and a horizontal key enters it.
+                    if not node.get('warmup_key') and shared not in self.typesetter.cache:
+                        self.typesetter.cache[shared]=False;stuck=True
+                    continue
                 if stable in self.typesetter.cache or shared in self.typesetter.cache or shared in self.raw_pending or shared in seen:continue
                 source_id=':'.join(node['render_id'].split(':')[:2]);source_range=by_id.get(source_id)
                 if not source_range:continue
-                seen.add(shared);targets[source_id]=(stable,shared);ranges.append(source_range)
+                seen.add(shared);targets[source_id]=(stable,shared);ranges.append(source_range);wanted+=1
+            # Ask for a source that reaches only as far as the last fragment does:
+            # the service then cuts the document there, so a mistake further down
+            # cannot take the images of this viewport with it.
+            if wanted:context_end=max(context_end,formula['end'])
+        if stuck:self.typesetter.touch();self.repaint_formulas()
         if not targets:return
-        body=self.body()|{'raw':ranges,'formulas':[]}
+        body=self.body()|{'raw':ranges,'formulas':[],'context_end':context_end}
         pending={shared for _,shared in targets.values()};self.raw_pending.update(pending)
         def rendered(result,error,targets=targets,revision=revision):
             pending={shared for _,shared in targets.values()};self.raw_pending.difference_update(pending)
             if revision!=self.revision:self.raw_timer.start();return
             for shared in pending:self.typesetter.cache[shared]=False
-            if error:self.report(error)
+            if error:
+                self.raw_error=(revision,pending);self.report(error)
             else:
+                self.raw_error=None
                 for item in result.get('items',[]):
                     source_id=':'.join(item['id'].split(':')[:2])
                     if source_id in targets:self.typesetter.cache[targets[source_id][1]]=item
-            for editor in self.editors:editor.document().markContentsDirty(0,editor.document().characterCount());editor.viewport().update()
-            if self.math_state:self.math_canvas.refresh(self.math_state);self.reposition_math()
+            self.typesetter.touch();self.repaint_formulas()
         self.services.request('/api/render',body,rendered,key='raw-batch')
+
+    def repaint_formulas(self):
+        """Relay out and repaint after Raw images or fragment statuses changed."""
+        for editor in self.editors:editor.document().markContentsDirty(0,editor.document().characterCount());editor.viewport().update()
+        if self.math_state:self.math_canvas.refresh(self.math_state);self.reposition_math()
+        self.report_raw_fragments()
 
     def invalidate_raw(self,records):
         for _,text in records:
             shared=('raw',text);self.typesetter.cache.pop(shared,None);self.raw_pending.discard(shared)
+        if records:self.typesetter.touch()
 
     def clear_actual_svg(self):
         self.semantic_spans=[];self.engine_spans=[]
         for key in list(self.typesetter.cache):
             if isinstance(key,str):del self.typesetter.cache[key]
+        self.typesetter.touch()
 
     def compile(self,callback=None):
         revision=self.revision
@@ -731,15 +830,31 @@ class Window(QMainWindow):
             self.semantic_spans=spans;self.apply_highlights()
         self.request_language("semanticTokens/full",done)
 
+    def highlight_views(self):
+        """Views that show source text: the editors, plus the source dock when open."""
+        views=list(self.editors)
+        if not self.source_dock.isHidden():views.append(self.source_view)
+        return views
+
     def apply_highlights(self):
+        """Colour the semantic and engine spans in every view.
+
+        Token lists are replaced whenever they change (the editor clears them on
+        every source edit and the LSP reply repopulates them), so this runs once
+        per reply and has to stay cheap: one format per colour instead of a new
+        Qt object for every span, and no work for a hidden source dock.
+        """
         from PyQt5.QtGui import QColor
-        for editor in [*self.editors,self.source_view]:
-            selections=[]
+        for editor in self.highlight_views():
+            selections=[];formats={}
+            convert=editor.mapping.display_position if isinstance(editor,Editor) else lambda p:u16(self.source[:p])
             for a,b,color in self.semantic_spans+self.engine_spans:
+                fmt=formats.get(color)
+                if fmt is None:
+                    fmt=QTextCharFormat();fmt.setForeground(QColor(color));formats[color]=fmt
                 selection=QTextEdit.ExtraSelection();selection.cursor=QTextCursor(editor.document())
-                convert=editor.mapping.display_position if isinstance(editor,Editor) else lambda p:u16(self.source[:p])
                 selection.cursor.setPosition(convert(a));selection.cursor.setPosition(convert(b),QTextCursor.KeepAnchor)
-                selection.format.setForeground(QColor(color));selections.append(selection)
+                selection.format=fmt;selections.append(selection)
             editor.setExtraSelections((editor.base_selections if isinstance(editor,Editor) else [])+selections)
 
     def find_replace(self):

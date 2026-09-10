@@ -71,6 +71,10 @@ def validate_settings(value):
     result = DEFAULTS | value
     if not isinstance(result["font_family"], str) or not result["font_family"].strip():
         raise ValueError("font_family 不能为空")
+    # The formula font is resolved against the installed families, so an
+    # uninstalled name silently mixes several designs in one formula.
+    if not isinstance(result["math_font"], str) or not result["math_font"].strip():
+        raise ValueError("math_font 不能为空")
     if not isinstance(result["font_size"], (int, float)) or not 6 <= result["font_size"] <= 72:
         raise ValueError("font_size 应在 6–72 pt 之间")
     if not isinstance(result["svg_scale"], (int, float)) or not .1 <= result["svg_scale"] <= 8:

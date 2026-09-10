@@ -24,7 +24,12 @@ function attachmentKey(expression,definitions=state.formula_definitions,display=
 function attachmentFor(node) {
   if(!attachmentReady || !node.attachment)return null;
   const key=attachmentKey(node.attachment,node.attachmentDefinitions,node.attachmentDisplay);
-  if(!attachments.has(key))attachments.set(key,{status:'waiting'});
+  if(!attachments.has(key)){
+    // Layout results depend on the definition prefix as well, so a long editing
+    // session leaves keys behind that no block references any more.
+    if(attachments.size>=256)for(const [old,record] of attachments){if(record.status==='waiting')continue;attachments.delete(old);if(attachments.size<192)break;}
+    attachments.set(key,{status:'waiting'});
+  }
   return attachments.get(key);
 }
 function scheduleAttachments() {
@@ -186,6 +191,10 @@ function visitRaw(callback) {
 function schedulePreviews() {
   clearTimeout(renderTimer);
   let waiting=false;
+  // A record belongs to one compile snapshot, and its key embeds that snapshot,
+  // so records from an older session can never be looked up again. Drop them
+  // with their blob URLs instead of accumulating one per keystroke.
+  for(const [key,record] of previews)if(record.session!==previewSession){if(record.url)URL.revokeObjectURL(record.url);previews.delete(key);}
   visitRaw(node=>{
     const key=rawPreviewKey(previewSession,node);
     if(!previews.has(key))previews.set(key,{key,session:previewSession,status:'waiting',expression:node.text});
@@ -221,6 +230,7 @@ async function runPreviews() {
       const svg=new DOMParser().parseFromString(item.svg,'image/svg+xml').documentElement;
       if(svg.localName!=='svg'||![item.width,item.height].every(n=>Number.isFinite(n)&&n>=0))throw new Error('无效的 Typst SVG');
       normalizedMetrics(item);
+      if(record.url)URL.revokeObjectURL(record.url);
       Object.assign(record,item,{status:'ready',mapped:true,url:URL.createObjectURL(new Blob([item.svg],{type:'image/svg+xml'}))});
     }
     for(const record of records)if(record.status==='loading')Object.assign(record,{status:'error',error:'当前文档没有此 Raw 的可见排版结果'});
@@ -402,6 +412,9 @@ keyboard.addEventListener('keydown',event=>{
   if(ctrl && ['c','v','x'].includes(key.toLowerCase()))return;
   if(ctrl && key.toLowerCase()==='z'){event.preventDefault();send({action:event.shiftKey?'redo':'undo'});return;}
   if(ctrl && key.toLowerCase()==='y'){event.preventDefault();send({action:'redo'});return;}
+  // Only the combinations the structural editor implements are captured here.
+  // Everything else (Ctrl+F, Ctrl+P, Ctrl+S, reload, …) stays with the browser.
+  if(ctrl && !['a',' ','arrowleft','arrowright'].includes(key.toLowerCase()))return;
   if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','Backspace','Delete','Escape','Tab','Enter',' '].includes(key)||ctrl){event.preventDefault();send({action:'key',key,shift:event.shiftKey,ctrl});}
 });
 keyboard.addEventListener('beforeinput',event=>{
@@ -429,7 +442,8 @@ export async function initMath(callbacks) {
     request:body=>api('/api/prewarm',body),
     snapshot:()=>callbacks.warmupSnapshot?.()||({path:documentPath(),source:state.source}),
     apply:results=>{if(state.pending)return false;state=call({action:'macro_warmup',results});previewSession++;callbacks.projectionChanged?.(state);return true;},
-    updated:()=>{callbacks.projectionChanged?.(state);redraw();}
+    updated:()=>{callbacks.projectionChanged?.(state);redraw();},
+    onError:error=>serviceLabel('宏预热失败',error.message)
   });
   serviceLabel(serviceReady?'Tinymist':'Tinymist 未找到',result.error||'');
   document.fonts.ready.then(measure);

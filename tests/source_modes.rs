@@ -155,15 +155,15 @@ fn macro_cache_reuses_analysis_and_free_raw_uses_definition_scope() {
     let defs = "#let amount = 2\n#let fixed(x) = $frac(#x, cancel(amount))$\n#let amount = 5\n";
     let registry = typst::macro_registry(defs);
     let again = typst::macro_registry(defs);
-    assert!(std::rc::Rc::ptr_eq(&registry, &again));
+    assert!(std::sync::Arc::ptr_eq(&registry, &again));
     let mut e = Editor::default();
     e.apply(Action::Import { source:format!("{defs}$fixed(a)$") }).unwrap();
     let view = e.response().view;
     let raw = views(&view, "raw")[0];
     assert_eq!(raw.text, "cancel(amount)");
     assert!(!raw.definitions.as_ref().unwrap().contains("amount = 5"));
-    assert!(std::rc::Rc::ptr_eq(&registry, &typst::macro_registry(defs)));
-    assert!(!std::rc::Rc::ptr_eq(&registry, &typst::macro_registry(RATIO)));
+    assert!(std::sync::Arc::ptr_eq(&registry, &typst::macro_registry(defs)));
+    assert!(!std::sync::Arc::ptr_eq(&registry, &typst::macro_registry(RATIO)));
 }
 #[test]
 fn macro_names_shadow_builtins_and_empty_command_slots_are_editable() {
@@ -281,14 +281,24 @@ fn composed_arguments_keep_outer_colors_and_lexical_raw_contexts() {
 fn definition_edits_reuse_only_the_unchanged_prefix_and_rebuild_dependents() {
     let original = format!("{PD}\n{JAC}\n#let tail(x) = $jac(#x, #x, #x, #x)$");
     let first = typst::macro_registry(&original);
+    // Reuse is decided per definition by comparing its own source text, so an
+    // edited definition is rebuilt while the earlier ones keep their templates.
+    // The registry cache is process-wide and shared with the server threads, so
+    // which cached entry supplied the reuse is not part of the contract: compare
+    // the templates themselves, not their addresses.
     let tail_edit = typst::macro_registry(&original.replace("#let tail(x)", "#let renamed(x)"));
-    assert!(std::rc::Rc::ptr_eq(&first.entries[0].template, &tail_edit.entries[0].template));
-    assert!(std::rc::Rc::ptr_eq(&first.entries[1].template, &tail_edit.entries[1].template));
-    assert!(!std::rc::Rc::ptr_eq(&first.entries[2].template, &tail_edit.entries[2].template));
+    assert_eq!(first.entries[0].template, tail_edit.entries[0].template);
+    assert_eq!(first.entries[1].template, tail_edit.entries[1].template);
+    // The edited definition is re-analyzed under its new binding name. Its
+    // template body is unchanged, so equal templates are correct here.
+    assert_eq!(tail_edit.entries[2].name, "renamed");
+    assert_eq!(tail_edit.entries[2].params, vec!["x".to_string()]);
     let pd_edit = typst::macro_registry(&original.replace("frac(partial #f, partial #x)", "cancel(#f + #x)"));
     assert!(pd_edit.entries.iter().all(|d| !d.expandable));
     let restored = typst::macro_registry(&original);
     assert!(restored.entries.iter().all(|d| d.expandable));
+    // An identical definition set is served from the cache, address for address.
+    assert!(std::sync::Arc::ptr_eq(&first, &restored));
     let removed = typst::macro_registry(JAC);
     assert!(!removed.entries[0].expandable);
     let mut e = Editor::default();

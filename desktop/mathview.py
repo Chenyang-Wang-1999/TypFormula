@@ -6,6 +6,7 @@ from PyQt5.QtCore import Qt, QRectF, QPointF, QSizeF, QObject
 from PyQt5.QtGui import QFont, QFontMetricsF, QColor, QPen, QPainter, QTextObjectInterface, QTextFormat, QImage, QPixmap
 from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import QWidget, QApplication, QInputDialog
+from . import mathfont
 from .svg import qt_svg
 
 OBJECT = QTextFormat.UserObject + 1
@@ -53,32 +54,105 @@ class Typesetter:
         self.cache = cache if cache is not None else {}
         self.svg = BitmapCache()
         self.placements = {}
+        # Structural metrics: baseline and line height, from the editor text font.
+        # A math font's own ascent is TeX sized (the bundled New Computer Modern
+        # Math reports more than three em, for four-line delimiters), so taking the
+        # line box from it would put every formula in a mostly empty box.
+        self.lines = {}
+        # Glyph metrics, per family and style size: one pair is enough for each.
+        self.fonts = {}
+        self.requested = None
+        self.math_family = ""
+        # Bumped whenever the Raw/attachment results that layout reads change.
+        self.version = 0
+
+    def touch(self):
+        """Invalidate cached boxes after Raw SVGs or attachment placements move."""
+        self.version += 1
+
+    def settings_signature(self):
+        return (self.settings.get("font_size"), self.settings.get("svg_scale"), self.family())
+
+    def family(self):
+        """The family that draws math glyphs, resolved against what Qt really has.
+
+        Re-resolved when the settings change: an uninstalled name must never reach
+        QFont, because the substitution is silent and the fallback for a glyph the
+        substitute lacks is a third font again.
+        """
+        requested = (self.settings.get("math_font") or "", self.settings.get("font_family") or "")
+        if requested != self.requested:
+            self.requested = requested
+            self.math_family = mathfont.resolve(*requested)
+            self.fonts.clear()
+            self.lines.clear()
+        return self.math_family
+
+    def line(self, factor):
+        """(font, metrics, height, ascent, descent) of one math style's line box."""
+        size = self.settings["font_size"] * max(.55, factor)
+        entry = self.lines.get(size)
+        if entry is None:
+            font = QFont(self.settings.get("font_family") or "")
+            font.setPointSizeF(size)
+            metrics = QFontMetricsF(font)
+            entry = (font, metrics, metrics.height(), metrics.ascent(), metrics.descent())
+            self.lines[size] = entry
+        return entry
+
+    def font(self, family, factor):
+        """(font, metrics) used to draw one run, at this style's size."""
+        size = self.settings["font_size"] * max(.55, factor)
+        entry = self.fonts.get((family, size))
+        if entry is None:
+            font = QFont(family)
+            font.setPointSizeF(size)
+            entry = (font, QFontMetricsF(font))
+            self.fonts[(family, size)] = entry
+        return entry
+
+    def run(self, text, factor, text_mode=False):
+        """(characters, font, advance) for one text run of the display tree."""
+        family, glyph = mathfont.glyph(self.family(), text, text_mode)
+        font, metrics = self.font(family, factor)
+        return glyph, font, max(2, metrics.horizontalAdvance(glyph))
+
+    def source_run(self, text, factor):
+        """A Raw shown as source instead of an image keeps the editor's own font.
+
+        Its text is Typst source, not math: mapping letters to the math italic
+        range would draw `cases(1 & x > 0)` as a formula.
+        """
+        font, metrics = self.font(self.settings.get("font_family") or self.family(), factor)
+        return text, font, max(2, metrics.horizontalAdvance(text))
 
     def raw(self, node):
-        item=self.cache.get(("raw",node.get("text","")))
-        if item:return item
-        key = node.get("_raw_key",node.get("render_id"))
-        item = self.cache.get(key)
-        if item:
-            return item
+        """The rendered record of a Raw node, or False once a request failed.
+
+        False and None are different answers: False means the fragment was asked
+        for and produced no image, None that nothing has been asked yet.
+        """
+        shared = ("raw", node.get("text", ""))
+        if shared in self.cache:
+            return self.cache[shared]
+        for key in (node.get("_raw_key"), node.get("render_id")):
+            if key and key in self.cache:
+                return self.cache[key]
         warm_key = node.get("warmup_key")
         bounds = node.get("warmup_range")
         return self.cache.get((warm_key, tuple(bounds))) if warm_key and bounds else None
 
     def layout(self, node, factor=1.0, text_mode=False):
-        font = QFont("New Computer Modern Math")
-        font.setPointSizeF(self.settings["font_size"] * max(.55, factor))
-        metrics = QFontMetricsF(font)
-        em = metrics.height()
+        font, metrics, em, ascent, descent = self.line(factor)
         kind = node.get("kind", "cell")
         children = node.get("children", [])
         if kind == "absent":
             return Box(0,0,0)
         if kind == "stop":
-            return Box(2,em,metrics.ascent(),stops=[(1,0,em,node["cursor"],node.get("active",False))])
+            return Box(2,em,ascent,stops=[(1,0,em,node["cursor"],node.get("active",False))])
         if kind == "raw":
             item = self.raw(node)
-            if item:
+            if isinstance(item, dict):
                 # Metrics are ratios relative to the actual Typst environment.
                 size = self.settings["font_size"] * metrics.fontDpi() / 72 * self.settings["svg_scale"]
                 width = max(1, item["base_font_size_pt"] * size)
@@ -87,15 +161,22 @@ class Typesetter:
                 box = Box(width,height,base,[("svg",0,0,(item["svg"],width,height))])
                 box.raws.append((QRectF(0,0,width,height),node))
                 return box
+            if item is False:
+                # Asked for and refused. Its source is shown instead, marked the way
+                # the web editor marks a failed fragment, and the core lets a
+                # horizontal key enter it so it can be repaired in place.
+                glyph, draw_font, width = self.source_run(node.get("text", ""), factor)
+                box = Box(width,em,ascent,[("text",0,ascent,(glyph,draw_font,kind))])
+                box.operations.insert(0,("failed",0,0,(width,em)))
+                box.raws.append((QRectF(0,0,width,em),node))
+                return box
         if not children:
             text = node.get("display_glyph") or node.get("text", "")
-            if kind=="char" and not text_mode and not node.get("display_glyph") and len(text)==1:
-                if 'a'<=text<='z':text='ℎ' if text=='h' else chr(0x1d44e+ord(text)-ord('a'))
-                elif 'A'<=text<='Z':text=chr(0x1d434+ord(text)-ord('A'))
             if kind == "empty-cell": text = "□"
             if kind == "draft-caret": text = "│"
-            width = max(2,metrics.horizontalAdvance(text))
-            box = Box(width,em,metrics.ascent(),[("text",0,metrics.ascent(),(text,font,kind))])
+            if kind == "raw": glyph, draw_font, width = self.source_run(text, factor)
+            else: glyph, draw_font, width = self.run(text, factor, text_mode)
+            box = Box(width,em,ascent,[("text",0,ascent,(glyph,draw_font,kind))])
             if kind == "raw": box.raws.append((QRectF(0,0,width,em),node))
         elif kind == "fraction":
             numerator,denominator = [self.layout(child,factor*.9) for child in children[:2]]
@@ -144,8 +225,8 @@ class Typesetter:
             if kind == "delim":
                 left,right=(node.get("text", "(\n)").split("\n")+[""])[:2]
                 parts=[self.layout({"kind":"symbol","text":left},factor)]+parts+[self.layout({"kind":"symbol","text":right},factor)]
-            baseline=max((part.baseline for part in parts),default=metrics.ascent())
-            height=baseline+max((part.height-part.baseline for part in parts),default=metrics.descent())
+            baseline=max((part.baseline for part in parts),default=ascent)
+            height=baseline+max((part.height-part.baseline for part in parts),default=descent)
             box=Box(sum(p.width for p in parts),height,baseline)
             x=0
             for part in parts:
@@ -160,7 +241,8 @@ class Typesetter:
                         box.operations.extend([("line",0,4,(box.width/2,-4)),("line",box.width/2,0,(box.width/2,4))])
                     elif name in ("dot","ddot","dddot"):
                         dots={"dot":"·","ddot":"··","dddot":"···"}[name]
-                        box.operations.append(("text",(box.width-metrics.horizontalAdvance(dots))/2,metrics.ascent()*.4,(dots,font,"symbol")))
+                        glyph,draw_font,width=self.run(dots,factor)
+                        box.operations.append(("text",(box.width-width)/2,ascent*.4,(glyph,draw_font,"symbol")))
                     else:
                         box.operations.append(("line",0,2,(box.width,0)))
                         if name in ("arrow","vec"):
@@ -187,6 +269,13 @@ class Typesetter:
                 painter.drawLine(QPointF(px,py),QPointF(px+value[0],py+value[1]))
             elif kind == "selection":
                 painter.fillRect(QRectF(px,py,*value),QColor("#a8cdf3"))
+            elif kind == "failed":
+                # Same mark as the web editor's render error: dashes, warm ground.
+                width,height=value
+                painter.setBrush(QColor("#fff2eb"))
+                painter.setPen(QPen(QColor("#b3654e"),1,Qt.DashLine))
+                painter.drawRoundedRect(QRectF(px-.5,py+1,width+1,max(2,height-2)),2,2)
+                painter.setBrush(Qt.NoBrush)
             elif kind == 'mode':
                 width,height,mode=value
                 painter.setBrush(QColor('#fff8e9' if mode=='string' else '#edf4ff'))
@@ -204,12 +293,29 @@ class Typesetter:
 
 class FormulaObject(QObject,QTextObjectInterface):
     def __init__(self, editor):
-        super().__init__(editor);self.editor=editor
+        super().__init__(editor);self.editor=editor;self.boxes={};self.signature=None
+
+    def box(self,formula):
+        """Box for one formula view, reused across the layout, paint and click paths.
+
+        Qt asks for the same object from intrinsicSize and drawObject, and a
+        click asks again before activating. One entry per live view is all this
+        needs, and holding the view keeps its id() unique.
+        """
+        typesetter=self.editor.owner.typesetter
+        signature=(typesetter.version,typesetter.settings_signature())
+        if signature!=self.signature:self.boxes.clear();self.signature=signature
+        view=formula["view"]
+        entry=self.boxes.get(id(view))
+        if entry is not None and entry[0] is view:return entry[1]
+        box=typesetter.layout(view)
+        self.boxes[id(view)]=(view,box)
+        return box
 
     def intrinsicSize(self, document, position, format):
         node=self.editor.object_by_id.get(format.property(OBJECT_ID))
         if not node:return QSizeF(20,20)
-        box=self.editor.owner.typesetter.layout(node["view"])
+        box=self.box(node)
         # QTextDocument uses this height for the whole visual line. Do not cap
         # it: a tall fraction/matrix must enlarge its line instead of clipping.
         return QSizeF(min(box.width+8,max(80,self.editor.viewport().width()-30)),box.height+6)
@@ -220,7 +326,7 @@ class FormulaObject(QObject,QTextObjectInterface):
         painter.save();painter.setClipRect(rect)
         painter.fillRect(rect,QColor("#f1f6fb"))
         painter.setPen(QColor("#c8d6e2"));painter.drawRoundedRect(rect.adjusted(.5,.5,-.5,-.5),2,2)
-        self.editor.owner.typesetter.paint(painter,self.editor.owner.typesetter.layout(node["view"]),rect.x()+4,rect.y()+3)
+        self.editor.owner.typesetter.paint(painter,self.box(node),rect.x()+4,rect.y()+3)
         painter.restore()
 
 class MathCanvas(QWidget):

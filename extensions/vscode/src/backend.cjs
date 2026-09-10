@@ -1,7 +1,7 @@
 const {spawn}=require('node:child_process');
 const readline=require('node:readline');
 class Backend {
-  constructor(executable,root,env,log){Object.assign(this,{executable,root,env,log});this.next=0;this.pending=new Map();this.tail=Promise.resolve();}
+  constructor(executable,root,env,log){Object.assign(this,{executable,root,env,log});this.next=0;this.pending=new Map();}
   start(){
     if(this.child)return;
     const child=spawn(this.executable,['--stdio',this.root],{cwd:this.root,env:this.env,windowsHide:true,stdio:['pipe','pipe','pipe']});this.child=child;
@@ -10,13 +10,14 @@ class Backend {
     child.stderr.on('data',data=>this.log?.appendLine(data.toString()));
     child.on('error',error=>this.stop(error));child.on('exit',()=>{if(this.child===child)this.stop(new Error('Typst 后端已退出'));});
   }
+  // Replies are matched by id, and the backend serves each request on its own
+  // thread, so a long page preview no longer blocks formula rendering or LSP.
   request(route,body){
-    const task=()=>new Promise((resolve,reject)=>{
+    return new Promise((resolve,reject)=>{
       if(this.disposed){reject(new Error('编辑器已关闭'));return;}
       this.start();const id=++this.next,timer=setTimeout(()=>this.stop(new Error('Typst 后端请求超时')),55000);
       this.pending.set(id,{resolve,reject,timer});this.child.stdin.write(JSON.stringify({id,route,body})+'\n',error=>{if(error)this.stop(error);});
     });
-    const result=this.tail.then(task);this.tail=result.catch(()=>{});return result;
   }
   stop(error=new Error('编辑器已关闭')){const child=this.child;this.child=null;child?.kill();for(const task of this.pending.values()){clearTimeout(task.timer);task.reject(error);}this.pending.clear();}
   dispose(){this.disposed=true;this.stop();}

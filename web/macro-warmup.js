@@ -1,7 +1,7 @@
 import {normalizedMetrics} from './svg-metrics.js';
 
 export class MacroWarmup {
-  constructor({request,snapshot,apply,updated}) { Object.assign(this,{request,snapshot,apply,updated});this.records=new Map();this.revision=0;this.failures='[]'; }
+  constructor({request,snapshot,apply,updated,onError=()=>{}}) { Object.assign(this,{request,snapshot,apply,updated,onError});this.records=new Map();this.revision=0;this.failures='[]'; }
   schedule(delay=350) {
     if(this.disposed)return;
     const path=this.snapshot().path;
@@ -27,7 +27,7 @@ export class MacroWarmup {
       const failures=JSON.stringify(result.results.filter(r=>r.failed).map(r=>r.key).sort());
       if(failures!==this.failures) { this.pending=result.results.map(r=>[r.key,r.failed]);this.failures=failures; }
       this.flush();this.updated();
-    } catch(error) { this.error=error.message; }
+    } catch(error) { this.error=error.message;this.onError(error); }
     finally { this.busy=false;if(revision!==this.revision)this.schedule(0); }
   }
   flush() { if(this.pending&&this.apply(this.pending))this.pending=null; }

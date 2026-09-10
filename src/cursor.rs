@@ -26,6 +26,8 @@ pub enum Action {
     Complete { name: String },
     EditSource { cursor: Cursor, source: String },
     PreviewResult { source: String, definitions: String, display: bool, failed: bool },
+    // The desktop learns the fate of every fragment of one render pass at once.
+    PreviewResults { sources: Vec<String>, definitions: String, display: bool, failed: bool },
     LspCompletions { draft: String, caret: usize, items: Vec<CommandCompletion> },
     Geometry { stops: Vec<StopGeometry> },
     Undo, Redo, Clear,
@@ -33,7 +35,9 @@ pub enum Action {
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct StopGeometry { pub cursor: Cursor, pub x: f64, pub y: f64 }
-#[derive(Clone)]
+// Only a hint about which Raws are worth opening their source for; dropping the
+// whole set at the limit is harmless.
+const FAILED_PREVIEW_LIMIT: usize = 256;#[derive(Clone)]
 pub(crate) struct Snapshot { root: MathData, cursor: Cursor, anchor: Option<Cursor>, definitions: String, display: bool }
 
 pub struct Editor {
@@ -51,16 +55,41 @@ pub struct Editor {
     future: Vec<Snapshot>,
     typing: bool,
     lsp_completions: Option<(String, usize, Vec<CommandCompletion>)>,
-    failed_previews: HashSet<(String, bool, String)>,
+    // Which Raw fragments of the active formula have no rendered image. A verdict
+    // belongs to one definition context, and a change discards the set: it stays
+    // proportional to a single formula instead of to a session of prefixes.
+    failed_previews: HashSet<String>,
+    failed_context: Option<(String, bool)>,
 }
 impl Default for Editor {
-    fn default() -> Self { Self { root: vec![], cursor: Cursor::default(), anchor: None, definitions: String::new(), display: true, message: String::new(), completion_index: 0, revision: 0, geometry: vec![], target_x: None, history: vec![], future: vec![], typing: false, lsp_completions: None, failed_previews: HashSet::new() } }
+    fn default() -> Self { Self { root: vec![], cursor: Cursor::default(), anchor: None, definitions: String::new(), display: true, message: String::new(), completion_index: 0, revision: 0, geometry: vec![], target_x: None, history: vec![], future: vec![], typing: false, lsp_completions: None, failed_previews: HashSet::new(), failed_context: None } }
 }
 impl Editor {
     pub(crate) fn snapshot(&self) -> Snapshot { Snapshot { root: self.root.clone(), cursor: self.cursor.clone(), anchor: self.anchor.clone(), definitions: self.definitions.clone(), display: self.display } }
     pub(crate) fn restore(&mut self, s: Snapshot) { self.root = s.root; self.cursor = s.cursor; self.anchor = s.anchor; self.definitions = s.definitions; self.display = s.display; }
     pub fn can_undo(&self) -> bool { !self.history.is_empty() }
     pub fn can_redo(&self) -> bool { !self.future.is_empty() }
+    // Adopting a definition set always replaces the whole projected tree, so the
+    // cursor cannot survive it: the structural paths it points at are re-derived.
+    fn adopt(&mut self, parsed: typst::Parsed) {
+        self.root = parsed.root; self.definitions = parsed.definitions;
+        self.cursor = Cursor::default(); self.anchor = None; self.geometry.clear();
+        self.lsp_completions = None;
+    }
+    // Reclassify the current cell against the current definitions. A MacroCall
+    // must never outlive the arity it was parsed with.
+    fn rebind(&mut self) -> Result<(), String> {
+        let parsed = typst::parse_document(&typst::write_document_mode(&self.root, &self.definitions, self.display))?;
+        self.adopt(parsed);
+        Ok(())
+    }
+    // A #let confirmed inside a formula arrives mid-edit. Route it through the
+    // same reparse as an explicit definition update instead of leaving the cell
+    // parsed against the previous registry.
+    fn refresh_definitions(&mut self, previous: &str) {
+        if self.definitions == previous { return; }
+        if let Err(error) = self.rebind() { self.message = error; }
+    }
     fn data(&self) -> &MathData { cell(&self.root, &self.cursor.slices) }
     fn data_mut(&mut self) -> &mut MathData { cell_mut(&mut self.root, &self.cursor.slices) }
     fn owner(&self) -> Option<&MathAtom> {
@@ -76,6 +105,30 @@ impl Editor {
         let atom = self.cursor.pos.checked_sub(1).and_then(|p| self.data().get(p))?;
         if let Kind::Unknown { name, .. } = &atom.kind { Some(name) } else { None }
     }
+    // A draft opened from a Raw fragment carries that fragment as its source, and
+    // its spelling is the authority once the draft is committed.
+    fn editing_source(&self) -> bool {
+        self.cursor.pos.checked_sub(1).and_then(|p| self.data().get(p))
+            .is_some_and(|atom| matches!(&atom.kind, Kind::Unknown { original: Some(_), .. }))
+    }
+    // Rendering state is transient and independent of source and undo: it only
+    // decides whether a Raw opens its source on a boundary key.
+    fn record_preview(&mut self, definitions: &str, display: bool, sources: impl IntoIterator<Item=String>, failed: bool) {
+        if self.failed_context.as_ref().is_none_or(|(context,shown)| context != definitions || *shown != display) {
+            self.failed_previews.clear();
+            self.failed_context = Some((definitions.to_owned(), display));
+        }
+        for source in sources {
+            if failed {
+                if self.failed_previews.len() >= FAILED_PREVIEW_LIMIT { self.failed_previews.clear(); }
+                self.failed_previews.insert(source);
+            } else { self.failed_previews.remove(&source); }
+        }
+    }
+    fn preview_failed(&self, source: &str) -> bool {
+        self.failed_context.as_ref().is_some_and(|(context,shown)| context == &self.definitions && *shown == self.display)
+            && self.failed_previews.contains(source)
+    }
     pub fn completions(&self) -> Vec<String> {
         if self.string_mode() { return vec![]; }
         if let Some(items) = self.current_lsp_completions() { return items.iter().map(|i| i.label.clone()).collect(); }
@@ -89,11 +142,19 @@ impl Editor {
         names.sort(); names.dedup(); names
     }
     pub fn apply(&mut self, action: Action) -> Result<(), String> {
-        if let Action::Geometry { stops } = action { self.geometry = stops; return Ok(()); }
+        if let Action::Geometry { stops } = action {
+            // Geometry is measured by a frontend and can be stale after an undo
+            // or a definition change. It is a hint for the caret, never a
+            // cursor source, so drop every stop that is not valid right now.
+            self.geometry = stops.into_iter().filter(|stop| valid(&self.root, &stop.cursor)).collect();
+            return Ok(());
+        }
         if let Action::PreviewResult { source, definitions, display, failed } = action {
-            // Rendering state is transient, independent of source and undo.
-            let key = (definitions, display, source);
-            if failed { self.failed_previews.insert(key); } else { self.failed_previews.remove(&key); }
+            self.record_preview(&definitions, display, [source], failed);
+            return Ok(());
+        }
+        if let Action::PreviewResults { sources, definitions, display, failed } = action {
+            self.record_preview(&definitions, display, sources, failed);
             return Ok(());
         }
         if let Action::LspCompletions { draft, caret, items } = action {
@@ -115,9 +176,7 @@ impl Editor {
                 // Serialize first, so removing/changing a definition cannot lose arguments.
                 if definitions != self.definitions {
                     let parsed = typst::parse_document(&typst::write_document_mode(&self.root, &definitions, self.display))?;
-                    self.root = parsed.root; self.definitions = parsed.definitions;
-                    self.cursor = Cursor::default(); self.anchor = None; self.geometry.clear();
-                    self.lsp_completions = None;
+                    self.adopt(parsed);
                 }
             }
             Action::Undo => {
@@ -153,16 +212,28 @@ impl Editor {
             Action::Clear => { self.root.clear(); self.cursor = Cursor::default(); self.anchor = None; }
             Action::AddRow => self.grow_grid(false),
             Action::AddColumn => self.grow_grid(true),
-            Action::Geometry { .. } | Action::LspCompletions { .. } | Action::PreviewResult { .. } => unreachable!(),
+            Action::Geometry { .. } | Action::LspCompletions { .. } | Action::PreviewResult { .. } | Action::PreviewResults { .. } => unreachable!(),
         }
+        let typed_before = self.typing;
+        let mut pushed = false;
+        let mut future_before = None;
         if self.root != before.root || self.definitions != before.definitions || self.display != before.display {
-            if !is_typing || !self.typing { self.history.push(before); }
-            if self.history.len() > 200 { self.history.remove(0); }
-            self.future.clear();
+            if !is_typing || !self.typing { self.history.push(before.clone()); pushed = true; }
+            future_before = Some(std::mem::take(&mut self.future));
         }
         self.typing = is_typing;
         self.revision += 1;
-        if !valid(&self.root, &self.cursor) { return Err("光标结构不一致".into()); }
+        if !valid(&self.root, &self.cursor) {
+            // A rejected step must not leave a cursor whose next keystroke would
+            // index a cell that no longer exists: drop the step, its history
+            // entry and its effects on the redo stack.
+            if pushed { self.history.pop(); }
+            if let Some(future) = future_before { self.future = future; }
+            self.restore(before);
+            self.typing = typed_before;
+            return Err("光标结构不一致".into());
+        }
+        if pushed && self.history.len() > 200 { self.history.remove(0); }
         Ok(())
     }
     // CutAndPaste reduceSelectionToOneCell: crossing a nest selects its atom.
@@ -175,6 +246,10 @@ impl Editor {
         let left = a.min(b);
         let right = if a == b || self.cursor.slices.len() > common || anchor.slices.len() > common { a.max(b) + 1 } else { a.max(b) };
         let slices = self.cursor.slices[..common].to_vec();
+        // One side may name an atom while the other names a position, so the
+        // widened end can pass the cell it lives in. A selection never may.
+        let length = cell(&self.root, &slices).len();
+        let right = right.min(length);
         *anchor = Cursor { slices: slices.clone(), pos: left, occurrence: String::new() };
         self.cursor = Cursor { slices, pos: right, occurrence: String::new() };
     }
@@ -257,6 +332,10 @@ impl Editor {
     // Cursor::macroModeClose. The backslash is an input gesture, never serialized.
     fn close_command(&mut self, cancel: bool, completion: Option<String>) -> bool {
         let Some(draft) = self.pending() else { return false; };
+        // Asked before the draft is removed: an unparseable edit of a Raw fragment
+        // is committed as that fragment's source instead of being refused.
+        let from_source = self.editing_source();
+        let previous_definitions = self.definitions.clone();
         let name = completion.unwrap_or_else(|| draft.trim().to_string());
         let name = if name == "/" { "frac".to_string() } else { name };
         let template = name.is_empty() || self.factory(&name).is_some();
@@ -287,7 +366,13 @@ impl Editor {
                 data = text.chars().map(MathAtom::character).collect();
             }
             let n = data.len(); self.data_mut().splice(pos..pos, data); self.cursor.pos += n;
+        } else if from_source && !template {
+            // The draft was opened from a Raw fragment and does not parse as a
+            // formula: keep the edited text as that fragment's source, because the
+            // source is authoritative and refusing would lose the repair.
+            self.plain_insert(MathAtom::raw(name));
         } else { self.insert_named(&name, saved); }
+        self.refresh_definitions(&previous_definitions);
         true
     }
     fn fill_command(&mut self, replacement: String) {
@@ -434,8 +519,10 @@ impl Editor {
             let pos = self.cursor.pos;
             match typst::parse_command(name, &self.definitions) {
                 Ok(doc) => {
+                    let previous = self.definitions.clone();
                     self.definitions = doc.definitions;
                     let n = doc.root.len(); self.data_mut().splice(pos..pos, doc.root); self.cursor.pos += n;
+                    self.refresh_definitions(&previous);
                 }
                 Err(error) => {
                     let n = saved.len(); self.data_mut().splice(pos..pos, saved); self.cursor.pos += n;
@@ -478,7 +565,7 @@ impl Editor {
             let p = if forward { self.cursor.pos } else { self.cursor.pos - 1 };
             if !shift {
                 if let Kind::Raw {source} = &self.data()[p].kind {
-                    if self.failed_previews.contains(&(self.definitions.clone(), self.display, source.clone())) {
+                    if self.preview_failed(source) {
                         let source = source.clone();
                         let caret = if forward { 0 } else { source.len() };
                         self.open_source(Cursor {pos:p,..self.cursor.clone()}, source, caret); return;
@@ -560,7 +647,9 @@ impl Editor {
                 self.cursor.slices.last_mut().unwrap().cell = target;
                 let candidates: Vec<_> = self.geometry.iter().filter(|s| s.cursor.slices == self.cursor.slices).collect();
                 self.cursor.pos = if end { self.data().len() } else if let (Some(x), Some(best)) = (x, candidates.iter().min_by(|a,b| (a.x-x.unwrap_or(0.0)).abs().total_cmp(&(b.x-x.unwrap_or(0.0)).abs()))) {
-                    let _ = x; best.cursor.pos
+                    // The stop's own position is a measurement hint; clamp it to
+                    // the cell it was measured in.
+                    let _ = x; best.cursor.pos.min(self.data().len())
                 } else { original.pos.min(self.data().len()) };
                 break;
             }

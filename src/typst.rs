@@ -3,10 +3,22 @@
 // Structural editing and draft keystrokes do not reparse the formula.
 use crate::math::*;
 use typst_syntax::{Source, SyntaxKind, SyntaxNode, ast::{self, AstNode}};
-use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}};
 
 pub const PROJECTION_LIMIT: usize = 4096;
 const SIZE_CAP: usize = PROJECTION_LIMIT + 1;
+// Definition-prefix text kept in the registry cache. A document with F formulas
+// asks for F distinct prefixes, so the budget has to cover a whole document for
+// the second pass over it (font change, split, LSP reclassification, reopening a
+// file) to be cheap; entries also hold their own context strings, so the real
+// footprint is a small multiple of this.
+const CACHE_TEXT_LIMIT: usize = 8 * 1024 * 1024;
+const CACHE_ENTRY_LIMIT: usize = 4096;
+// Consecutive misses after which the cache stops inserting. A document whose
+// definition prefixes do not fit is analysed in full every pass either way; not
+// inserting keeps that pass at the cost of the analysis alone, instead of paying
+// for an entry that is evicted before it is ever used again.
+const CACHE_SATURATION_MISSES: u32 = 64;
 #[derive(Clone, Default)]
 struct TemplateSize {
     fixed: usize,
@@ -22,9 +34,9 @@ pub struct MacroDefinition {
     pub shadowed: bool,
     pub reason: String,
     #[serde(skip)]
-    pub template: Rc<MathData>,
+    pub template: Arc<MathData>,
     #[serde(skip)]
-    pub context: Rc<String>,
+    pub context: Arc<String>,
     #[serde(skip)]
     pub function: bool,
     #[serde(skip)]
@@ -62,26 +74,80 @@ impl MacroRegistry {
         self.entries.push(definition);
     }
 }
-thread_local! {
-    // Retain one definition set. Prefix templates are reused on source edits;
-    // removed suffixes are freed once no caller holds the previous registry.
-    static MACROS: RefCell<Option<(String, Rc<MacroRegistry>)>> = const { RefCell::new(None) };
-    static FAILED_WARMUPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
-    static EMPTY_MACROS: Rc<MacroRegistry> = Rc::new(MacroRegistry::default());
+// Registries are keyed by the definition prefix they were analyzed from and are
+// shared process-wide. The HTTP and stdio servers answer each request on its own
+// thread, so a thread-local cache is empty for every request; the desktop is
+// single-threaded and keeps reusing the entries it already built.
+static MACROS: Mutex<MacroCache> = Mutex::new(MacroCache::new());
+static FAILED_WARMUPS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static EMPTY_MACROS: OnceLock<Arc<MacroRegistry>> = OnceLock::new();
+fn empty_macros() -> Arc<MacroRegistry> { EMPTY_MACROS.get_or_init(|| Arc::new(MacroRegistry::default())).clone() }
+struct MacroCache { entries: Vec<CacheEntry>, text: usize, misses: u32, saturated: bool }
+// Lookups compare a hash and a length instead of whole prefixes: a document of
+// N formulas asks for N prefixes of growing size, and comparing each of them
+// against every cached entry costs more than the analysis it saves.
+struct CacheEntry { key: String, hash: u64, len: usize, registry: Arc<MacroRegistry> }
+fn key_hash(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() { hash ^= *byte as u64; hash = hash.wrapping_mul(0x100_0000_01b3); }
+    hash
+}
+impl MacroCache {
+    const fn new() -> Self { Self { entries: Vec::new(), text: 0, misses: 0, saturated: false } }
+    fn clear(&mut self) { self.entries.clear(); self.text = 0; self.misses = 0; self.saturated = false; }
+    // Only a matching hash and length is verified as a whole string, so a
+    // collision cannot return a registry for different definitions.
+    fn find(&self, definitions: &str, hash: u64) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.hash == hash && entry.len == definitions.len() && entry.key == definitions)
+    }
+    fn retain(&mut self, definitions: &str, hash: u64, registry: &Arc<MacroRegistry>) {
+        // Either the working set fits and every entry is kept, or it does not and
+        // the cache stops for good. A hit must not clear that verdict: a document
+        // whose prefixes do not fit still hits the few entries near the end of the
+        // previous pass, and resuming insertion there only makes the pass slower.
+        if self.text + definitions.len() > CACHE_TEXT_LIMIT || self.entries.len() >= CACHE_ENTRY_LIMIT {
+            self.misses = self.misses.saturating_add(1);
+            if self.misses >= CACHE_SATURATION_MISSES {
+                // Holding entries that will never be reused only adds allocation
+                // pressure to the analysis, which then runs slower than without a
+                // cache at all, so drop them.
+                self.entries.clear();
+                self.text = 0;
+                self.saturated = true;
+            }
+            if self.saturated { return; }
+        }
+        self.entries.push(CacheEntry { key: definitions.to_string(), hash, len: definitions.len(), registry: registry.clone() });
+        self.text += definitions.len();
+        while self.entries.len() > 1 && (self.text > CACHE_TEXT_LIMIT || self.entries.len() > CACHE_ENTRY_LIMIT) {
+            self.text = self.text.saturating_sub(self.entries.remove(0).len);
+        }
+    }
+}
+// A poisoned lock still holds usable data: the caches are plain maps of derived
+// values, so recover instead of propagating a panic from an unrelated thread.
+fn poison_free<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { lock.lock().unwrap_or_else(|error| error.into_inner()) }
+fn warmup_failed(key: &str) -> bool {
+    // Takes the warmup lock on its own: analyze_macros runs while the registry
+    // lock is held, and no path may hold both in the opposite order.
+    poison_free(&FAILED_WARMUPS).as_ref().is_some_and(|failed| failed.contains(key))
 }
 pub fn warmup_key(def: &MacroDefinition) -> String { format!("{}{}", def.context, def.input) }
 pub fn warmup_within_limit(def: &MacroDefinition) -> bool {
     def.size.depth <= 64 && def.size.params.iter().fold(def.size.fixed, |n,w| capped_add(n,*w)) <= PROJECTION_LIMIT
 }
 pub fn set_warmup_results(results: &[(String, bool)]) {
-    FAILED_WARMUPS.with(|failed| { let mut failed = failed.borrow_mut();
+    {
+        let mut failed = poison_free(&FAILED_WARMUPS);
+        let failed = failed.get_or_insert_with(HashSet::new);
         for (key, error) in results { if *error { failed.insert(key.clone()); } else { failed.remove(key); } }
-    });
-    MACROS.with(|cache| *cache.borrow_mut() = None);
+    }
+    // Classified definitions changed, so every cached registry is stale.
+    poison_free(&MACROS).clear();
 }
 pub fn clear_warmup_results() {
-    FAILED_WARMUPS.with(|failed| failed.borrow_mut().clear());
-    MACROS.with(|cache| *cache.borrow_mut() = None);
+    *poison_free(&FAILED_WARMUPS) = None;
+    poison_free(&MACROS).clear();
 }
 
 // A prefix ends at the formula being edited. Traverse only its open lexical
@@ -111,21 +177,30 @@ fn scope_bindings<'a>(node: &'a SyntaxNode, offset: usize, out: &mut Vec<ScopeBi
     let mut at = offset;
     for child in node.children() { scope_bindings(child, at, out); at += child.len(); }
 }
-pub fn macro_registry(definitions: &str) -> Rc<MacroRegistry> {
+pub fn macro_registry(definitions: &str) -> Arc<MacroRegistry> {
     // The desktop passes the full lexical prefix. Most documents and most
     // early formulas contain no bindings at all; avoid parsing that markup a
     // second time merely to construct an empty registry.
-    if !definitions.contains("let") { return EMPTY_MACROS.with(Rc::clone); }
-    MACROS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some((key, registry)) = cache.as_ref() {
-            if key == definitions { return registry.clone(); }
-        }
-        let previous = cache.as_ref().map(|(_, registry)| registry.as_ref());
-        let registry = Rc::new(analyze_macros(definitions, previous));
-        *cache = Some((definitions.to_string(), registry.clone()));
-        registry
-    })
+    if !definitions.contains("let") { return empty_macros(); }
+    let hash = key_hash(definitions);
+    let mut cache = poison_free(&MACROS);
+    if let Some(index) = cache.find(definitions, hash) {
+        let entry = cache.entries.swap_remove(index);
+        let registry = entry.registry.clone();
+        cache.entries.push(entry);
+        cache.misses = 0;
+        return registry;
+    }
+    // Reuse the most recently analyzed prefix: a definition analyzed from a
+    // prefix stays valid for every extension of it, and its templates are shared
+    // instead of rebuilt. Documents ask for prefixes in growing order, so the most
+    // recent entry is the longest usable prefix; when an edit lands inside the
+    // definitions themselves it is simply a candidate whose earlier definitions
+    // analyze_macros still reuses, one definition at a time.
+    let previous = cache.entries.last().map(|entry| entry.registry.clone());
+    let registry = Arc::new(analyze_macros(definitions, previous.as_deref()));
+    cache.retain(definitions, hash, &registry);
+    registry
 }
 struct ParseContext<'a> {
     params: &'a [String],
@@ -208,6 +283,18 @@ pub fn validate_definitions(text: &str) -> Result<(), String> {
     }
     Ok(())
 }
+// Clone a definition for reuse without copying its source text: the reused
+// definition carries only its own text, and `old.source` holds the whole trailing
+// prefix, which on a large document is far bigger than every other field.
+fn reused_definition(old: &MacroDefinition, input: &str) -> MacroDefinition {
+    MacroDefinition {
+        source: input.to_string(), input: input.to_string(),
+        name: old.name.clone(), names: old.names.clone(), params: old.params.clone(),
+        expandable: old.expandable, shadowed: false, reason: old.reason.clone(),
+        template: old.template.clone(), context: old.context.clone(), function: old.function,
+        definition_start: old.definition_start, size: old.size.clone(),
+    }
+}
 fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry {
     let source = Source::detached(text.to_string());
     let mut registry = MacroRegistry::default();
@@ -227,10 +314,7 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
         start = offset;
         if reuse_prefix {
             if let Some(old) = previous.and_then(|r| r.entries.get(registry.entries.len())).filter(|d| d.input == input) {
-                let mut def = old.clone();
-                def.source = input.to_string(); // exclude the old trailing trivia
-                def.shadowed = false;
-                registry.register(def);
+                registry.register(reused_definition(old, input));
                 continue;
             }
             reuse_prefix = false;
@@ -238,7 +322,7 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
         let names: Vec<String> = binding.kind().bindings().iter().map(|n| n.as_str().to_string()).collect();
         let mut def = MacroDefinition { source: input.to_string(), input: input.to_string(), name: names.join(", "), names,
             params: vec![], expandable: false, shadowed: false, reason: "仅支持直接返回数学公式的位置参数函数或公式常量".into(),
-            template: Rc::new(vec![]), context: Rc::new(text[..context_end].to_string()), function: false, definition_start: at, size: TemplateSize::default() };
+            template: Arc::new(vec![]), context: Arc::new(text[..context_end].to_string()), function: false, definition_start: at, size: TemplateSize::default() };
         let mut body = binding.init();
         let mut supported = def.names.len() == 1;
         let mut locals = HashSet::new();
@@ -278,11 +362,11 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
             } else if used.contains(&false) {
                 def.reason = "存在未显示的参数，无法提供全部参数输入框".into();
             } else {
-                def.expandable = !FAILED_WARMUPS.with(|failed| failed.borrow().contains(&warmup_key(&def)));
+                def.expandable = !warmup_failed(&warmup_key(&def));
                 def.reason = "所有参数均可在结构槽位中编辑".into();
                 if !def.expandable { def.reason = "空字符串实例预热失败，按普通调用渲染".into(); }
                 def.size = template_size(&template, &registry, def.params.len());
-                def.template = Rc::new(template);
+                def.template = Arc::new(template);
             }
         }
         registry.register(def);

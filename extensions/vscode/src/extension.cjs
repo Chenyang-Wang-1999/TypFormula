@@ -4,6 +4,7 @@ const path=require('node:path');
 const crypto=require('node:crypto');
 const {Backend}=require('./backend.cjs');
 const {snapshot,applyDocumentEdit}=require('./document.cjs');
+const {EditHistory}=require('./history.cjs');
 const commands=require('../commands.json');
 const VIEW='visualTypst.editor';
 const pos=p=>({line:p.line,character:p.character});
@@ -12,7 +13,7 @@ const textEdit=e=>({range:range(e.range),newText:e.newText});
 function escapeHtml(value){return value.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
 class Provider {
-  constructor(context){this.context=context;this.sessions=new Set();this.backends=new Map();this.edits=new Map();this.applying=new Map();this.log=vscode.window.createOutputChannel('Visual Typst');context.subscriptions.push(this.log);}
+  constructor(context){this.context=context;this.sessions=new Set();this.backends=new Map();this.edits=new Map();this.applying=new Map();this.histories=new Map();this.log=vscode.window.createOutputChannel('Visual Typst');context.subscriptions.push(this.log);}
   async backend(root){
     if(!vscode.workspace.isTrusted)throw new Error('请信任此工作区后使用本地 Typst 编译和包安装。');
     if(!this.backends.has(root)){
@@ -37,6 +38,7 @@ class Provider {
     disposables.push(panel.onDidChangeViewState(()=>{if(panel.active)this.active=session;}));
     disposables.push(vscode.workspace.onDidChangeTextDocument(event=>{
       if(event.document.uri.toString()!==document.uri.toString()||!event.contentChanges.length)return;
+      this.history(session).record(document.getText());
       if(this.applying.get(document.uri.toString())!==session)panel.webview.postMessage({type:'document',...snapshot(document)});
     }));
     disposables.push(vscode.workspace.onDidSaveTextDocument(doc=>{if(doc===document)panel.webview.postMessage({type:'saved',...snapshot(doc)});}));
@@ -50,6 +52,7 @@ class Provider {
     panel.webview.html=html;
   }
   settings(document){const editor=vscode.workspace.getConfiguration('editor',document.uri),config=vscode.workspace.getConfiguration('visualTypst',document.uri);return {fontSize:editor.get('fontSize',16),fontFamily:editor.get('fontFamily','Consolas, monospace'),previewOnOpen:config.get('previewOnOpen',true)};}
+  history(session){const key=session.document.uri.toString();if(!this.histories.has(key))this.histories.set(key,new EditHistory(session.document.getText()));return this.histories.get(key);}
   filePath(session){if(!session.root)throw new Error('预览需要打开一个工作区或先保存文件。');const relative=session.document.uri.scheme==='untitled'?'untitled.typ':path.relative(session.root,session.document.uri.fsPath).split(path.sep).join('/');if(relative.startsWith('../')||path.isAbsolute(relative))throw new Error('文件不在工作区内');return relative;}
   async message(session,message){
     if(message?.type==='focus'){this.active=session;return;}
@@ -102,9 +105,19 @@ class Provider {
     const diagnostics=vscode.languages.getDiagnostics(doc.uri).map(d=>({range:range(d.range),severity:d.severity+1,message:d.message}));
     return {result,diagnostics,uri:doc.uri.toString(),version:doc.version};
   }
+  // The workbench undo command targets the focused code editor, not this
+  // custom editor's TextDocument, so the host replays its own document history.
+  async editHistory(session,direction){
+    const history=this.history(session),target=history.peek(direction);
+    if(target===null)return {changed:false,canUndo:history.canUndo,canRedo:history.canRedo};
+    const document=session.document;
+    const applied=await applyDocumentEdit(vscode,document,{version:document.version,base:document.getText(),source:target});
+    if(applied.accepted)history.commit(direction);
+    return {changed:applied.accepted,canUndo:history.canUndo,canRedo:history.canRedo};
+  }
   async hostCommand(session,command){
     if(command==='configureShortcuts'){await vscode.commands.executeCommand('workbench.action.openGlobalKeybindings','@ext:visual-typst-local.visual-typst');return {};}
-    if(command==='undo'||command==='redo'){await vscode.commands.executeCommand(command);return {};}
+    if(command==='undo'||command==='redo')return this.editHistory(session,command);
     throw new Error('未知宿主命令');
   }
   dispose(){for(const backend of this.backends.values())backend.dispose();this.backends.clear();}
@@ -114,7 +127,8 @@ function activate(context){
   context.subscriptions.push(vscode.window.registerCustomEditorProvider(VIEW,provider,{webviewOptions:{retainContextWhenHidden:true},supportsMultipleEditorsPerDocument:true}));
   for(const action of commands)context.subscriptions.push(vscode.commands.registerCommand('visualTypst.'+action.command,()=>{
     const session=provider.active;if(!session)return;
-    // Undo/redo in a custom editor use VS Code's TextDocument history.
+    // Undo and redo post to the webview like any other toolbar command; the
+    // webview asks the host, and the host replays this document's history.
     session.panel.webview.postMessage({type:'command',id:action.id});
   }));
   context.subscriptions.push(vscode.commands.registerCommand('visualTypst.open',async(uri)=>{uri=uri||vscode.window.activeTextEditor?.document.uri;if(uri)await vscode.commands.executeCommand('vscode.openWith',uri,VIEW);}));

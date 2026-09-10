@@ -5,7 +5,7 @@ use visual_typst_core::{Action, Editor, services::{Services, CompletionRequest, 
 fn render(service: &Services, expression: &str, definitions: &str) -> Result<serde_json::Value,String> {
     let prefix=format!("{definitions}\n$ ");
     let start=prefix.len();
-    let result=service.render(RenderRequest {preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),source:format!("{prefix}{expression} $"),raw:vec![RawRange{id:"raw".into(),start,end:start+expression.len()}],formulas:vec![],preview_hashes:vec![]})?;
+    let result=service.render(RenderRequest {preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),source:format!("{prefix}{expression} $"),raw:vec![RawRange{id:"raw".into(),start,end:start+expression.len()}],formulas:vec![],preview_hashes:vec![],context_end:None})?;
     Ok(result["items"][0].clone())
 }
 
@@ -54,6 +54,29 @@ fn macro_calls_and_scoped_raw_compile_with_native_typst() {
         let result = render(&service, expression, definitions).unwrap();
         assert!(result["svg"].as_str().unwrap().contains("<svg"));
     }
+}
+
+// The image request compiles only as far as the fragments reach, so a mistake in
+// the rest of the document no longer leaves every fragment without an image.
+#[test]
+#[ignore = "requires a locally installed Tinymist executable"]
+fn a_fragment_context_renders_past_a_later_document_error() {
+    let service = Services::new(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let source = "#set text(size: 11pt)\n\n正文 $ sum_(n=1)^oo x^n $。\n\n#panic(\"坏了\")\n";
+    // One fragment, exactly as the editor reports it, and the end of its formula.
+    let start = source.find("sum").unwrap();
+    let end = start + "sum".len();
+    let context_end = source.find("^n $").unwrap() + 4;
+    let raw = || vec![RawRange { id: format!("{start}:{end}"), start, end }];
+    let request = |context_end: Option<usize>| RenderRequest {
+        preview: false, pdf: false, overlays: Default::default(), path: "main.typ".into(),
+        source: source.into(), raw: raw(), formulas: vec![], preview_hashes: vec![], context_end,
+    };
+    let whole = service.render(request(None));
+    assert!(whole.is_err(),"the whole document must fail: {whole:?}");
+    let cut = service.render(request(Some(context_end))).unwrap_or_else(|error| panic!("cut request failed: {error}"));
+    assert_eq!(cut["items"].as_array().unwrap().len(), 1);
+    assert!(cut["items"][0]["svg"].as_str().unwrap().contains("<svg"));
 }
 
 

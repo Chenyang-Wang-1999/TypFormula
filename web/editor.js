@@ -18,6 +18,10 @@ import {initMath,syncSource,enterMath,leaveMath,focusMath,enterMathFromArrow,mat
 import {byteOffset,charOffset,position,offset,edits,insertion} from './source.js';
 
 const $=s=>document.querySelector(s), host=$('#formula-host');
+// Every binding below belongs to the shell that serves this script. A stale
+// copy of the shell must degrade to one inert button, never to a module that
+// throws while it is being evaluated.
+const on=(id,handler,event='click')=>{const el=document.getElementById(id);if(el)el['on'+event]=handler;return el;};
 const formulaChange=Annotation.define(), projection=StateEffect.define();
 let documentSync,preview,shortcutManager,formulaViewport,typography,externalFile=null,hostDirty=false,applyingRemote=false,hostListener;
 let view, snapshot, active=null, visual=true, path='main.typ', diskBase=null, diagnosticsTimer, generation=0;
@@ -207,7 +211,7 @@ try{
   if(inVSCode){doc=await request('/api/document');initial=doc.source;path=doc.path;hostDirty=doc.dirty;applySettings(doc.settings);}
   view=new EditorView({state:createState(initial),parent:$('#editor')});snapshot=syncSource(initial);formulaViewport=installFormulaViewport(view,measureMath);
   if(inVSCode){
-    documentSync=new DocumentSync(doc,body=>request('/api/edit',body),{replace:replaceFromHost,dirty:dirty=>{hostDirty=dirty;updateTitle();},conflict:conflict=>{$('#sync-conflict').hidden=!conflict;$('#conflict-message').textContent=conflict?.message||'';}});
+    documentSync=new DocumentSync(doc,body=>request('/api/edit',body),{replace:replaceFromHost,dirty:dirty=>{hostDirty=dirty;updateTitle();},conflict:conflict=>{$('#sync-conflict').hidden=!conflict;$('#conflict-message').textContent=conflict?.message||'';},failed:error=>report(error)});
     hostListener=onHostMessage(msg=>{
       if(msg.type==='document')documentSync.remote(msg);
       if(msg.type==='command')executeAction(msg.id);
@@ -224,41 +228,42 @@ try{
   updateTitle();$('#status').textContent='就绪 · Ctrl+S 保存 · Ctrl+Space 补全 · F12 跳转';scheduleDiagnostics();
 }catch(e){report(e);}
 for(const [id,display] of [['insert-inline',false],['insert-display',true]]){
-  $('#'+id).onpointerdown=e=>e.preventDefault();$('#'+id).onclick=()=>{try{if(!finish())return;const selection=view.state.selection.main,change=insertion(source(),selection.from,selection.to,display);view.dispatch({changes:change,annotations:isolateHistory.of('full'),selection:{anchor:change.start}});activate(byteOffset(source(),change.start));}catch(e){report(e);}};
+  on(id,e=>e.preventDefault(),'pointerdown');on(id,()=>{try{if(!finish())return;const selection=view.state.selection.main,change=insertion(source(),selection.from,selection.to,display);view.dispatch({changes:change,annotations:isolateHistory.of('full'),selection:{anchor:change.start}});activate(byteOffset(source(),change.start));}catch(e){report(e);}});
 }
-$('#edit-formula').onpointerdown=e=>e.preventDefault();$('#edit-formula').onclick=()=>{const head=byteOffset(source(),view.state.selection.main.head),eq=snapshot.equations.find(e=>e.start<=head&&head<=e.end);if(eq)activate(eq.start);else report('请将光标放在 $…$ 公式中');};
-$('#source-mode').onclick=()=>{if(!finish(false))return;visual=!visual;project();$('#source-mode').textContent=visual?'查看纯源码':'显示公式';view.focus();};
-$('#finish-formula').onclick=()=>finish();$('#undo').onclick=()=>history('undo');$('#redo').onclick=()=>history('redo');
-$('#row').onclick=()=>mathAction({action:'add_row'});$('#column').onclick=()=>mathAction({action:'add_column'});
-$('#refresh-svg').onclick=()=>{passive.clear();refreshAllSvg();project();};$('#save').onclick=()=>save().catch(report);
-$('#format').onclick=async()=>{try{if(!finish(false))return;const result=await language('formatting');view.dispatch({changes:edits(source(),result.result||[]),userEvent:'input.format',annotations:isolateHistory.of('full')});}catch(e){report(e);}};
-$('#new-file').onclick=()=>inVSCode?request('/api/new').catch(report):$('#new-dialog').showModal();
-$('#open-file').onclick=$('#open-file-top').onclick=()=>openFromPicker().catch(error=>{if(error?.name!=='AbortError')report(error);});
-$('#new-form').onsubmit=e=>{e.preventDefault();const name=$('#new-name').value.trim();if(!name||buffers.has(name)){report('文件名为空或已打开');return;}if(!finish(false))return;buffers.set(path,{state:view.state,base:diskBase});path=name;diskBase=null;view.setState(createState(''));snapshot=syncSource('');project();updateTitle();preview?.schedule(0);$('#new-dialog').close();view.focus();};
-$('#download').onclick=()=>saveAs().catch(error=>{if(error?.name!=='AbortError')report(error);});
+on('edit-formula',e=>e.preventDefault(),'pointerdown');on('edit-formula',()=>{const head=byteOffset(source(),view.state.selection.main.head),eq=snapshot.equations.find(e=>e.start<=head&&head<=e.end);if(eq)activate(eq.start);else report('请将光标放在 $…$ 公式中');});
+on('source-mode',()=>{if(!finish(false))return;visual=!visual;project();$('#source-mode').textContent=visual?'查看纯源码':'显示公式';view.focus();});
+on('finish-formula',()=>finish());on('undo',()=>history('undo'));on('redo',()=>history('redo'));
+on('row',()=>mathAction({action:'add_row'}));on('column',()=>mathAction({action:'add_column'}));
+on('refresh-svg',()=>{passive.clear();refreshAllSvg();project();});on('save',()=>save().catch(report));
+on('format',async()=>{try{if(!finish(false))return;const result=await language('formatting');view.dispatch({changes:edits(source(),result.result||[]),userEvent:'input.format',annotations:isolateHistory.of('full')});}catch(e){report(e);}});
+on('new-file',()=>inVSCode?request('/api/new').catch(report):$('#new-dialog').showModal());
+on('open-file',()=>openFromPicker().catch(error=>{if(error?.name!=='AbortError')report(error);}));
+on('open-file-top',()=>openFromPicker().catch(error=>{if(error?.name!=='AbortError')report(error);}));
+on('new-form',e=>{e.preventDefault();const name=$('#new-name').value.trim();if(!name||buffers.has(name)){report('文件名为空或已打开');return;}if(!finish(false))return;buffers.set(path,{state:view.state,base:diskBase});path=name;diskBase=null;view.setState(createState(''));snapshot=syncSource('');project();updateTitle();preview?.schedule(0);$('#new-dialog').close();view.focus();},'submit');
+on('download',()=>saveAs().catch(error=>{if(error?.name!=='AbortError')report(error);}));
 let packageItems=[];
-$('#packages-form').onsubmit=async e=>{e.preventDefault();$('#package-status').textContent='正在读取官方包索引…';try{
+on('packages-form',async e=>{e.preventDefault();$('#package-status').textContent='正在读取官方包索引…';try{
   const result=await api('/api/packages',{action:'search',query:$('#package-query').value});packageItems=result.items;
   $('#package-status').textContent=`${result.items.length} 个版本 · 选择后安装并插入 import`;
   $('#package-select').replaceChildren(...result.items.map((p,i)=>{const option=document.createElement('option');option.value=i;option.textContent=`${p.name} ${p.version}${p.installed?' · 已安装':''}`;return option;}));
   $('#install-package').disabled=!result.items.length;
-}catch(e){$('#package-status').textContent=e.message;}};
-$('#install-package').onclick=async()=>{const p=packageItems[Number($('#package-select').value)];if(!p){report('请先搜索并选择一个包');return;}$('#install-package').disabled=true;try{
+}catch(e){$('#package-status').textContent=e.message;}},'submit');
+on('install-package',async()=>{const p=packageItems[Number($('#package-select').value)];if(!p){report('请先搜索并选择一个包');return;}$('#install-package').disabled=true;try{
   const installed=await api('/api/packages',{action:'install',spec:`@preview/${p.name}:${p.version}`});
   if(finish(false)){view.dispatch({changes:{from:0,insert:installed.import},userEvent:'input.package',annotations:isolateHistory.of('full')});view.focus();}
   $('#package-status').textContent='已安装 '+installed.spec;
-}catch(e){$('#package-status').textContent=e.message;}finally{$('#install-package').disabled=false;}};
-$('#toggle-preview').onclick=()=>preview.toggle();$('#refresh-preview').onclick=()=>preview.schedule(0);
-$('#zoom-in').onclick=()=>preview.scale(.1);$('#zoom-out').onclick=()=>preview.scale(-.1);$('#zoom-reset').onclick=()=>preview.scale(null);
-$('#toggle-packages').onclick=()=>document.body.classList.toggle('packages-open');
-$('#definition').onclick=()=>definition();
-$('#accept-remote').onclick=()=>documentSync?.resolve(false).catch(report);$('#keep-local').onclick=()=>documentSync?.resolve(true).catch(report);
+}catch(e){$('#package-status').textContent=e.message;}finally{$('#install-package').disabled=false;}});
+on('toggle-preview',()=>preview.toggle());on('refresh-preview',()=>preview.schedule(0));
+on('zoom-in',()=>preview.scale(.1));on('zoom-out',()=>preview.scale(-.1));on('zoom-reset',()=>preview.scale(null));
+on('toggle-packages',()=>document.body.classList.toggle('packages-open'));
+on('definition',()=>definition());
+on('accept-remote',()=>documentSync?.resolve(false).catch(report));on('keep-local',()=>documentSync?.resolve(true).catch(report));
 function executeAction(id){const button=document.getElementById(id);if(!button||button.disabled)return;if(id==='search-packages'){$('#packages-form').requestSubmit();return;}button.click();}
 shortcutManager=installShortcuts({execute:executeAction,inVSCode,configure:()=>request('/api/host-command',{command:'configureShortcuts'}).catch(report)});
-$('#shortcuts').onclick=()=>shortcutManager.configure();
-$('#editor-font-smaller').onclick=()=>typography.zoom(-1).catch(report);$('#editor-font-larger').onclick=()=>typography.zoom(1).catch(report);$('#editor-font-reset').onclick=()=>typography.reset().catch(report);
-$('#svg-scale-apply').onclick=()=>typography.set({svgScale:Number($('#svg-scale-value').value)}).catch(report);
-$('#svg-scale-reset').onclick=()=>typography.set({svgScale:1}).catch(report);
+on('shortcuts',()=>shortcutManager.configure());
+on('editor-font-smaller',()=>typography.zoom(-1).catch(report));on('editor-font-larger',()=>typography.zoom(1).catch(report));on('editor-font-reset',()=>typography.reset().catch(report));
+on('svg-scale-apply',()=>typography.set({svgScale:Number($('#svg-scale-value').value)}).catch(report));
+on('svg-scale-reset',()=>typography.set({svgScale:1}).catch(report));
 view?.scrollDOM.addEventListener('wheel',event=>{if(!event.ctrlKey)return;event.preventDefault();typography.zoom(event.deltaY<0?1:-1).catch(report);},{passive:false,capture:true});
 window.addEventListener('beforeunload',event=>{if(!inVSCode&&(source()!==diskBase||[...buffers.entries()].some(([name,b])=>name!==path&&b.state.doc.toString()!==b.base))){event.preventDefault();event.returnValue='';}});
 export {view as editorView};

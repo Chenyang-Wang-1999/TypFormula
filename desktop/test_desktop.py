@@ -427,6 +427,222 @@ class NativeTest(unittest.TestCase):
         self.assertNotIn('analyze',calls)
         self.assertLessEqual(calls.count('analyze_formula'),5)
 
+    def test_formula_box_is_lain_out_once_per_layout_paint_cycle(self):
+        self.load('$frac(a, b) + x$');window=self.window
+        formula=window.analysis['formulas'][0];handler=window.editor.handler
+        first=handler.box(formula)
+        self.assertIs(handler.box(formula),first,'paint and click must reuse the layout result')
+        window.typesetter.touch()
+        second=handler.box(formula)
+        self.assertIsNot(second,first,'new Raw output must lay the formula out again')
+        self.assertEqual((second.width,second.height),(first.width,first.height))
+        before=handler.box(formula)
+        window.change_font(1);window.compile_timer.stop()
+        self.assertIsNot(handler.box(formula),before,'an editor font change must relayout')
+
+    def test_font_metrics_are_shared_per_size(self):
+        typesetter=Typesetter({'font_size':16,'svg_scale':1,'font_family':'Consolas'})
+        font,metrics,em,ascent,descent=typesetter.line(1.0)
+        self.assertIs(typesetter.line(1.0)[0],font)
+        self.assertIs(typesetter.line(1.0)[1],metrics)
+        self.assertEqual(em,metrics.height())
+        self.assertEqual(ascent,metrics.ascent())
+        self.assertGreater(em,0)
+        self.assertIsNot(typesetter.line(.7)[1],metrics)
+
+    def test_formula_glyphs_come_from_an_installed_math_font(self):
+        from . import mathfont
+        mathfont.install()
+        typesetter=Typesetter({'font_size':12,'svg_scale':1,'font_family':'Consolas','math_font':'NewComputerModern Math'})
+        self.assertEqual(typesetter.family(),'NewComputerModern Math')
+        self.assertIn(typesetter.family(),mathfont.families())
+        # A variable is the math italic letter of the range Typst typesets with.
+        for letter,italic in (('a','𝑎'),('h','ℎ'),('Z','𝑍')):
+            glyph,font,width=typesetter.run(letter,1.0)
+            self.assertEqual(glyph,italic)
+            self.assertEqual(font.family(),'NewComputerModern Math')
+            self.assertGreater(width,0)
+        # Text cells and symbols stay as written.
+        self.assertEqual(typesetter.run('a',1.0,text_mode=True)[0],'a')
+        self.assertEqual(typesetter.run('≤',1.0)[0],'≤')
+
+    def test_an_uninstalled_math_font_is_never_handed_to_qt(self):
+        """A missing family is substituted in silence; that must not reach layout."""
+        from . import mathfont
+        typesetter=Typesetter({'font_size':12,'svg_scale':1,'font_family':'Consolas','math_font':'No Such Math Font'})
+        self.assertIn(typesetter.family(),mathfont.families())
+        # The line box is taken from the editor text font, never from the math font:
+        # a math font reports TeX line metrics (an ascent of several em on Windows)
+        # because it has to contain four-line delimiters.
+        line_font,metrics,em,ascent,descent=typesetter.line(1.0)
+        self.assertEqual(line_font.family(),'Consolas')
+        self.assertEqual((em,ascent),(metrics.height(),metrics.ascent()))
+        self.assertLess(ascent,em)
+        self.assertIsNot(metrics,typesetter.font(typesetter.family(),1.0)[1])
+
+    def test_incremental_merge_shares_untouched_views_and_keeps_the_old_analysis(self):
+        from .incremental import merge
+        def formula(start,text):
+            return {'start':start,'end':start+3,'editable':True,
+                'view':{'kind':'cell','children':[{'kind':'raw','text':text,'render_id':f'{start}:{start+3}:0:0','warmup_range':[start,start+3]}]},
+                'render':{'source':'old','raw':[{'id':f'{start}:{start+3}:0','start':start,'end':start+3}]}}
+        previous={'formulas':[formula(0,'a'),formula(10,'b')],'styles':[]}
+        syntax={'formulas':[{'start':0,'end':3,'editable':True},{'start':12,'end':15,'editable':True}],'styles':[]}
+        merged,rebuild=merge(previous,syntax,'new',5,5,'zz',{'start':5,'end':5})
+        self.assertEqual(rebuild,[])
+        first,second=merged['formulas']
+        # A formula before the edit cannot move, so its whole view subtree is shared.
+        self.assertIs(first['view'],previous['formulas'][0]['view'])
+        self.assertEqual(first['render']['source'],'new')
+        self.assertEqual(previous['formulas'][0]['render']['source'],'old')
+        # A formula after the edit gets new nodes; the previous analysis keeps its own.
+        self.assertIsNot(second['view'],previous['formulas'][1]['view'])
+        self.assertEqual((second['start'],second['end']),(12,15))
+        self.assertEqual(second['view']['children'][0]['render_id'],'12:15:0:0')
+        self.assertEqual(second['view']['children'][0]['warmup_range'],[12,15])
+        self.assertEqual(second['render']['raw'][0]['id'],'12:15:0')
+        old=previous['formulas'][1]
+        self.assertEqual((old['start'],old['end']),(10,13))
+        self.assertEqual(old['view']['children'][0]['render_id'],'10:13:0:0')
+        self.assertEqual(old['view']['children'][0]['warmup_range'],[10,13])
+        self.assertEqual(old['render']['raw'][0]['id'],'10:13:0')
+
+    def test_the_math_font_covers_every_glyph_the_core_can_draw(self):
+        """A missing glyph is drawn from another font, so coverage is a test."""
+        from PyQt5.QtGui import QFont,QRawFont
+        from . import mathfont
+        family=mathfont.resolve('','Consolas')
+        font=QFont(family);font.setStyleStrategy(QFont.NoFontMerging)
+        raw=QRawFont.fromFont(font)
+        # Letters as the math alphabet, operators and Greek as the symbol table
+        # writes them, the box glyphs the display tree adds, and the digits the
+        # editor puts in text cells.
+        # U+1D455 is unassigned; glyph() maps h to ℎ, which is required below.
+        needed=[chr(0x1D44E+i) for i in range(26) if i!=7]+[chr(0x1D434+i) for i in range(26)]
+        needed+=list('0123456789+-=()[]{}|/,.:;!?<>^_')+['ℎ','−','∗','≤','≥','≠','±','∓','×','⋅','÷','𝛼','𝛽','𝛾','𝛿','𝜀','𝜃','𝜆','𝜇','𝜋','𝜌','𝜎','𝜏','𝜑','𝜓','𝜔','Γ','Δ','Θ','Σ','Ω','□','│','⌘','·','‖']
+        missing=[ch for ch in needed if raw.glyphIndexesForString(ch)[0]==0]
+        self.assertEqual(missing,[],f'{family} cannot draw {missing}')
+
+    def test_a_failed_fragment_is_reported_and_entered_with_a_horizontal_key(self):
+        """A Raw without an image has nothing to click, so a key has to open it."""
+        window=self.window
+        self.load('$ undefinedfunc(α) $');window.activate(0);window.compile_timer.stop()
+        text=next(node['text'] for node in window.view_nodes(window.math_state['view']) if node['kind']=='raw')
+        self.assertEqual(text,'undefinedfunc(α)')
+        # What load_raw records when the render pass returns nothing for a fragment.
+        window.typesetter.cache[('raw',text)]=False
+        window.report_raw_fragments(force=True)
+        window.math_action('key',key='ArrowRight')
+        state=window.math_state
+        self.assertTrue(state['pending'],'the caret must be inside the fragment draft')
+        self.assertEqual(state['view']['children'][1]['kind'],'unknown')
+        # Escape restores the fragment and closes the draft.
+        window.math_action('key',key='Escape')
+        self.assertFalse(window.math_state['pending'])
+        self.assertEqual(window.source,'$ undefinedfunc(α) $')
+
+    def test_a_fragment_without_a_source_range_is_marked_as_failed(self):
+        window=self.window
+        self.load('$ sum_(n=0)^oo a_n $')
+        nodes=[node for formula in window.analysis['formulas'] for node in window.view_nodes(formula['view']) if node['kind']=='raw']
+        self.assertTrue(nodes)
+        for node in nodes:node.pop('render_id',None)
+        window.load_raw()
+        for node in nodes:self.assertIs(window.typesetter.cache[('raw',node['text'])],False)
+        box=window.editor.handler.box(window.analysis['formulas'][0])
+        marks=[kind for kind,_,_,_ in box.operations]
+        self.assertIn('failed',marks,'a fragment with no image must say so where it is drawn')
+
+    def test_a_rendered_fragment_is_not_marked_and_draws_its_image(self):
+        window=self.window
+        self.load('$ sum_(n=0)^oo a_n $')
+        nodes=[node for formula in window.analysis['formulas'] for node in window.view_nodes(formula['view']) if node['kind']=='raw']
+        for node in nodes:
+            window.typesetter.cache[('raw',node['text'])]={'svg':'<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>',
+                'base_font_size_pt':.5,'base_font_height_pt':.7,'base_font_baseline_pt':.1}
+        window.typesetter.touch()
+        box=window.editor.handler.box(window.analysis['formulas'][0])
+        marks=[kind for kind,_,_,_ in box.operations]
+        self.assertIn('svg',marks);self.assertNotIn('failed',marks)
+
+    def test_a_failed_render_request_is_retried_after_the_next_edit(self):
+        """One bad compile must not leave a viewport of source text for good."""
+        window=self.window
+        self.load('$ sum_(n=1)^oo frac(1, n^2) $')
+        nodes=[node for formula in window.analysis['formulas'] for node in window.view_nodes(formula['view']) if node['kind']=='raw']
+        self.assertTrue(nodes)
+        requests=[]
+        def failing(route,body,callback,key=None):
+            requests.append((route,body,key))
+            if len(requests)==1:callback(None,'渲染后端编译失败')
+            else:callback({'items':[]},None)
+        with patch.object(window.services,'request',side_effect=failing):
+            window.load_raw()
+            self.assertEqual(len(requests),1)
+            for node in nodes:self.assertIs(window.typesetter.cache[('raw',node['text'])],False)
+            # The same revision does not ask again: the verdict still holds.
+            window.load_raw()
+            self.assertEqual(len(requests),1)
+            # An edit usually fixes the document, and must clear that verdict.
+            window.replace(0,0,'正文 ')
+            window.load_raw()
+            self.assertEqual(len(requests),2)
+
+    def test_fragments_render_even_when_the_document_has_a_later_error(self):
+        """The request compiles only as far as the fragments reach, so an error
+        further down the document cannot take their images with it."""
+        window=self.window
+        self.load('正文 $ sum_(n=1)^oo frac(1, n^2) $ 与 $ dif x $。\n\n#panic("坏了")\n')
+        window.compile_timer.stop();window.raw_timer.stop()
+        loop=QEventLoop()
+        QTimer.singleShot(200,window.load_raw)
+        QTimer.singleShot(3000,loop.quit)
+        loop.exec_()
+        nodes=[node for formula in window.analysis['formulas'] for node in window.view_nodes(formula['view']) if node['kind']=='raw']
+        self.assertTrue(nodes)
+        drawn=[node['text'] for node in nodes if isinstance(window.typesetter.raw(node),dict)]
+        self.assertEqual(len(drawn),len(nodes),'fragments before a document error must still get images')
+        # The same fragments asked for without the context cannot compile.
+        formula=window.analysis['formulas'][0]
+        outcome={};loop=QEventLoop()
+        def done(result,error):outcome['error']=error;loop.quit()
+        window.services.request('/api/render',window.body()|{'raw':formula['render']['raw'],'formulas':[]},done,key='raw-whole')
+        QTimer.singleShot(5000,loop.quit)
+        loop.exec_()
+        self.assertIn('坏',outcome.get('error') or '')
+
+    def test_semantic_highlights_follow_an_incremental_edit(self):
+        self.load('= 标题\n\n正文 $x$\n\n尾部 $y$')
+        window=self.window;window.compile_timer.stop()
+        def spans(source):
+            # Spans are Python source indices; the mapping turns them into Qt
+            # (UTF-16) positions for each view.
+            found=[]
+            for text,color in [('标题','#8250a3'),('尾部','#26384a')]:
+                at=source.index(text)
+                found.append((at,at+len(text),color))
+            return found
+        def positions():
+            return [[(s.cursor.anchor(),s.cursor.position()) for s in editor.extraSelections()] for editor in window.highlight_views()]
+        self.assertEqual(len(positions()),1,'the source dock is hidden by default')
+        window.source_dock.show()
+        window.semantic_spans=spans(window.source);window.engine_spans=[]
+        window.apply_highlights()
+        built=positions()
+        self.assertEqual(len(built),2,'opening the dock colours it too')
+        for view in range(2):
+            self.assertEqual(len(built[view]),2,'both spans reach every view')
+            self.assertTrue(all(b>a for a,b in built[view]))
+        # An edit before the spans moves every view by the inserted display width.
+        window.replace(0,0,'前缀 ')
+        window.compile_timer.stop()
+        window.semantic_spans=spans(window.source)
+        window.apply_highlights()
+        shifted=positions()
+        for view in range(2):
+            for index in range(2):
+                self.assertEqual((shifted[view][index][0]-built[view][index][0],shifted[view][index][1]-built[view][index][1]),(3,3),f'view {view} span {index}')
+
     def test_let_edit_rebuilds_affected_following_projections(self):
         source='#let f(x) = $#x + 1$\nBefore $f(a)$\nAfter $f(b)$'
         self.load(source);window=self.window
