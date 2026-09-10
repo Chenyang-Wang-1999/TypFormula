@@ -1,5 +1,0 @@
-.vscode/**
-tests/**
-**/*.vsix
-**/*.pdb
-**/*.map
