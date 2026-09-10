@@ -656,5 +656,177 @@ block 7 alignment=1 text='行内 ￼ 与 ￼ 混排'    ← 保持左对齐
 
 改动文件：`src/typst.rs`、`src/view.rs`、`src/document.rs`、`src/services.rs`、`src/rpc.rs`、`src/lib.rs`（+ 删除 `src/prewarm.rs`、`src/warmup_service.rs`）、`tests/macro_scope.rs`、`desktop/window.py`、`desktop/mathview.py`、`desktop/rawcache.py`、`desktop/incremental.py`、`desktop/bridge.py`、`desktop/test_desktop.py`、`README.md`、`docs/desktop.md`、`docs/architecture.md`、`docs/lyx-desktop-rendering-study.md`。
 
+# 只复用"不含函数调用"的片段：实验开关 · 2026-09-10
+
+## 开关做了什么
+
+`VISUAL_TYPST_RAW_CACHE=plain` 只改一件事：`load_raw` 的命中判定（`window.py`）对**含函数调用**的片段不再算命中，于是它每一轮都进请求批次。含调用与否由 `rawcache.contains_call` 从片段**文本**判断（`标识符` 紧跟 `(`），不是解析：`cases(1 & x > 0, 2 & y < 0)`、`cancel(a)`、`#pd(f, x)` 算，`partial`、`#f`、`x_1` 不算。
+
+两点刻意保持：
+
+- 上一张图**留在缓存里继续绘制**，所以实验期画面不会退回源码，也不省下栅格化——多出来的编译是唯一差别；
+- 被拒（`False`）的片段照旧跳过，只在下一次编辑后重试，否则一份坏文档会被每 160 ms 滚动重编一次。
+
+## 冒烟实测（真实后端 + 真实适配器）
+
+文档 `正文 $ cases(1 & x > 0, 2 & y < 0) $ 与 $ partial + 1 $。`（两个片段：`cases(…)` 含调用、`partial` 不含），每轮 `load_raw` 后等事件循环跑完：
+
+| 轮次 | 模式 | `/api/render` 请求数 | 请求片段 | 出图 | 缓存项 |
+| --- | --- | --- | --- | --- | --- |
+| 冷启动 | `all` | 1 | `(9,36)`、`(45,52)` | 2/2 | 2 |
+| 第 2、3 轮 | `all` | 0 / 0 | — | 2/2 | 2 |
+| 第 1、2、3 轮 | `plain` | 1 / 1 / 1 | `(9,36)` | 2/2 | 2 |
+
+即：默认模式下第二、三轮**零请求**，`plain` 下每轮重编一次含调用的片段；三次都仍然出图 2/2（没有退回源码）。这个文档极小、后端是热的长驻 release 引擎，单次请求 < 0.5 ms，所以延迟差看不出来——量级要在大文档上测，这也是这枚开关留着的原因。
+
+## 本轮实测
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m unittest desktop.test_desktop` | **69 通过**（离屏，30.5s，新增 1） |
+
+新增用例：`desktop/test_desktop.py::test_the_experiment_switch_reuses_only_call_free_fragments`（默认模式两轮零请求；`plain` 下只重问 `cancel(a)`、`partial` 不再问、两个片段都还在出图；`False` 在同一个 revision 内不重问）。
+
+改动文件：`desktop/rawcache.py`、`desktop/window.py`、`desktop/test_desktop.py`、`docs/desktop.md`、`docs/validation.md`。Rust 与前端构建未改动。
+
+# 编辑器被源码栏光标拽回文档开头 · 2026-09-10
+
+症状：把编辑器滚到文档中段后，**任何一次编辑**（含公式编辑）都会跳回文档开头。
+
+## 定位
+
+120 行文档（每行一个 `$ x_{i} + {i} $`），真窗口 + 真后端，编辑前把编辑器滚到 `2594`，并在滚动条的 `valueChanged` 上挂一个打印调用栈的探针：
+
+```
+after load                         scroll=     0 max=  5188 dock=     0/  5252
+scrolled to the middle             scroll=  2594 max=  5188 dock=  2594/  5252
+   valueChanged(27) via mirror_scroll:201 <- <lambda>:102 <- project:182 <- replace:296
+after plain replace                scroll=    27 max=  5188 dock=    27/  5252
+   valueChanged(27) via decorate_incremental:176 <- incremental_project:122 <- project:177 <- math_action:346
+after math input                   scroll=    27 max=  5211 dock=    27/  5252
+```
+
+`project:182` 是 `Window.project` 里那行 `self.source_view.setTextCursor(cursor)`（同步源码栏光标，早于 `f54049d` 就存在）。`QTextEdit.setTextCursor` 会把该控件滚到光标处：源码栏的光标一直停在文档开头（这个面板默认隐藏，没人点过它），而它的滚动值此前是被 `mirror_scroll` 从编辑器镜像过来的 `2594`，于是这一步把源码栏拉回 `27`，`valueChanged(27)` 顺着 `<lambda>:102`（源码栏滚动条 → `mirror_scroll`）反过来把**编辑器**设成 `27`。也就是说 `f54049d` 新增的 `mirror_scroll` 让"镜像"变成了双向环：跟随者（源码栏）被程序改动后会去改写主人（编辑器）。公式编辑与普通编辑都会触发，因为两者都走 `Window.project`。
+
+## 改法
+
+| 位置 | 改动 |
+| --- | --- |
+| `Window.mirror_scroll` | `self.loading` 期间直接返回：重投影重建两栏、各放回自己的滚动值，那不是"要跟随的滚动" |
+| `Window.project` | 设置源码栏光标前记下它的滚动值，设完立刻放回（`loading` 期间镜像已被抑制，放回不会回流） |
+| `Window.dock_visibility_changed` | 打开源码栏时的重新着色 + 重新定行高也包在 `loading` 里，行高变化可能挪动它的滚动条，同样不该被跟随 |
+
+## 实测
+
+| 场景 | 改前 | 改后 |
+| --- | --- | --- |
+| 中段普通编辑（编辑器滚动值，文档 120 行） | 2594 → **27** | 2594 → 2594 |
+| 中段公式编辑（`activate` + `input`） | 2594 → **27** | 2594 → 2594 |
+| 两栏跟随仍有效（`test_the_source_dock_lines_up_with_the_editor`） | 通过 | 通过 |
+
+新增用例 `desktop/test_desktop.py::test_an_edit_keeps_the_view_where_the_reader_scrolled_it`（离屏 `show()` 后取真实滚动范围，先做普通编辑再做公式编辑，两次都要求滚动值不变）。把 `desktop/window.py` 暂存回改前版本后该用例失败：`AssertionError: 21 != 1272 : an edit must not move the view`。
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m unittest desktop.test_desktop` | **70 通过**（离屏，31.4s，新增 1） |
+
+改动文件：`desktop/window.py`、`desktop/test_desktop.py`、`docs/desktop.md`、`docs/architecture.md`、`docs/validation.md`。Rust 未改动。
+
+# 片段的图跟随谁：attach 用 script 形状，其余只用自己的源码 · 2026-09-10
+
+起因是用户报告 `$stretch(->)^x$` 与 `$stretch(->)^(…) $` 里的 `stretch(->)` 显示同一张图（应不同），随后讨论到"内容变动时到底该重渲染哪些片段"。
+
+## 后端没问题，是客户端按"文本"复用
+
+片段是被**插回原位置**编译的（`#[$ 片段 $<label>] `），所以它的盒子和周围内容有关。真后端 + 真适配器直接请求 `/api/render`：
+
+| 请求 | 片段区间 | 返回 |
+| --- | --- | --- |
+| `$ stretch(arrow.r)^("a") $` | `2:18` | **11.000 pt** |
+| `$ stretch(arrow.r)^("a much longer label") $` | `30:46` | **66.305 pt** |
+| 两个区间同一批 | — | 两条 item：`2:18:0` 11.000 / `30:46:0` 66.305 |
+
+适配器里本来就有这条断言（`native-adapter/src/render.rs::stretch_document_probe`）。客户端两处把它抹平：`load_raw` 用 `('raw', 文本)` 判"已有图就不再请求"（第二个区间**连请求都没发**），`Typesetter.cache`/`Typesetter.raw` 也只用文本做键。
+
+顺带排掉一个假线索：`$…^(xxxxxx)$` 会让整个请求报 `unknown variable: xxxxxx`，那是 `xxxxxx` 在 Typst 里本来就不是已知符号，与拼接无关。
+
+## 实测：哪些兄弟改动会改变片段自己的盒子
+
+同一片段放在两侧不同环境里，只比较它自己的 width（真后端 + 真适配器）：
+
+| 情形 | 短 → 长 | 变化 |
+| --- | --- | --- |
+| `stretch(arrow.r)` 作为 **attach 的基底**，脚标短/长 | 11.000 → 30.669 pt | **DIFFERS** |
+| `cal(A)` 作为基底，脚标短/长 | 8.778 → 8.778 | 不变 |
+| `cal(A)` 在分式里，另一格变宽/变高 | 8.778 → 8.778 | 不变 |
+| `cases(1 & x > 0, 2 & y < 0)` 旁的兄弟变长 | 40.211 → 40.211 | 不变 |
+| `mat(1, 2; 3, 4)` 旁的行变长 | 32.692 → 32.692 | 不变 |
+| `cal(A)` 在 `abs(...)`/`sqrt(...)` 里，兄弟变长 | 8.778 → 8.778 | 不变 |
+| `cal(A)` 作为 `sum` 的极限，极限变宽 | 6.514 → 6.514 | 不变 |
+| `stretch(arrow.r)` 在矩阵格里，行变长 | 11.000 → 11.000 | 不变 |
+
+样本里**只有"attach 的基底"会跟着脚标变**——这正是 Typst `stretch` 的文档用法（基底拉伸到附件的宽度）。行宽、分式另一格、矩阵邻格都不影响片段自己的盒子。
+
+## 视图里到底有什么（`$frac(x^(2+), cal(A))$`）
+
+```
+cell
+  stop(root.p0)
+  fraction
+    cell                     ← 分子
+      stop
+      script
+        cell                 ← 基底
+          stop  char('x')  stop
+        cell                 ← 上标
+          stop  char('2')  stop  symbol('+')  stop
+        absent
+      stop
+    cell                     ← 分母
+      stop  raw('cal(A)' render_id=14:20)  stop
+  stop(root.p1)
+```
+
+两点和"顺着 AST 追溯"的直觉不同：`+` 是 **symbol 结点**（不是 Raw），`frac`/`x^…` 是编辑器自己排版的结构结点（没有 `render_id`）；这条公式里唯一的 Raw 是分母的 `cal(A)`。于是"只重渲染路径上的 Raw"在这条公式里等于**什么都不重渲染**（光标在分子里时路径上一个 Raw 也没有）；而在 `$stretch(->)^x$` 里，跟着脚标变的基底是**兄弟分支**，同样不在路径上——所以判据不能是"路径"，只能是"这次变动能影响到谁的盒子"。
+
+## 规则与实现
+
+| 位置 | 规则 |
+| --- | --- |
+| 不在 `script` 里的片段 | 键 = `('raw', 源码)`：一个文本一张图，任何兄弟改动都不重取 |
+| 在 `script` 里的片段 | 键 = `('raw', 源码, script 形状摘要)`：基底、脚标、上下标方向变了就重取 |
+| 宏定义体内的片段 | 上下文只在**定义所在的公式视图**里建立（只索引"该公式自己定义"的区间，按 `render_id` 是否落在公式内判断），定义视图与各调用点视图因此同键 |
+
+实现（客户端，Rust 未动）：
+
+| 位置 | 改动 |
+| --- | --- |
+| `rawcache.raw_key(node)` | 有 `_context` → 三元键，否则二元键 |
+| `rawcache.signature_digest(value)` | 视图子树的短摘要 |
+| `Window.context_index` / `index_fragment_contexts` | 每个公式走一遍视图，记下每个片段所处的最近 `script`，上下文 = `signature_digest(signature(script))`（`signature` 跳过 stop/draft 结点，所以移动光标不改键） |
+| `Window.stamp_contexts` | `prepare_view` 与每次设置 `math_state` 时按 `render_id` 区间查表写 `_context` |
+| `Window.drop_dead_contexts` | 每轮 `load_raw` 清掉已无脚本使用的上下文，避免打字积压 |
+
+## 实测（真后端 + 真窗口）
+
+| 场景 | 结果 |
+| --- | --- |
+| `$frac(x^(2+), cal(A))$`，在分子里打字 | 请求**空**（`[]`）；`cal(A)` 仍用 `('raw','cal(A)')` 缓存的图（旧行为：会重取 `cal(A)`） |
+| 两条公式的 `stretch(arrow.r)`，脚标 `("a")` / `("a much longer label")` | 一批两个区间：**11.000 pt** / **66.305 pt**，各画各的 |
+| 同一公式里把脚标改宽 | 重新请求基底 `stretch(->)` |
+| 宏定义体 + 调用点的 `cancel(a)^2` | 两视图同键 `('raw','cancel(a)','96a8ac09c87153d5')`、同一张图 |
+| 在 `stretch(arrow.r) + x` 公式里连打 4 个字符 | 缓存稳定 **2 项**，无积压 |
+| 重取期间 | 该片段先按"无图"画源码 **172 ms**（160 ms 去抖 + 一次编译），随后回到图 |
+
+## 测试
+
+改写 `test_a_base_that_an_attachment_stretches_is_asked_for_again`（两条公式各要各的区间；同一公式里改宽脚标会重新请求基底）；`test_raw_keeps_svg_when_adjacent_text_moves_its_source_range` 恢复原来的 `cancel(a)` 用例（"编辑相邻字符不重取"对不在 attach 里的片段成立）；直接读写 `typesetter.cache` 的 4 处用例改用 `raw_key(node)`。
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m unittest desktop.test_desktop` | **71 通过**（离屏，31.6s） |
+
+改动文件：`desktop/rawcache.py`、`desktop/mathview.py`、`desktop/window.py`、`desktop/test_desktop.py`、`docs/desktop.md`、`docs/architecture.md`、`docs/validation.md`。Rust 未改动，无需重建后端。
+
 
 

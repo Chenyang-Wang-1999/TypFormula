@@ -7,6 +7,7 @@ from PyQt5.QtGui import QFont, QFontMetricsF, QColor, QPen, QPainter, QTextObjec
 from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import QWidget, QApplication, QInputDialog
 from . import mathfont
+from . import rawcache
 from .svg import qt_svg
 
 OBJECT = QTextFormat.UserObject + 1
@@ -146,7 +147,7 @@ class Typesetter:
         inside a macro template is asked for like any other, at the definition's
         own source range, so there is one namespace for every fragment.
         """
-        shared = ("raw", node.get("text", ""))
+        shared = rawcache.raw_key(node)
         if shared in self.cache:
             return self.cache[shared]
         for key in (node.get("_raw_key"), node.get("render_id")):

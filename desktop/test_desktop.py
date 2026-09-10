@@ -12,7 +12,7 @@ from .model import Projection,to_byte,from_byte,u16,from_u16,validate_settings,a
 from .bridge import Core
 from .mathview import Typesetter
 from .window import Window,initial_window_geometry
-from .rawcache import signature
+from .rawcache import signature,raw_key
 
 APPLICATION=QApplication.instance() or QApplication([])
 from .model import ROOT
@@ -289,6 +289,12 @@ class NativeTest(unittest.TestCase):
         return calls,request
 
     def test_raw_keeps_svg_when_adjacent_text_moves_its_source_range(self):
+        """A fragment that is not in an attachment renders from its own source alone.
+
+        One image answers for it wherever it stands, so editing a sibling leaves it
+        alone -- see `test_a_base_that_an_attachment_stretches_is_asked_for_again`
+        for the fragments that do follow a sibling.
+        """
         from unittest.mock import patch
         self.load('$cancel(a)$');window=self.window;calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
@@ -301,6 +307,35 @@ class NativeTest(unittest.TestCase):
             self.assertEqual(after['_raw_key'],key)
             self.assertIs(window.typesetter.raw(after),svg)
             self.assertEqual(len(calls),1,'editing a sibling must not request Raw SVG again')
+
+    def test_a_base_that_an_attachment_stretches_is_asked_for_again(self):
+        """`stretch(->)^x` takes its width from `x`, so the base cannot keep the image
+        it had under another script -- in another formula, or in this one."""
+        from unittest.mock import patch
+        self.load('$stretch(->)^x$\n\n$stretch(->)^(1234)$');window=self.window
+        calls,request=self.fake_render()
+        def fragment(index):
+            return next(n for n in window.view_nodes(window.analysis['formulas'][index]['view']) if n['kind']=='raw')
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.load_raw()
+            self.assertEqual(len(calls),1,'both fragments come from one batch compile')
+            self.assertEqual(len(calls[0]['raw']),2,'each script asks for its own base')
+            first,second=fragment(0),fragment(1)
+            self.assertEqual(first['text'],second['text'])
+            self.assertNotEqual(first['_context'],second['_context'],'two scripts, two contexts')
+            for node in (first,second):
+                start,end=(int(part) for part in node['render_id'].split(':')[:2])
+                self.assertTrue(window.typesetter.raw(node)['id'].startswith(f'{start}:{end}:'),
+                    'each fragment draws the image rendered at its own range')
+            # The same formula: widening the script asks for its base again.
+            window.activate(window.analysis['formulas'][0]['start'])
+            script=next(n for n in window.view_nodes(window.math_state['view']) if n['kind']=='script')
+            stop=next(n for n in window.view_nodes(script['children'][1]) if n.get('cursor'))
+            window.math_action('click',cursor=stop['cursor']);window.math_action('input',text='57')
+            calls.clear();window.load_raw()
+        asked=[[body['source'].encode('utf-8')[item['start']:item['end']].decode('utf-8') for item in body['raw']] for body in calls]
+        self.assertEqual(asked,[['stretch(->)']],
+            'the base follows the script it is drawn under')
 
     def test_script_edits_invalidate_only_base_raw_when_leaving_slot(self):
         from unittest.mock import patch
@@ -325,6 +360,43 @@ class NativeTest(unittest.TestCase):
         self.assertEqual(len(calls),1)
         raws=[next(n for n in window.view_nodes(formula['view']) if n['kind']=='raw') for formula in window.analysis['formulas']]
         self.assertIs(window.typesetter.raw(raws[0]),window.typesetter.raw(raws[1]))
+
+    def test_the_experiment_switch_reuses_only_call_free_fragments(self):
+        """VISUAL_TYPST_RAW_CACHE=plain keeps an image only for a fragment without a call.
+
+        The switch asks what dropping the reuse of call-carrying fragments costs,
+        so a fragment that already has an image is still drawn from it: the extra
+        render work is the only difference. A refusal is not a reused image and
+        still waits for the next edit.
+        """
+        import desktop.rawcache as rawcache
+        self.load('$cancel(a)$\n$partial + 1$');window=self.window;calls,request=self.fake_render()
+        def pass_once():
+            with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+                window.load_raw()
+        pass_once();pass_once()
+        self.assertEqual(len(calls),1,'every fragment is reused by default')
+        call=window.source.index('cancel(a)');plain=window.source.index('partial')
+        starts=[[item['start'] for item in body['raw']] for body in calls]
+        self.assertIn(call,starts[0]);self.assertIn(plain,starts[0])
+        with patch.object(rawcache,'MODE','plain'):
+            self.assertTrue(rawcache.reusable('partial'));self.assertFalse(rawcache.reusable('cancel(a)'))
+            self.assertFalse(rawcache.reusable('mat(1, 2)'),'a call written as text is one')
+            self.assertTrue(rawcache.reusable('#f'),'a parameter reference is not a call')
+            pass_once();pass_once()
+        self.assertEqual([[item['start'] for item in body['raw']] for body in calls[1:]],
+            [[call],[call]],'only the fragment holding a call is asked for again')
+        node=next(node for node in window.view_nodes(window.analysis['formulas'][0]['view']) if node['kind']=='raw')
+        self.assertEqual(node['text'],'cancel(a)')
+        self.assertIsInstance(window.typesetter.raw(node),dict,'the image in hand keeps being drawn')
+        drawn=[window.typesetter.raw(node) for formula in window.analysis['formulas']
+            for node in window.view_nodes(formula['view']) if node['kind']=='raw']
+        self.assertTrue(all(isinstance(item,dict) for item in drawn),'no fragment fell back to source text')
+        window.typesetter.cache[raw_key(node)]=False
+        before=len(calls)
+        with patch.object(rawcache,'MODE','plain'):
+            pass_once()
+        self.assertEqual(len(calls),before,'a refused fragment is not asked for again in the same revision')
 
     def test_distinct_visible_raws_across_formulas_use_one_batch_compile(self):
         self.load('$cancel(a)$\n$cancel(b)$\n$cancel(c)$');window=self.window;calls,request=self.fake_render()
@@ -564,7 +636,8 @@ class NativeTest(unittest.TestCase):
         text=next(node['text'] for node in window.view_nodes(window.math_state['view']) if node['kind']=='raw')
         self.assertEqual(text,'undefinedfunc(α)')
         # What load_raw records when the render pass returns nothing for a fragment.
-        window.typesetter.cache[('raw',text)]=False
+        node=next(node for node in window.view_nodes(window.math_state['view']) if node['kind']=='raw')
+        window.typesetter.cache[raw_key(node)]=False
         window.report_raw_fragments(force=True)
         window.math_action('key',key='ArrowRight')
         state=window.math_state
@@ -582,7 +655,7 @@ class NativeTest(unittest.TestCase):
         self.assertTrue(nodes)
         for node in nodes:node.pop('render_id',None)
         window.load_raw()
-        for node in nodes:self.assertIs(window.typesetter.cache[('raw',node['text'])],False)
+        for node in nodes:self.assertIs(window.typesetter.cache[raw_key(node)],False)
         box=window.editor.handler.box(window.analysis['formulas'][0])
         marks=[kind for kind,_,_,_ in box.operations]
         self.assertIn('failed',marks,'a fragment with no image must say so where it is drawn')
@@ -592,7 +665,7 @@ class NativeTest(unittest.TestCase):
         self.load('$ sum_(n=0)^oo a_n $')
         nodes=[node for formula in window.analysis['formulas'] for node in window.view_nodes(formula['view']) if node['kind']=='raw']
         for node in nodes:
-            window.typesetter.cache[('raw',node['text'])]={'svg':'<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>',
+            window.typesetter.cache[raw_key(node)]={'svg':'<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>',
                 'base_font_size_pt':.5,'base_font_height_pt':.7,'base_font_baseline_pt':.1}
         window.typesetter.touch()
         box=window.editor.handler.box(window.analysis['formulas'][0])
@@ -613,7 +686,7 @@ class NativeTest(unittest.TestCase):
         with patch.object(window.services,'request',side_effect=failing):
             window.load_raw()
             self.assertEqual(len(requests),1)
-            for node in nodes:self.assertIs(window.typesetter.cache[('raw',node['text'])],False)
+            for node in nodes:self.assertIs(window.typesetter.cache[raw_key(node)],False)
             # The same revision does not ask again: the verdict still holds.
             window.load_raw()
             self.assertEqual(len(requests),1)
@@ -636,7 +709,7 @@ class NativeTest(unittest.TestCase):
         with patch.object(window.services,'request',side_effect=salvaged):
             window.load_raw()
             self.assertEqual(len(requests),1)
-            self.assertIs(window.typesetter.cache[('raw',refused['text'])],False)
+            self.assertIs(window.typesetter.cache[raw_key(refused)],False)
             window.load_raw()
             self.assertEqual(len(requests),1,'the same revision keeps the verdict')
             window.replace(0,0,'正文 ')
@@ -703,6 +776,28 @@ class NativeTest(unittest.TestCase):
             self.assertAlmostEqual(offset,expected,delta=1.0,
                                    msg='%s: %.2f px, wanted %.2f' % (formula,offset,expected))
         self.load('$ $')
+
+    def test_an_edit_keeps_the_view_where_the_reader_scrolled_it(self):
+        """A re-projection must not read the dock's caret back into the editor.
+
+        The dock's caret stays near the top while the editor is scrolled far down.
+        Setting that caret scrolls the dock, and the scroll mirror would carry that
+        value to the editor -- which put every edit back at the document's start.
+        """
+        window=self.window
+        self.load('\n\n'.join(f'第 {i} 行正文 $ x_{i} + {i} $' for i in range(1,60)))
+        window.compile_timer.stop();window.raw_timer.stop()
+        window.resize(900,600);window.show();APPLICATION.processEvents()
+        bar=window.editor.verticalScrollBar()
+        bar.setValue(bar.maximum()//2);where=bar.value()
+        self.assertGreater(where,0,'the fixture has to be long enough to scroll')
+        self.assertEqual(window.source_view.textCursor().position(),0,'the dock caret sits at the top')
+        window.replace(0,0,'X',typed=True);window.raw_timer.stop()
+        self.assertEqual(bar.value(),where,'an edit must not move the view')
+        formula=window.analysis['formulas'][len(window.analysis['formulas'])//2]
+        window.activate(formula['start']);window.math_action('input',text='z');window.raw_timer.stop()
+        self.assertEqual(bar.value(),where,'a formula edit must not move the view')
+        self.assertEqual(window.source_view.verticalScrollBar().value(),where,'the dock still follows the editor')
 
     def test_the_source_dock_lines_up_with_the_editor(self):
         window=self.window

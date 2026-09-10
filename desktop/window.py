@@ -15,7 +15,7 @@ from .bridge import Core,Services
 from .editor import Editor,SourceEditor
 from .mathview import Typesetter,MathCanvas
 from .svg import qt_svg
-from .rawcache import RawCache,signature
+from .rawcache import RawCache,signature,reusable,raw_key,signature_digest
 from .incremental import merge as incremental_merge
 
 def initial_window_geometry(available):
@@ -54,6 +54,9 @@ class Window(QMainWindow):
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
         self.settings=load_settings();self.typesetter=Typesetter(self.settings)
         self.raw_cache=RawCache();self.raw_pending=set()
+        # (analysis, sorted (start, end, context) per formula, their starts), rebuilt
+        # when the analysis is replaced.
+        self.contexts=None
         # Attachment requests per live formula view, so a background cycle does
         # not walk every view node and rebuild every definition prefix.
         self.attachments={}
@@ -76,7 +79,7 @@ class Window(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea,self.source_dock);self.source_dock.hide()
         # Token colours are applied per visible view; open the dock and it is
         # coloured at once instead of paying for a hidden widget on every reply.
-        self.source_dock.visibilityChanged.connect(lambda _:(self.apply_highlights(),self.sync_source_lines()))
+        self.source_dock.visibilityChanged.connect(self.dock_visibility_changed)
         self.source_view.textChanged.connect(self.source_changed)
         self.outline=QTreeWidget();self.outline.setHeaderHidden(True)
         dock=QDockWidget("大纲",self);dock.setWidget(self.outline);self.addDockWidget(Qt.LeftDockWidgetArea,dock)
@@ -178,8 +181,14 @@ class Window(QMainWindow):
             else:editor.project(selection,schedule_raw)
         cursor=self.source_view.textCursor();pos=cursor.position()
         current=self.source_view.toPlainText();a,b,replacement=difference(current,self.source)
+        dock_scroll=self.source_view.verticalScrollBar().value()
         cursor=QTextCursor(self.source_view.document());cursor.setPosition(u16(current[:a]));cursor.setPosition(u16(current[:b]),QTextCursor.KeepAnchor);cursor.insertText(replacement)
         cursor=self.source_view.textCursor();cursor.setPosition(min(pos,u16(self.source)));self.source_view.setTextCursor(cursor)
+        # Setting a cursor scrolls the pane that owns it. The dock's caret usually
+        # sits near the top while the editor is scrolled far down, and
+        # `mirror_scroll` would carry that scroll back to the editor, so the dock
+        # is put back where it was before anything reads it.
+        self.source_view.verticalScrollBar().setValue(dock_scroll)
         font=QFont(self.settings["font_family"]);font.setPointSizeF(self.settings["font_size"]);self.source_view.setFont(font)
         self.outline.clear()
         for style in self.analysis.get("styles",[]):
@@ -189,13 +198,28 @@ class Window(QMainWindow):
         self.loading=False;self.reposition_math();self.apply_highlights()
         self.loading=True;self.sync_source_lines();self.loading=False
 
+    def dock_visibility_changed(self):
+        """Colour the dock as it opens and re-height its lines.
+
+        Re-heighting the dock can move its scroll bar, and that is not a scroll to
+        follow: the same guard `mirror_scroll` uses for a re-projection applies here,
+        so opening the dock leaves the editor where the reader put it.
+        """
+        loading=self.loading;self.loading=True
+        self.apply_highlights();self.sync_source_lines();self.loading=loading
+
     def mirror_scroll(self,source):
         """Keep the dock and the editor on the same lines.
 
         `sync_source_lines` gives both panes the same line heights, so their scroll
         values are directly comparable: whichever pane is scrolled, the other follows.
         The equality check ends the ping-pong after one step.
+
+        A re-projection sets scroll bars too -- it rebuilds each pane and puts its
+        own value back -- and that is not a scroll to follow: mirroring it would
+        drag the editor to the dock's caret. Only the user scrolls while this runs.
         """
+        if self.loading:return
         target=self.editor if source is self.source_view else self.source_view
         value=source.verticalScrollBar().value()
         if target.verticalScrollBar().value()!=value:target.verticalScrollBar().setValue(value)
@@ -321,6 +345,7 @@ class Window(QMainWindow):
         if not self.finish_formula(focus=False):return
         editor=editor or self.focused_editor()
         state=self.core.call("activate_formula",start=start);self.math_state=state;self.active_editor=editor
+        self.stamp_contexts(state['view'])
         self.active_position=position if position is not None else editor.mapping.display_position(from_byte(self.source,start))
         self.math_scroll.setParent(editor.viewport());self.math_canvas.refresh(state)
         if last and self.math_canvas.box.stops:self.math_action("click",cursor=self.math_canvas.box.stops[-1][3])
@@ -344,7 +369,7 @@ class Window(QMainWindow):
             old=self.analysis;a,b,text=difference(before,self.source)
             self.analysis=self.update_analysis(before,a,b,text,core_current=True);self.raw_cache.rebind(old,self.analysis)
             self.project(incremental=True);self.compile_timer.start()
-        self.math_canvas.refresh(state);self.reposition_math()
+        self.stamp_contexts(state['view']);self.math_canvas.refresh(state);self.reposition_math()
         self.report_raw_fragments(state)
         invalidated=self.raw_cache.track(state,self.typesetter.cache)
         if invalidated:self.invalidate_raw(invalidated);self.raw_timer.start()
@@ -477,11 +502,62 @@ class Window(QMainWindow):
 
     def prepare_view(self,view,definitions,display):
         attachments=[]
+        self.stamp_contexts(view)
         for node in self.view_nodes(view):
             if node.get("attachment"):
                 node["_placement"]=self.typesetter.placements.get((definitions,node["attachment"],display),{})
                 attachments.append((definitions,node["attachment"],display))
         return attachments
+
+    def context_index(self):
+        """The attachment every fragment is drawn in, by the range it is asked from.
+
+        Almost every fragment renders from its own source wherever it stands, and one
+        image per source text is what keeps a viewport of symbols to a handful of
+        pictures. The base of an attachment is the exception: `stretch(->)^x`
+        stretches to the width of `x`, so the same base source is a different picture
+        under a different script. Those fragments are keyed by the *shape of that
+        script* (its base, its script, up or down) instead -- not by the whole
+        formula, so editing a fraction's numerator still leaves the denominator's
+        images alone.
+
+        Only what a formula *defines* is indexed: a call site shows a macro's
+        fragments again, at the definition's own ranges, and those have to keep the
+        context they were indexed with at the definition -- which is what makes the
+        definition and all of its call sites share one image.
+        """
+        if self.contexts is None or self.contexts[0] is not self.analysis:
+            index={}
+            for formula in self.analysis.get('formulas',[]):self.index_fragment_contexts(formula.get('view',{}),None,formula,index)
+            self.contexts=(self.analysis,index)
+        return self.contexts[1]
+
+    def index_fragment_contexts(self,view,script,formula,index):
+        """Walk one view, remembering the script each of the formula's own fragments sits in."""
+        if script is None and view.get('kind')=='script':script=view
+        if view.get('kind')=='raw':
+            start=self.fragment_start(view)
+            if start is None or not formula['start']<=start<formula['end']:return
+            if script is not None:
+                identity=':'.join((view.get('render_id') or '').split(':')[:2])
+                index[identity]=signature_digest(signature(script))
+            return
+        for child in view.get('children',[]):self.index_fragment_contexts(child,script,formula,index)
+
+    @staticmethod
+    def fragment_start(node):
+        """The byte offset a fragment is asked for, from its range or its render id."""
+        bounds=node.get('source_range') or (node.get('render_id') or '').split(':')[:2]
+        try:return int(bounds[0])
+        except (IndexError,TypeError,ValueError):return None
+
+    def stamp_contexts(self,view):
+        """Give every fragment of a view the attachment it is drawn in, if any."""
+        index=self.context_index()
+        for node in self.view_nodes(view):
+            if node.get('kind')!='raw':continue
+            node['_context']=index.get(':'.join((node.get('render_id') or '').split(':')[:2]))
+        return view
 
     def remember_attachments(self,formula,attachments):
         view=formula.get("view",{})
@@ -530,6 +606,18 @@ class Window(QMainWindow):
         for sources,flag in ((failed,True),(rest,False)):
             if sources:self.core.call('preview_results',sources=list(sources),definitions=definitions,display=display,failed=flag)
 
+    def drop_dead_contexts(self):
+        """Forget the images of attachments that no longer exist.
+
+        A fragment inside a script is cached per script shape, and editing that
+        script names a new one: without this, typing an attachment would leave one
+        more picture per fragment of it behind for the rest of the session. An entry
+        whose context belongs to no script in the document cannot be looked up again.
+        """
+        live=set(self.context_index().values())
+        for key in list(self.typesetter.cache):
+            if isinstance(key,tuple) and len(key)==3 and key[2] not in live:del self.typesetter.cache[key]
+
     def visible_formula_starts(self):
         """Formula starts currently on screen in any editor.
 
@@ -551,6 +639,7 @@ class Window(QMainWindow):
         if self.math_state and self.math_state.get('pending'):return
         revision=self.revision;targets={};ranges=[];seen=set();stuck=False;context_end=0;in_definition=False
         definitions=[(style['start'],style['end']) for style in self.analysis.get('styles',[]) if style.get('kind')=='let']
+        self.drop_dead_contexts()
         # A failed request leaves every fragment it covered without an image, and a
         # fragment the renderer refused leaves that one without an image. Either
         # verdict belongs to the revision it was made in: the next edit (usually the
@@ -569,7 +658,7 @@ class Window(QMainWindow):
             wanted=0
             for node in self.view_nodes(formula.get('view',{})):
                 if node.get('kind')!='raw':continue
-                stable=node.get('_raw_key');shared=('raw',node.get('text',''))
+                stable=node.get('_raw_key');text=node.get('text','');shared=raw_key(node)
                 if not node.get('render_id'):
                     # No range means the service can never be asked for this fragment.
                     # Record it as failed: its source is shown, and a horizontal key
@@ -577,7 +666,16 @@ class Window(QMainWindow):
                     if shared not in self.typesetter.cache:
                         self.typesetter.cache[shared]=False;stuck=True
                     continue
-                if stable in self.typesetter.cache or shared in self.typesetter.cache or shared in self.raw_pending or shared in seen:continue
+                known=[self.typesetter.cache[key] for key in (shared,stable) if key in self.typesetter.cache]
+                # An image in hand answers this request. A refusal (`False`) does
+                # too: it belongs to this revision and is dropped by the next edit,
+                # so not repeating it keeps a broken document from being compiled
+                # again on every scroll. Under VISUAL_TYPST_RAW_CACHE=plain a
+                # fragment holding a call is asked for on every pass instead; its
+                # previous image stays in the cache and keeps being drawn, so the
+                # extra render work is the only difference the switch makes.
+                if known and (any(value is False for value in known) or reusable(text)):continue
+                if shared in self.raw_pending or shared in seen:continue
                 source_id=':'.join(node['render_id'].split(':')[:2]);source_range=by_id.get(source_id)
                 if not source_range:continue
                 seen.add(shared);targets[source_id]=(stable,shared);ranges.append(source_range);wanted+=1
@@ -623,8 +721,16 @@ class Window(QMainWindow):
         self.report_raw_fragments()
 
     def invalidate_raw(self,records):
+        """Drop every image of the fragments a script edit invalidated.
+
+        A fragment that holds a call is stored once per formula, so the sweep goes
+        by source text: the record names the fragment, not one of its pictures.
+        """
         for _,text in records:
-            shared=('raw',text);self.typesetter.cache.pop(shared,None);self.raw_pending.discard(shared)
+            prefix=('raw',text)
+            for key in [key for key in self.typesetter.cache if isinstance(key,tuple) and key[:2]==prefix]:
+                del self.typesetter.cache[key]
+            self.raw_pending={key for key in self.raw_pending if not (isinstance(key,tuple) and key[:2]==prefix)}
         if records:self.typesetter.touch()
 
     def clear_actual_svg(self):

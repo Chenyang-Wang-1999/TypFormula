@@ -1,5 +1,44 @@
-"""Stable Raw identities and script edit sessions, independent of byte offsets."""
+"""Stable Raw identities, script edit sessions, and the fragment cache policy."""
+import hashlib,os,re
 from difflib import SequenceMatcher
+
+# Which fragment images may be kept for a later request. `all` is the editor's
+# behaviour: every fragment is reused by its source text. `plain` is an
+# experiment switch, not a setting -- it exists to measure what dropping the
+# reuse of the fragments that hold a call costs.
+MODE = os.environ.get("VISUAL_TYPST_RAW_CACHE", "all").strip()
+
+# One identifier followed by an opening parenthesis. The text of a Raw is the
+# source the renderer is asked for, so `cancel(a)`, `mat(1, 2)` and `#pd(f, x)`
+# read as calls while `partial`, `#f` and `x_1` do not. This is a guess about
+# source text, not a parse: a call that is written `f (x)` costs one extra render.
+CALL = re.compile(r"[^\W\d]\w*\s*\(")
+
+def contains_call(text):
+    return CALL.search(text) is not None
+
+def reusable(text):
+    """Whether an image asked for with this source may answer a later request."""
+    if MODE != "plain":return True
+    return not contains_call(text)
+
+def raw_key(node):
+    """The identity of one fragment's image, as the cache stores it.
+
+    A fragment is compiled where it stands, and almost always its own source is the
+    whole story: `cal(A)` is the same box in a numerator and in a denominator. The
+    exception this editor knows is an attachment's base -- `stretch(->)^x`
+    stretches to the width of `x`, so the same base source is a different picture
+    under a different script. A fragment that sits in a `script` therefore carries
+    that script's shape as `_context` (a digest the window stamps), and it is part
+    of the key. Everything else shares one image per source text, wherever it stands.
+    """
+    text=node.get('text','')
+    return ('raw',text,node['_context']) if node.get('_context') else ('raw',text)
+
+def signature_digest(value):
+    """A short key for one view subtree, for the fragments whose box follows it."""
+    return hashlib.blake2b(repr(value).encode('utf-8'),digest_size=8).hexdigest()
 
 def nodes(view):
     yield view

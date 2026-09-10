@@ -179,7 +179,7 @@ impl RenderAdapter {
     pub(crate) fn start(bin: &Path, root: &Path) -> Result<Self,String> {
         let mut child = hidden(Command::new(bin).arg("--server")).current_dir(root)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
-            .map_err(|e|format!("请运行 build-native.cmd 构建实时 Typst 引擎：{e}"))?;
+            .map_err(|e|format!("请运行 build-desktop.cmd 构建实时 Typst 引擎：{e}"))?;
         let mut input = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (requests, receiver) = mpsc::channel::<Vec<u8>>();
@@ -218,7 +218,7 @@ impl Services {
     pub fn status(&self) -> Value { match &self.bin { Ok(path) => json!({"available":true,"attachments":self.adapter_bin().is_file(),"engine":"Tinymist LSP + Typst","path":path}), Err(error) => json!({"available":false,"attachments":self.adapter_bin().is_file(),"error":error}) } }
     pub fn attachments(&self, req: AttachmentRequest) -> Result<Value, String> {
         crate::workspace::resolve(&self.workspace, &req.path)?;
-        if !self.adapter_bin().is_file() { return Err("请运行 build-native.cmd 并重启服务，以启用 Typst limits/stretch 适配器".into()); }
+        if !self.adapter_bin().is_file() { return Err("请运行 build-desktop.cmd 并重启服务，以启用 Typst limits/stretch 适配器".into()); }
         let body = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
         let mut child = hidden(&mut Command::new(self.adapter_bin())).current_dir(&self.workspace)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
