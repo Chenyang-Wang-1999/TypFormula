@@ -328,3 +328,123 @@ Typst 的公开编译入口是文档级的（`typst::compile::<PagedDocument>(wo
 - **内存**：栅格内存 = 宽×高×4 字节，随缩放平方增长（4× 时 4.0 KiB → 27.7 KiB）；单边 4096 的上限意味着一份条目最坏 64 MiB，这正是 `BitmapCache` 要设上限和 LRU 的原因。缓存 SVG 时这部分由"当前可见尺寸"决定，而不是由"用户缩放过的每一个档位"决定。
 - **CPU**：SVG 的解析 + 栅格化约 0.1～0.3 ms/片段，只在尺寸或内容变化时付一次；PNG 的解码约 0.02～0.1 ms，但**编码**在服务端要 0.03～0.5 ms（首次 6.5 ms，含编解码器初始化），而服务端本来就要跑一次 Typst——栅格化把它从"几何求解"变成"光栅求解"，放大的正是 Typst 最昂贵的部分（字形轮廓光栅化），还会丢掉向量在缩放下的清晰度。
 - **结论**：交换与缓存都用 SVG 更划算，PNG 只在"要跨进程缓存大量已栅格化的小片段、且尺寸固定"时才有意义。桌面端当前形态（传 SVG、按需栅格化、位图 LRU）已经是这个结论下的正确取舍；要优化的话方向是**减少请求**（前缀合成文档把每次取图从整篇编译降到一个公式），而不是换图片格式。
+
+# Raw 取图"整屏变源码"的第二个原因 · 2026-09-10
+
+针对反馈"编辑器还是会某些字形无法识别，例如 `paper/slides` 里 ln.79 的 `=>` 和 ln.99 的 `det`"。
+
+## 复现：不是字形，也不是那两行
+
+以离屏真实窗口（`Window` + 真后端 + 真适配器）打开 `pygbz2d-details.typ`，跳到 ln.79 后触发一次 `load_raw`：缓存里 41 个片段**全部**是 `False`，编辑器把它们画成暖色虚线框 + Consolas 源码文字（`=>`、`det`、`det(E-h(beta))` 都一样）。也就是用户看到的不是"某两个字形画错"，而是**这个视口的所有片段都没有图**。上报的错误是：
+
+```
+REQUEST raw=41 context_end=6749 path=pygbz2d-details.typ
+   error: expected function, found content
+```
+
+同一份 41 个区间的请求，无论带不带 `context_end` 都失败；把区间逐个单独请求，只有 `2820:2826`（`cal(A)`）会失败，且错误信息一样。文档本身没问题：同一份文档只请求它所在公式的 2 个片段时编译成功。
+
+## 根因：片段被插进源码后与后面的 `(` 粘成了函数调用
+
+`native-adapter/src/render.rs` 把每个片段替换成 `#[${片段}$<标签>]` 再编译整篇。`#[...]` 是**嵌入的代码表达式**（`typst-syntax/src/parser.rs` 里 math 的 `Hash` 分支走 `embedded_code_expr`），而代码解析器把**紧跟其后的** `(`、`[` 当作对它的调用：
+
+```rust
+// code_expr_prec
+if p.directly_at(SyntaxKind::LeftParen) || p.directly_at(SyntaxKind::LeftBracket) {
+    args(p);
+    p.wrap(m, SyntaxKind::FuncCall);
+```
+
+文档原文是 `cal(A)(E)`：在 math 里这是并置（`cal(A)` 与括号组），所以文档本身合法；插入后变成 `#[…](E)`，于是被读成"调用 content" → `expected function, found content` → **整批取图全灭**。`directly_at` 的定义是"当前 token 匹配且前面没有 trivia"，所以修法是块尾补一个空格：`#[…] (E)`，代码解析器不再把它当调用。空格落在方括号之外，片段自己那个公式——也正是取出来的那张图——不受影响：`native-adapter/src/render.rs::the_trailing_space_of_a_splice_stays_outside_the_fragment` 断言同一片段的宽、高、基线与 SVG 在"后面紧跟 `(y)`"与"什么都不跟"两种写法下完全相同。
+
+## 第二个改动：一个片段不再能带崩整批
+
+上一条是具体写法，这一条是**这一类**问题：只要有一个片段自己编译不出来，整个视口就退回源码。后端现在在整批失败时**分半重试**，把能编译的子批的图都收回来，并在响应里给出 `failed`（单个片段仍然失败的 id 列表）；重试次数上限 `SALVAGE_BUDGET = 24`，避免一份满是坏片段的文档把一次按键变成编译风暴。**所有子批都失败时仍然返回错误**，因为那说明问题在共享上下文（正文真的错），用户需要看到原因而不是一批"无图"。
+
+这不是假想：`$ #let z = 1; z + cancel(y) $` 是合法文档，但片段 `#let z = 1` 的区间不含后面的分号，单独包成 `$#let z = 1$` 必然报 `expected semicolon or line break`——以前它会让同一视口里的 `cancel(y)` 一起没图。用例：`native-adapter/src/render.rs::one_broken_fragment_does_not_blank_the_batch`（断言 `salvaged=true`、`failed=["0"]`、另一个片段仍有 SVG，以及"全坏 → 仍是 Err"）。
+
+桌面端把 `failed` 当作与"整批失败"同一种判决：记在当前 `revision` 上，下一次编辑清掉并重新请求，见 `desktop/test_desktop.py::test_a_fragment_the_renderer_refused_is_retried_after_the_next_edit`。
+
+## 缓存 SVG 一律按黑色栅格化
+
+片段是从文档里切出来的图，文档可以给它上色（幻灯片主题常见 `#set text(fill: white)`，或 `#text(fill: red)[$…$]`），浅色编辑区上就会看不见。改动很小，所以做了：
+
+- `desktop/svg.py::qt_svg(source, monochrome=False)`：Qt 兼容转换时把每个元素的 `fill`/`stroke` 改成 `#000000`（`none` 保留，否则只描边的形状会被填满）。
+- `desktop/mathview.py::BitmapCache.draw` 用 `qt_svg(svg, True)`；导出 SVG/PDF 仍用原始 SVG（`window.py::export` 里 PDF 走 `qt_svg(page["svg"])`，那是**整页**，颜色照旧）。
+
+实测：把一份 `fill="#ffffff"` 的片段画到白色 `QImage` 上，改前中心像素是 `#ffffff`（等于看不见），改后是 `#000000`；`qt_svg(svg)`（导出路径）仍保留 `#ffffff`。顺带量了本次这份文档：49 个片段**本来就全是** `#000000`，所以这条改动对本例没有可见变化，它防的是别的主题/写法。
+
+## 本轮实测
+
+| 检查 | 结果 |
+| --- | --- |
+| `paper/slides/pygbz2d-details.typ` 41 个片段的批量请求 | 改前 `expected function, found content`、0 张图；改后 49 个条目（含 `#pause` 拆出的多页重复）、0 错误 |
+| 同一份文档在离屏真实窗口里的绘制操作 | 改前 `FAILED MARK + text 'det(E-h(beta))' (Consolas)`、`text '=>' (Consolas)`；改后 `svg image` + 邻接的 `=`、`0` 由 `NewComputerModern Math` 绘制 |
+| 逐区间单独请求 | 改前只有 `cal(A)` 失败；改后 41/41 通过 |
+| `cargo test --offline --locked` | 86 通过，5 个本机服务集成用例忽略 |
+| `cargo test --manifest-path native-adapter/Cargo.toml --target-dir target/adapter` | 19 通过（新增 3） |
+| `python -m unittest desktop.test_desktop` | 56 通过（离屏，21.2s，新增 3） |
+| `npm test` | 27 通过（未改 Web 侧） |
+
+新增用例：`native-adapter/src/render.rs` 的 `a_fragment_followed_by_a_parenthesis_is_not_read_as_a_call`（去掉那个空格即复现 `expected function, found content`）、`one_broken_fragment_does_not_blank_the_batch`、`the_trailing_space_of_a_splice_stays_outside_the_fragment`；`desktop/test_desktop.py` 的 `test_a_fragment_followed_by_a_parenthesis_still_gets_its_image`（真后端 + 真适配器的端到端）、`test_a_fragment_the_renderer_refused_is_retried_after_the_next_edit`、`test_a_cached_fragment_is_black_but_its_exported_svg_keeps_its_colour`。
+
+# 普通输入的分隔符：只有数字连写 · 2026-09-10
+
+针对反馈"依次输入 `-` 和 `>`，源码不是 `$- >$` 而是 `$->$`"。
+
+## 结论：不是输入层加糖，是序列化不加分隔符
+
+普通输入确实是"一个按键一个 `Char` 对象"（`tests/structured_input.rs::ordinary_input_keeps_char_nodes_and_only_maps_single_character_display` 一直在断言这一点）。变的是**写出的源码**：`typst::write_cell` 原来在"相邻两个运算符字符"之间也省略分隔符，于是 `-` `>` 被写成 `->`，而 Typst 把 `->` 读成**一个** token（`MathShorthand`），下一次解析（`analyze_formula`、重新进入公式）就把它变成一个 `Raw` 片段——也就是箭头图像。仅"数字"和"运算符"两类不加分隔符，字母本来就走默认分支，所以 `x` `y` 会写成 `x y`。
+
+## 改动
+
+`write_cell` 的分隔条件收窄为"只对数字连写"：
+
+| 输入 | 改前源码 | 改后源码 | 改后重新解析 |
+| --- | --- | --- | --- |
+| `-` `>` | `$->$` | `$- >$` | `symbol(−) symbol(>)` |
+| `=` `>` | `$=>$` | `$= >$` | `symbol(=) symbol(>)` |
+| `-` `-` `>` | `$-->$` | `$- - >$` | 三个符号 |
+| `<` `=` `>` | `$<=>$` | `$< = >$` | 三个符号 |
+| `.` `.` `.` | `$...$`→`raw(…)` | `$. . .$` | 三个 `char(.)` |
+| `\|` `\|` | `$\|\|$`→`raw(‖)` | `$\| \|$` | 两个 `raw(\|)` |
+| `[` `\|` | `$[\|$`→`raw(⟦)` | `$[ \|$` | `char([) raw(\|)` |
+| `:` `=` | `$:=$`→`raw(≔)` | `$: =$` | `raw(:) symbol(=)` |
+| `<` `-` `>` | `$<->$`→`raw(↔)` | `$< - >$` | 三个符号 |
+| `>` `=` | `$>=$`→`symbol(≥)` | `$> =$` | `symbol(>) symbol(=)` |
+| `1` `.` `5` | `$1.5$` | `$1.5$` | 三个 `char` |
+| `x` `y` | `$x y$` | `$x y$` | 两个 `char` |
+
+`.` 的处理单独收窄：它原先与任何"数字类"字符相连，于是 `...` 仍会合并；现在 `.` 只与相邻数字相连（`1.5`、`.5` 保持一个数字），两个点之间必须分开。
+
+## 为什么必须留分隔符（实测）
+
+用自动页宽（`#set page(width: auto, height: auto, margin: 0pt)`）量 Typst 的排版宽度：
+
+| 源码 | 结果 |
+| --- | --- |
+| `$ab$` / `$xy$` | 编译错误 `unknown variable: ab` / `xy`——连写的字母是一个变量名 |
+| `$a b$` | 10.692 pt |
+| `$12$` 与 `$1 2$` | 均为 11.000 pt（数字连写只影响可读性） |
+| `$1.5$` 与 `$1 . 5$` | 均为 14.058 pt |
+| `$->$` | 11.000 pt（一个箭头字形） |
+| `$- >$` | 20.172 pt（减号与大于号两个关系符） |
+| `$<=$` | 8.558 pt（`≤`） |
+| `$< =$` | 17.116 pt（两个关系符） |
+
+也就是说：分隔符改变的是**语义**，不是排版噪音——这正是本次修复的目的（按下的两个字符就是两个字符），同时也说明 `<=`、`>=`、`!=` 不再自动变成 `≤`、`≥`、`≠`。这类符号仍可由命令输入得到（`\>=` + Enter → `Symbol(name: ">=", glyph: "≥")`，`tests/structured_input.rs::compiler_owns_symbols_shorthands_and_escapes` 覆盖）。
+
+## 本轮实测
+
+| 检查 | 结果 |
+| --- | --- |
+| 离屏真实窗口逐个键入（16 组） | 全部按新规则写出：`- >`、`= >`、`- - >`、`< = >`、`. . .`、`: =`、`< <`、`> >`、`\| \|`、`[ \|`、`< - >`、`~ >`、`> =`；`1.5` 与 `x y` 保持原样 |
+| `cargo test --offline --locked` | 87 通过（新增 1），5 个本机服务集成用例忽略 |
+| `cargo build --release --target wasm32-unknown-unknown --lib` + `web/core.wasm` + `npm run build:vscode` | 通过；`extensions/vscode/media/` 与 `web/` 逐字节一致 |
+| `npm test` | 27 通过 |
+| `cargo test --manifest-path native-adapter/Cargo.toml --target-dir target/adapter` | 19 通过（未改适配器） |
+| `python -m unittest desktop.test_desktop` | 56 通过（离屏，21.7s，重建 release 后端） |
+
+改动文件：`src/typst.rs`（`write_cell`）、`tests/structured_input.rs`（两条旧断言 + 新增 `a_separator_keeps_typed_characters_from_becoming_one_shorthand`）、`tests/source_modes.rs`（一条断言），以及 `web/core.wasm`、`extensions/vscode/media/` 两个构建产物。
+
+

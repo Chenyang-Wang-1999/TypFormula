@@ -324,7 +324,21 @@ class NativeTest(unittest.TestCase):
         with patch.object(mathview,'QSvgRenderer',CountingRenderer):
             painter=QPainter(image);typesetter.paint(painter,box);typesetter.paint(painter,box);painter.end()
         self.assertEqual(len(renders),1);self.assertEqual(len(typesetter.svg),1)
-        self.assertEqual(image.pixelColor(5,5).name(),'#ff0000')
+        self.assertEqual(image.pixelColor(5,5).name(),'#000000')
+
+    def test_a_cached_fragment_is_black_but_its_exported_svg_keeps_its_colour(self):
+        """A document that colours its math must not colour the editor's fragments."""
+        from PyQt5.QtCore import QRectF
+        from .svg import qt_svg
+        import desktop.mathview as mathview
+        svg='<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#ffffff"/>'
+        svg+='<rect width="4" height="4" fill="none"/></svg>'
+        cache=mathview.BitmapCache()
+        image=QImage(8,8,QImage.Format_ARGB32);image.fill(Qt.white)
+        painter=QPainter(image);cache.draw(painter,svg,QRectF(0,0,8,8));painter.end()
+        self.assertEqual(image.pixelColor(6,6).name(),'#000000','a white fragment would be invisible on the light page')
+        self.assertIn(b'fill="none"',qt_svg(svg,True),'a stroke-only shape must stay unfilled')
+        self.assertIn(b'fill="#ffffff"',qt_svg(svg),'export keeps the document colour')
 
     def test_arrows_exit_only_when_internal_movement_is_exhausted(self):
         for key in ('ArrowLeft','ArrowRight','ArrowUp','ArrowDown'):
@@ -587,6 +601,41 @@ class NativeTest(unittest.TestCase):
             window.replace(0,0,'正文 ')
             window.load_raw()
             self.assertEqual(len(requests),2)
+
+    def test_a_fragment_the_renderer_refused_is_retried_after_the_next_edit(self):
+        """A fragment left out of a salvaged batch is about the text, not the session."""
+        window=self.window
+        self.load('$ sum_(n=1)^oo frac(1, n^2) $')
+        nodes=[node for formula in window.analysis['formulas'] for node in window.view_nodes(formula['view']) if node['kind']=='raw']
+        self.assertTrue(nodes)
+        refused=nodes[0];source_id=':'.join(refused['render_id'].split(':')[:2])
+        requests=[]
+        def salvaged(route,body,callback,key=None):
+            requests.append((route,body,key))
+            callback({'items':[],'failed':[source_id]},None)
+        with patch.object(window.services,'request',side_effect=salvaged):
+            window.load_raw()
+            self.assertEqual(len(requests),1)
+            self.assertIs(window.typesetter.cache[('raw',refused['text'])],False)
+            window.load_raw()
+            self.assertEqual(len(requests),1,'the same revision keeps the verdict')
+            window.replace(0,0,'正文 ')
+            window.load_raw()
+            self.assertEqual(len(requests),2,'an edit asks for the refused fragment again')
+
+    def test_a_fragment_followed_by_a_parenthesis_still_gets_its_image(self):
+        """`cal(A)(E)`: the spliced fragment must not be read as a call on code."""
+        window=self.window
+        self.load('正文 $ cal(A)(E) = 0 $ 与 $ dif x $。')
+        window.compile_timer.stop();window.raw_timer.stop()
+        loop=QEventLoop()
+        QTimer.singleShot(200,window.load_raw)
+        QTimer.singleShot(3000,loop.quit)
+        loop.exec_()
+        nodes=[node for formula in window.analysis['formulas'] for node in window.view_nodes(formula['view']) if node['kind']=='raw']
+        self.assertTrue(nodes)
+        drawn=[node['text'] for node in nodes if isinstance(window.typesetter.raw(node),dict)]
+        self.assertEqual(drawn,[node['text'] for node in nodes],'a fragment followed by `(` must keep its image')
 
     def test_fragments_render_even_when_the_document_has_a_later_error(self):
         """The request compiles only as far as the fragments reach, so an error

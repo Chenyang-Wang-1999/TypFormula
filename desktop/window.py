@@ -513,8 +513,9 @@ class Window(QMainWindow):
     def load_raw(self):
         if self.math_state and self.math_state.get('pending'):return
         revision=self.revision;targets={};ranges=[];seen=set();stuck=False;context_end=0
-        # A failed request leaves every fragment it covered without an image. That
-        # verdict belongs to the revision it failed in: the next edit (usually the
+        # A failed request leaves every fragment it covered without an image, and a
+        # fragment the renderer refused leaves that one without an image. Either
+        # verdict belongs to the revision it was made in: the next edit (usually the
         # one that fixes the document) clears it, so one bad compile cannot leave a
         # viewport full of source text for the rest of the session.
         if self.raw_error and self.raw_error[0]!=revision:
@@ -557,7 +558,12 @@ class Window(QMainWindow):
             if error:
                 self.raw_error=(revision,pending);self.report(error)
             else:
-                self.raw_error=None
+                # The renderer leaves out a fragment whose own source cannot
+                # compile instead of failing the batch. That verdict is about the
+                # document text, so the next edit clears it and asks again, the
+                # same way a failed request does.
+                refused={targets[source_id][1] for source_id in (result or {}).get('failed',[]) if source_id in targets}
+                self.raw_error=(revision,refused) if refused else None
                 for item in result.get('items',[]):
                     source_id=':'.join(item['id'].split(':')[:2])
                     if source_id in targets:self.typesetter.cache[targets[source_id][1]]=item

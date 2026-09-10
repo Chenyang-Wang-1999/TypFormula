@@ -581,13 +581,24 @@ fn parse_marker(node: &SyntaxNode) -> MathData {
 pub fn write_cell(data: &MathData) -> String {
     if data.is_empty() { return "\"\"".into(); }
     let mut out = String::new();
+    // A separator is the default between two atoms: the source is re-parsed
+    // whenever the document is analyzed, so characters that would lex as one
+    // token have to be kept apart. Two letters would become one identifier
+    // (`xy`), and two operator characters would become one Typst shorthand --
+    // `->` is an arrow, `||` is `‖`, `...` is `…` -- turning typed characters
+    // into a single uneditable fragment.
     let mut previous_digit = false;
-    let mut previous_operator = false;
+    let mut previous_dot = false;
     for atom in data {
-        let digit = matches!(atom.kind, Kind::Char { value } if value.is_ascii_digit() || value == '.');
-        let operator = matches!(atom.kind,Kind::Char {value} if !value.is_alphanumeric() && !value.is_whitespace());
-        if !out.is_empty() && !(digit && previous_digit || operator && previous_operator) { out.push(' '); }
-        out.push_str(&write_atom(atom)); previous_digit = digit; previous_operator = operator;
+        let value = match atom.kind { Kind::Char { value } => Some(value), _ => None };
+        let digit = value.is_some_and(|value| value.is_ascii_digit());
+        let dot = value == Some('.');
+        // Only a number is written as one run: `12`, `1.5`, `.5`. A dot never
+        // joins another dot, so `...` stays three characters.
+        let number = (digit && (previous_digit || previous_dot)) || (dot && previous_digit);
+        if !out.is_empty() && !number { out.push(' '); }
+        out.push_str(&write_atom(atom));
+        previous_digit = digit; previous_dot = dot;
     }
     out
 }

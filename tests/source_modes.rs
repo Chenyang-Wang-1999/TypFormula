@@ -15,7 +15,9 @@ fn one_fallback_command_has_one_source_and_no_inner_cursor() {
 
 #[test]
 fn special_syntax_keeps_spelling_without_implicit_strings() {
-    let mut e=Editor::default();input(&mut e,">=");assert_eq!(source(&e),">=");
+    // Plain input is one character per key, and the two characters are written
+    // apart: joined, `>=` would be re-read as one shorthand token.
+    let mut e=Editor::default();input(&mut e,">=");assert_eq!(source(&e),"> =");
     for command in ["x >= y", r"\/", "cancel(x >= y)"] {
         let mut e=Editor::default();input(&mut e,&format!("\\{command}"));key(&mut e,"Enter");
         assert_eq!(source(&e),command,"{command}");

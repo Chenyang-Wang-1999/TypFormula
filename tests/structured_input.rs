@@ -34,7 +34,8 @@ fn compiler_owns_symbols_operators_shorthands_and_escapes() {
         raw(&command(s).root[0],s);raw(&load(s).root[0],s);
     }
     let mut e=Editor::default();input(&mut e,">=");assert_eq!(e.root.len(),2);assert!(e.root.iter().all(|a|matches!(a.kind,Kind::Char{..})));
-    assert_eq!(typst::write_cell(&e.root),">=");
+    // One separator: joined, `>=` would lex as a single shorthand token.
+    assert_eq!(typst::write_cell(&e.root),"> =");
 }
 
 #[test]
@@ -42,7 +43,7 @@ fn ordinary_input_keeps_char_nodes_and_only_maps_single_character_display() {
     let mut e=Editor::default();input(&mut e,"<=");let previous=e.root.clone();input(&mut e,"+");
     assert_eq!(e.root.len(),3);assert_eq!(&e.root[..2],previous.as_slice());
     assert!(e.root.iter().all(|a|matches!(a.kind,Kind::Char{..})));
-    assert_eq!(typst::write_cell(&e.root),"<=+");
+    assert_eq!(typst::write_cell(&e.root),"< = +");
     key(&mut e,"Backspace");assert_eq!(e.root,previous);
     let mut e=command("<=");let symbol=e.root[0].clone();input(&mut e,"+");
     assert_eq!(e.root[0],symbol);assert!(matches!(e.root[1].kind,Kind::Char{value:'+'}));
@@ -54,7 +55,29 @@ fn ordinary_input_keeps_char_nodes_and_only_maps_single_character_display() {
     let chars:Vec<_>=response.view.children.iter().filter(|v|v.kind=="char").collect();
     assert_eq!(chars[0].text,"-");assert_eq!(chars[0].display_glyph.as_deref(),Some("−"));
     assert_eq!(chars[1].text,"*");assert_eq!(chars[1].display_glyph.as_deref(),Some("∗"));
-    assert_eq!(e.root,root);assert_eq!(typst::write_cell(&e.root),"-*");
+    assert_eq!(e.root,root);assert_eq!(typst::write_cell(&e.root),"- *");
+}
+
+#[test]
+fn a_separator_keeps_typed_characters_from_becoming_one_shorthand() {
+    // Without the separator, `- >` would be written as `->` and re-read as the
+    // arrow shorthand, so the two typed characters would come back as one Raw.
+    // The same holds for `||` (`‖`), `...` (`…`), `:=` (`≔`) and `<=`.
+    for (typed,written) in [("->","- >"),("||","| |"),("...",". . ."),(":=",": ="),("<=","< =")] {
+        let mut e=Editor::default();input(&mut e,typed);
+        assert!(e.root.iter().all(|a|matches!(a.kind,Kind::Char{..})),"{typed}: {:?}",e.root);
+        assert_eq!(typst::write_cell(&e.root),written,"{typed}");
+        let reparsed=load(&written);
+        assert_eq!(reparsed.root.len(),e.root.len(),"{written} must stay separate atoms");
+        assert_eq!(typst::write_cell(&reparsed.root),written,"{written} must be stable");
+    }
+    // Digits are the one run written together, and they lex back into the same
+    // characters. A dot joins a neighbouring digit, never another dot.
+    for (typed,written) in [("12.5","12.5"),(".5",".5"),("1..2","1. .2")] {
+        let mut e=Editor::default();input(&mut e,typed);
+        assert_eq!(typst::write_cell(&e.root),written,"{typed}");
+    }
+    assert_eq!(load("12.5").root,{let mut e=Editor::default();input(&mut e,"12.5");e.root});
 }
 
 #[test]

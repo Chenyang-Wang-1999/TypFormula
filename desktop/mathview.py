@@ -13,7 +13,11 @@ OBJECT = QTextFormat.UserObject + 1
 OBJECT_ID = QTextFormat.UserProperty + 1
 
 class BitmapCache:
-    """Bounded device-pixel cache; SVG paths are interpreted only once."""
+    """Bounded device-pixel cache; SVG paths are interpreted only once.
+
+    Every fragment is rasterized in black: the cached image is editor text, and
+    the document a fragment was cut out of may have coloured it.
+    """
     def __init__(self,limit=64*1024*1024):self.limit=limit;self.size=0;self.entries=OrderedDict()
     def clear(self):self.entries.clear();self.size=0
     def __len__(self):return len(self.entries)
@@ -25,7 +29,7 @@ class BitmapCache:
         record=self.entries.pop(key,None)
         if record is None:
             image=QImage(width,height,QImage.Format_ARGB32_Premultiplied);image.fill(Qt.transparent)
-            renderer=QSvgRenderer(qt_svg(svg));paint=QPainter(image);renderer.render(paint,QRectF(0,0,width,height));paint.end()
+            renderer=QSvgRenderer(qt_svg(svg,True));paint=QPainter(image);renderer.render(paint,QRectF(0,0,width,height));paint.end()
             pixmap=QPixmap.fromImage(image);cost=width*height*4
             while self.entries and self.size+cost>self.limit:
                 _,(_,removed)=self.entries.popitem(last=False);self.size-=removed

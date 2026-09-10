@@ -6,11 +6,13 @@
 
 Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`，使用 Typst 增量解析器返回的实际重解析范围；桌面公式索引只扫描更新后的轻量语法节点，平移范围外已有投影，只为重解析范围相交的新建/改变公式构造 View。`let` 变化会使其后的宏投影失效。合并时只重建真正移动的节点：编辑点之前的公式与未移动的子树与上一份投影共享，因此每次按键不再深拷贝全部公式。载入文件和 `analyze_formula` 不可用时的回退仍走一次全量 `analyze`，即完整投影；上面描述的增量只覆盖编辑路径。此策略沿用 Typst 保持远处 span 稳定的增量解析边界，而不是按输入字符猜测影响范围。参见 [Typst 编译器架构](https://github.com/typst/typst/blob/main/docs/dev/architecture.md) 与 [comemo](https://github.com/typst/comemo)。
 
-公式排版结果按视图缓存：`FormulaObject.box` 为每个视图保留一份 Box，Qt 在一次布局/绘制周期内对同一公式的 `intrinsicSize` 与 `drawObject` 调用因此只排版一次，鼠标命中判定复用同一结果。Raw SVG 或附件位置变化（`Typesetter.touch`）以及编辑字号、SVG 倍率、`math_font` 变化时缓存失效。
+公式排版结果按视图缓存：`FormulaObject.box` 为每个视图保留一份 Box，Qt 在一次布局/绘制周期内对同一公式的 `intrinsicSize` 与 `drawObject` 调用因此只排版一次，鼠标命中判定复用同一结果。Raw SVG 或附件位置变化（`Typesetter.touch`）以及编辑字号、SVG 倍率、`math_font` 变化时缓存失效。片段位图一律按**黑色**栅格化（`desktop/svg.py` 的单色转换只在编辑器缓存这条路上启用）：片段是从文档里切出来的图，文档可能把数学排成白色，浅色编辑区上就看不见了；导出路径仍用原始 SVG。
 
 公式字体分两件事：**结构行度量**（em、基线、下降部）取编辑器正文字体，**字形**取数学字体。`desktop/mathfont.py` 注册随附字体并读回 Qt 报告的真实家族名，只在已安装的家族里解析设置里的 `math_font`；名字不存在时退回随附数学字体而不是交给 `QFont`，因为 Qt 的替换是静默的，随后逐字回退又会把多个设计混进同一个公式。数学字体本身不能提供行度量：`NewComputerModern Math` 必须容纳四层高的定界符，12pt 下报告 `ascent=99`、`height=185`，直接当行高会得到几乎空白的巨框。数学变量的字形来自 Unicode 数学斜体区间（`a→𝑎`、`h→ℎ`），与编译结果同一套字形；文本单元保持直立。
 
 每个 Raw 片段的源码区间由 `Document::annotate` 给出，它是"片段图像"与"源码"之间唯一的连接：桌面端与 Web 端都用 `render.raw` 的区间请求 Typst。规范序列化只用于估算位置——它补空格、把 `a/b` 写成 `frac(a, b)`——最终以"该区间里恰好是这段文本"为准，所以按自己习惯书写的公式同样出图。区间无法确定的片段退回源码显示并标出，核心允许左右键进入它的源码（`failed_previews` + `Action::PreviewResults`），这是它唯一的修复入口。
+
+规范序列化（`typst::write_cell`）在每两个原子之间**默认写一个分隔符**，只有数字连写例外：`12`、`1.5`、`.5` 不加，`.` 只与相邻数字相连（所以 `...` 是三个点）。原因是写出的源码会被重新解析，而 Typst 会把连写的字符当成一个整体：`xy` 是变量名（实测 `$ab$` 直接报 `unknown variable: ab`），`->` 是箭头、`||` 是 `‖`、`[|` 是 `⟦`、`...` 是 `…`。少一个分隔符，用户按下的两个字符就会在离开公式后变成一个不可再拆的 Raw 片段；`tests/structured_input.rs::a_separator_keeps_typed_characters_from_becoming_one_shorthand` 守着这条规则。数字是唯一允许连写的例外，因为 `$12$` 与 `$1 2$`、`$1.5$` 与 `$1 . 5$` 排版宽度实测完全相同，连写只影响可读性。代价是两个按键连写出的 `<=`、`>=`、`!=` 不再合并成 `≤`、`≥`、`≠`：这类符号改用命令输入（`\>=` 回车）得到。
 
 派生数据同样按视图缓存，避免每个编辑周期重算整篇：附件请求表 `Window.attachment_nodes` 记住每个视图的「定义前缀 + 表达式 + 显示模式」，`Window.visible_formula_starts` 先把各编辑器的公式对象按公式起点分组，再做可见性判断，因此 `load_raw` 是"对象数 + 公式数"而不是两者相乘。语义高亮的 span 每次回复都会整体替换，所以那一侧不缓存，改为每个视图复用同一 `QTextCharFormat`，并且只为可见视图构建（源码 dock 默认隐藏，展开时经 `visibilityChanged` 立即着色）。
 
@@ -57,6 +59,8 @@ Web 版显示设置由 `web/typography.js` 管理。Ctrl+滚轮及工具栏只�
 在数学 IR 解析 Raw 标记的边界，使用传入 StyleChain 临时以 MathSize::Text 解析 TextElem::size，只排除上下标字号因子；不修改排版所用样式。此时读取的环境字号不受 Raw 内部显式 text 样式影响，局部环境的绝对／相对字号仍被保留。基准值放入编辑器私有 frame 标签的 `:base-font-pt:` 后缀，沿现有透明标签桥传至 SVG 提取，不新增布局盒子。源码中的标签不变。
 
 返回字段中，`environment_font_size_pt` 是实际环境字号；`base_font_size_pt`、`base_font_height_pt`、`base_font_baseline_pt` 分别为原始宽／高／基线除以环境字号。按用户指定的兼容命名，这三个 `_pt` 字段实际是无量纲比值。前端用 `编辑字号(px) × 对应比值 × 微调` 得到像素尺寸；Raw 内部的上下标和显式局部放大仍体现在 SVG 中。
+
+片段是被插入源码再编译的（`native-adapter/src/render.rs` 的 `#[${片段}$<标签>]`），所以拼接本身要保证不影响编译：替换文本末尾必须留一个空格。`#[...]` 是嵌入的代码表达式，代码解析器把紧跟其后的 `(`／`[` 当作对它的调用（`directly_at(LeftParen)`），于是 `cal(A)(E)` 这种写法会被读成"调用 content"并让整篇报 `expected function, found content`。空格落在方括号之外，片段自己那个公式（以及取出的图）不受影响。整批编译失败时后端**分半重试**（上限 24 次），只把单独编译不出来的片段 id 放进响应的 `failed` 字段，其余片段照常返回；所有子批都失败则仍旧返回错误，因为那说明问题在共享上下文而不是某个片段。`failed` 与"整批失败"在桌面端同义：记在当前 `revision` 上，下一次编辑清掉并重试。
 
 Raw 缓存按进入会话和出现位置区分，不再让相同源码的不同出现位置共用首个 SVG。静态公式投影的缓存键也包含文件和环境前缀。不同位置可以保留各自的原始尺寸及归一化分母；已有成功结果在当前会话内仍沿用按需刷新策略。
 
