@@ -76,11 +76,19 @@ fn a_radical_walks_its_two_cells_and_then_leaves() {
     // `horizontal: Pair`: the two cells are reachable from each other, but a
     // move first traverses whatever the current cell already holds, so the walk
     // is: degree, its content, back to the radicand, its content, then out.
+    //
+    // The degree is the digit `3`, and a number run is a container with one cell
+    // (`Kind::Number`, like a text run), so its own content is walked too: in at
+    // its first position, out at its last, and only then on to the radicand.
     let mut editor = load("root(3, x)");
     key(&mut editor, "ArrowRight");
     assert_eq!(caret(&editor), (vec![1], 0), "先到根指数");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![1], 1), "走完根指数的内容");
+    assert_eq!(caret(&editor), (vec![1, 0], 0), "再进数字串的首位");
+    key(&mut editor, "ArrowRight");
+    assert_eq!(caret(&editor), (vec![1, 0], 1), "走完数字串的内容");
+    key(&mut editor, "ArrowRight");
+    assert_eq!(caret(&editor), (vec![1], 1), "出数字串，停在根指数格尾");
     key(&mut editor, "ArrowRight");
     assert_eq!(caret(&editor), (vec![0], 0), "再从根指数折回被开方式");
     key(&mut editor, "ArrowRight");
@@ -124,12 +132,22 @@ fn a_matrix_walks_by_row_and_column_without_crossing_a_column() {
     key(&mut editor, "ArrowUp");
     assert_eq!(caret(&editor).0, vec![0], "上键回到原格");
     // A move traverses the current cell's content first, then crosses a column.
+    // The cell holds the number run `1`, which is a container of its own, so both
+    // of its positions are walked before the column boundary is even reached.
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![0], 1), "先走完本格内容");
+    assert_eq!(caret(&editor), (vec![0, 0], 0), "先进数字串");
+    key(&mut editor, "ArrowRight");
+    assert_eq!(caret(&editor), (vec![0, 0], 1), "走完数字串");
+    key(&mut editor, "ArrowRight");
+    assert_eq!(caret(&editor), (vec![0], 1), "出数字串，走完本格内容");
     key(&mut editor, "ArrowRight");
     assert_eq!(caret(&editor), (vec![1], 0), "列内右移到本行末列");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![1], 1), "走完末列内容");
+    assert_eq!(caret(&editor), (vec![1, 0], 0), "末列的内容也是数字串");
+    key(&mut editor, "ArrowRight");
+    assert_eq!(caret(&editor), (vec![1, 0], 1), "走完数字串");
+    key(&mut editor, "ArrowRight");
+    assert_eq!(caret(&editor), (vec![1], 1), "出数字串，走完末列内容");
     key(&mut editor, "ArrowRight");
     // `horizontal: Column`: the caret must not step from the first row's last
     // column into the second row's first column.

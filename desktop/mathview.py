@@ -59,7 +59,7 @@ class Typesetter:
     # set has a branch in `layout`. A name outside it is a frontend/backend
     # mismatch, not a node to guess at.
     ARRANGEMENTS = frozenset({
-        "char", "symbol", "raw", "text", "unknown", "parameter",
+        "char", "symbol", "number", "raw", "text", "unknown", "parameter",
         "draft-text", "draft-placeholder", "draft-caret", "absent", "stop",
         "cell", "empty-cell", "fraction", "sqrt", "root", "script",
         "grid", "aligned", "delim", "decoration",

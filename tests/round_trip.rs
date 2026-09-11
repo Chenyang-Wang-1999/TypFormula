@@ -16,8 +16,8 @@
 //! * `Unknown` 承载半打完的命令草稿，是纯编辑器状态，没有 Typst 拼写：
 //!   `fra` 不是一个公式。
 //!
-//! 即"可往返的 Kind"共 13 个：Char, Symbol, Raw, MacroCall, Text, Frac, Sqrt,
-//! Root, Script, Delim, Grid, Aligned, Decoration。
+//! 即"可往返的 Kind"共 14 个：Char, Symbol, Number, Raw, MacroCall, Text,
+//! Fraction, Sqrt, Root, Scripts, Fenced, Table, Multiline, Decoration。
 
 use visual_typst_core::{Action, Editor, typst};
 
@@ -49,7 +49,16 @@ fn round_trips(source: &str) {
 fn char_atoms_round_trip() {
     // 写回时必须插入分隔符，否则两个字符会连成一个记号；分隔符本身也必须
     // 读回来还是两个字符（见 structured_input.rs 的同名用例）。
-    for source in ["x", "1", "123", "1.5", "+", "-", "x y", "- >", "| |", ". . ."] {
+    for source in ["x", "+", "-", "x y", "> =", "- >", "| |", ". . ."] {
+        round_trips(source);
+    }
+}
+
+#[test]
+fn number_atoms_round_trip() {
+    // 数字串按引擎的规则（全 ASCII 数字、至多一个点、至少一个数字）收成一个
+    // 原子，写回时原样写出，所以这里也必须是逐字节往返。
+    for source in ["1", "123", "1.5", "0.5", "123.456", "1.2.3", ".5", "1."] {
         round_trips(source);
     }
 }

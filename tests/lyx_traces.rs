@@ -71,7 +71,10 @@ fn selected_text_goes_into_script_not_base() {
 #[test]
 fn root_cell_zero_is_nucleus_and_index_is_one() {
     let mut e = Editor::default(); insert(&mut e,"root"); assert_eq!(e.cursor.slices[0].cell,1);
-    input(&mut e,"3"); key(&mut e,"ArrowRight"); assert_eq!(e.cursor.slices[0].cell,0); input(&mut e,"x");
+    // The `3` is a number run, so leaving the index cell takes two moves: one out
+    // of the run and one across the pair.
+    input(&mut e,"3"); key(&mut e,"ArrowRight"); key(&mut e,"ArrowRight");
+    assert_eq!(e.cursor.slices[0].cell,0); input(&mut e,"x");
     assert_eq!(source(&e),"root(3, x)");
     let parsed = load(&source(&e)); assert_eq!(parsed.root,e.root);
 }

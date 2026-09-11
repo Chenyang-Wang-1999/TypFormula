@@ -17,6 +17,29 @@ pub fn is_operator(ch: char) -> bool { "+-=<>!*:|~".contains(ch) }
 /// exist — that dependence is what `cell_1_is_up` used to encode.
 pub const fn script_cell(up: bool) -> usize { if up { 1 } else { 2 } }
 
+/// Whether a run of characters is one `Kind::Number`.
+///
+/// This is the engine's rule, not the lexer's, and the two differ on purpose:
+///
+/// * the lexer starts a run at any `char::is_numeric` and takes one tentatively
+///   eaten dot (`Lexer::math_text`), so `²3` is one token;
+/// * `resolve_text` turns a text run into a `NumberItem` only when every
+///   character is an ASCII digit or a dot, there is at most one dot, and there is
+///   at least one digit (`resolve.rs:302-308`).
+///
+/// Following the engine is what keeps this kind 1:1 with `MathKind::Number`:
+/// `²3` lexes as one run but resolves to a `TextItem`, so it must not become a
+/// `Number` here.
+pub fn is_number(text: &str) -> bool {
+    let mut digits = 0;
+    let mut dots = 0;
+    for value in text.chars() {
+        if value == '.' { dots += 1; }
+        else if value.is_ascii_digit() { digits += 1; }
+        else { return false; }    }
+    digits > 0 && dots <= 1
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MathAtom {
     pub kind: Kind,
@@ -44,6 +67,13 @@ pub struct MathAtom {
 pub enum Kind {
     Char { value: char },
     Symbol { name: String, glyph: String },
+    /// A run of digits with at most one dot: Typst's `Number`.
+    ///
+    /// One cell holding the run's characters, the way `Text` holds a string's.
+    /// The caret can sit *between* the digits, which a leaf could not express, and
+    /// the writer writes the cell as one piece — a separator inside a run would
+    /// split it into several numbers (`math::is_number` decides what a run is).
+    Number,
     Raw { source: String },
     MacroCall { name: String, function: bool },
     // Template-only edge to an earlier definition version in the registry.
@@ -66,6 +96,10 @@ pub enum Kind {
 
 impl MathAtom {
     pub fn character(value: char) -> Self { Self { kind: Kind::Char { value }, cells: vec![] } }
+    /// One run of digits, from its spelling. `is_number` decides what may be a run.
+    pub fn number(text: &str) -> Self {
+        Self { kind: Kind::Number, cells: vec![text.chars().map(MathAtom::character).collect()] }
+    }
     pub fn raw(source: impl Into<String>) -> Self { Self { kind: Kind::Raw { source: source.into() }, cells: vec![] } }
     pub fn from_source(source: impl Into<String>) -> Self {
         let source = source.into();
@@ -173,3 +207,23 @@ pub fn symbol(name: &str) -> Option<&'static str> {
         .ok().map(|i| configured::SYMBOLS[i].1)
 }
 pub const COMMANDS: &[&str] = &["frac", "sqrt", "root", "mat", "abs", "norm", "overline", "underline", "hat", "vec"];
+
+#[cfg(test)]
+mod tests {
+    use super::is_number;
+
+    /// `is_number` has to be pinned directly, because round-tripping cannot see a
+    /// wrong rule: the writer spells a `Number` as its own text and the parser
+    /// applies the same rule, so a `Number(".5")` no one should have built still
+    /// reads back perfectly. The rule's source is the engine, not us, so the test
+    /// states the engine's rule.
+    #[test]
+    fn only_ascii_digits_with_at_most_one_dot_are_a_number() {
+        for text in ["1", "12", "123", "1.5", "0.", ".5", "123.456"] {
+            assert!(is_number(text), "{text} 应当是 Number");
+        }
+        for text in ["", ".", "..", "1.2.3", "²3", "٣", "1e3", "x", "-1", "1 2", "1.5.6"] {
+            assert!(!is_number(text), "{text} 不应当是 Number");
+        }
+    }
+}

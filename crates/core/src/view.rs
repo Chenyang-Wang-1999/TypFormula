@@ -164,6 +164,9 @@ impl Editor {
                 view
             }
             Kind::Symbol { glyph, .. } => View::new(view_kind, glyph, vec![]),
+            // One cell holding the run's characters, like a text run: the frontend
+            // draws the cell and the caret can sit between the digits.
+            Kind::Number => View::new(view_kind, "", children),
             Kind::Raw { source } => {
                 let mut view = View::new(view_kind, source, vec![]);
                 view.edit = path.map(|path| Cursor {slices:path.to_vec(),pos,occurrence:format!("{occurrence}.edit")});

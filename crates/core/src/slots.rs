@@ -142,6 +142,11 @@ pub enum Write {
     OwnText,
     /// One cell's characters, quoted (`Text`).
     Quoted,
+    /// One cell's characters with no separator between them (`Number`).
+    ///
+    /// A separator is what `write_cell` puts between two atoms, and inside a run it
+    /// would split the run: `1 2 3` is three numbers to the lexer, `123` is one.
+    Run,
     /// A base with optional `^(…)` and `_(…)` (`Script`).
     Attach,
     /// `abs(…)`/`norm(…)` for those two pairs, the literal pair otherwise (`Fenced`).
@@ -215,12 +220,12 @@ const ROOT: &[Slot] = &[Slot::full(Role::Radicand), Slot::scaled(Role::Index, 55
 const ATTACH: &[Slot] = &[Slot::full(Role::Base), Slot::blank(Role::Upper, 700), Slot::blank(Role::Lower, 700)];
 
 // The `typst` lists of the table below, named for the same reason.
-/// A single character. `Number` is the run of digits Typst lexes into one item;
-/// the editor keeps it as one `Char` per digit and writes the run back in one
-/// piece (`write_cell`).
-const K_CHAR: &[&str] = &["Glyph", "Number"];
-/// A named symbol resolves to a glyph too, but never to a number.
-const K_SYMBOL: &[&str] = &["Glyph"];
+/// A single character, and a named symbol: both resolve to a glyph, which is why
+/// they share one `MathKind` rather than one having no counterpart.
+const K_GLYPH: &[&str] = &["Glyph"];
+/// A run of digits with at most one dot (`math::is_number`). The lexer keeps such
+/// a run in one token, so the editor keeps it in one atom.
+const K_NUMBER: &[&str] = &["Number"];
 /// Source text the editor does not model: a code expression is a `Box`, a
 /// `mathml` element is `Mathml`, and anything else the equation carries (a
 /// linebreak, for instance) is `External`.
@@ -296,12 +301,19 @@ impl Kind {
             // Leaves: no cells of their own, so nothing to enter or walk. Each is
             // spelled by its own stored text but shows up under its own view.
             Kind::Char { .. } => Decl {
-                view: "char", typst: K_CHAR, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
+                view: "char", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
                 horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::OwnText,
             },
             Kind::Symbol { .. } => Decl {
-                view: "symbol", typst: K_SYMBOL, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
+                view: "symbol", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
                 horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::OwnText,
+            },
+            // A number is a run of digits in one cell, like a text run: the caret
+            // can sit between the digits, and the cell is written as one piece so
+            // the run stays one token.
+            Kind::Number => Decl {
+                view: "number", typst: K_NUMBER, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
+                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::Run,
             },
             // Whatever the editor does not model structurally is one opaque
             // fragment of Typst source, whichever MathKind it resolves into.
@@ -415,6 +427,7 @@ mod tests {
         vec![
             ("Char", Kind::Char { value: 'x' }, 0),
             ("Symbol", Kind::Symbol { name: "arrow".into(), glyph: "→".into() }, 0),
+            ("Number", Kind::Number, 1),
             ("Raw", Kind::Raw { source: "dif".into() }, 0),
             ("Unknown", Kind::Unknown { name: "fra".into(), saved: MathData::new(), caret: 3, anchor: None, original: None }, 0),
             ("Parameter", Kind::Parameter { index: 0 }, 0),
@@ -436,7 +449,7 @@ mod tests {
     fn every_kind_has_a_representative_here() {
         // `Kind::decl` makes a new kind fail to compile; this count is what
         // makes a new kind fail to be *covered* by this file.
-        assert_eq!(representatives().len(), 16, "新增 Kind 后请在这里补一条代表实例");
+        assert_eq!(representatives().len(), 17, "新增 Kind 后请在这里补一条代表实例");
     }
 
     #[test]
@@ -529,6 +542,7 @@ mod tests {
                 Write::Marker => matches!(kind, Kind::Parameter { .. }),
                 Write::TemplateOnly => matches!(kind, Kind::TemplateCall { .. }),
                 Write::Quoted => matches!(kind, Kind::Text),
+                Write::Run => matches!(kind, Kind::Number),
                 Write::Attach => matches!(kind, Kind::Scripts),
                 Write::Delimited => matches!(kind, Kind::Fenced { .. }),
                 Write::Matrix => matches!(kind, Kind::Table { .. }),

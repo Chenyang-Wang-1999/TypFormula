@@ -1165,6 +1165,104 @@ error[E0432]: unresolved import `visual_typst`
 
 改动文件：新增 `crates/core/`（`Cargo.toml`、`build.rs`、`src/lib.rs`，以及搬入的 `math.rs`/`slots.rs`/`typst.rs`/`cursor.rs`/`view.rs`）、`tools/kind_inventory.py`、`tools/engine_boxes.py`、`docs/kind-inventory.md`；改 `Cargo.toml`、`Cargo.lock`、`src/lib.rs`、`src/main.rs`、`src/document.rs`、`src/desktop.rs`、`src/services.rs`、`tests/{desktop,document,macro_scope,services,workspace}.rs`、`docs/{architecture,kind-inventory,rust-book-walkthrough}.md`。
 
+## `Kind::Number`：数字串成为一个原子 · 2026-09-11
+
+### 先确认的事实
+
+**一个 `Number` 至多一个点号**，两条独立规则各自保证：
+
+- 词法（`lexer.rs:789-807`）从数字开头只**试探性**吃一个点，且点后必须还有数字才留下，所以 `1.2.3` 词法上是三个节点；
+- 解算（`resolve.rs:302-308`）要求 `decimal_count <= 1`、至少一个数字、且每个字符都是 ASCII 数字或点。
+
+两处对"数字"的定义**并不一致**，这一点决定了实现：`MathTextKind::get`（`ast.rs:917-926`）用 `char::is_numeric()`，`resolve_text` 用 `is_ascii_digit()`。反例 `²3`：词法收成一个 token 且 `MathTextKind` 说是 Number，引擎却把它做成 `Text`。所以 `Kind::Number` 的判定照**解算**那条写（`math::is_number`），才能与 `MathKind::Number` 保持 1:1。
+
+### 改了什么
+
+| 位置 | 改动 |
+| --- | --- |
+| `math.rs` | 新增 `Kind::Number { text }`、`MathAtom::number`、`is_number`（引擎规则） |
+| `slots.rs` | 表里加一条声明：叶子、`view: "number"`、`typst: ["Number"]`、`Write::OwnText`、class 0；`Char` 不再认领 `Number`（现在它只认领 `Glyph`） |
+| `typst.rs` | 解析：`MathText` 节点先试 `is_number`，命中则整串一个原子；写回：`write_cell` 的 `previous_digit`/`previous_dot` 状态机**整块删除**，只剩"每两个原子之间一个分隔符" |
+| `cursor.rs` | 新增 `insert_digit`：数字并入**左边**的 `Number`，没有则新建一个单数字的 `Number` |
+| `view.rs` | `Number` 节点把整串放在 `text` |
+| `desktop/mathview.py` | `ARRANGEMENTS` 加 `number`（通用叶子分支已经会把它画成一个文本 run，无需新分支） |
+
+按定好的行为：普通模式 `.` 走普通字符，所以 `123<光标>456` 输入 `.` 得到源码 `123 . 456`；数字并入左边的串是无条件的，所以 `123.456<光标>` 输入 `7` 得到 `123.4567`；命令模式走解析器，`\123.456` 回车就是一个 `Number`。
+
+### 一行偏离原话的实现（已按你的方案改成容器）
+
+第一版把数字串做成了**叶子**（一个原子带一段文本），于是"并入右边"做不到：原子内部没有光标位置，把 `9` 并到右边 `456` 的前面得到 `Number(9456)`，光标却停在原子之前，下一个 `8` 会继续往前插，`9` `8` 敲出 `89456`。当时只能"只并左边 + 新建原子"，并把偏离写进报告。
+
+**你给出的方案是正解**：数字用和 `Text` 一样的光标处理（一个格，里面逐字是 `Char`），但不继承 text 困住左右键的那部分。改成容器后：
+
+- `12|34` 插入 `9` 得到 `12934`——叶子模型下**根本做不到**（光标进不去串内部）；
+- `|456` 输入 `9` `8` 得到 `98456`，光标停在 `9` 与 `4` 之间，"并入右边"自然成立；
+- 左右键在串的两端**走出去**（text 在两端是 `return`，见 `cursor.rs` 的按键分支）。
+
+### 字符规则与按键规则分别对齐
+
+| | 字符（`interpret_char`） | 按键（`key`） |
+| --- | --- | --- |
+| `Text` | 一律插成 `Char`，不走 `/`、`^`、`_`、`\` | 两端**吞掉**左右键，`ArrowUp/Down`/`Tab` 也吞 |
+| `Number` | 数字插成 `Char`；**其它字符先在光标处把串断成两半**，再按普通字符在该处处理 | **不吞**，两端走出去（`pop`），`Tab` 也照常离开 |
+
+"非数字断串"是为了保住不变式：串里只能有数字，否则写回时不加分隔符的 `12x` 会被词法读成一个标识符。断串同时保住了光标位置，并且让 `/`、`^`、`"` 在断点处保持原意（`12|34` 打 `/` 得到 `frac(12, "") 34`，和任意两个原子之间打 `/` 完全一致）。
+
+两条删除路径也顺手对齐了：删掉最后一个数字时，空串会被**移除**而不是写成空原子（空串写出来是一个孤立的分隔符，读回就是另一棵树）；而在串**开头**按退格走的是 LyX 的 pullArg 规则（容器解散、内容留下），数字因此变成散字符——渲染完全相同（`1 2 3` 实测与 `123` 同宽），下次解析又成串。
+
+### 验证（容器模型，真实后端 + 源码层）
+
+| 操作 | 源码 |
+| --- | --- |
+| `123<光标>456` 输入 `.` | `$123 . 456$` |
+| `123<光标>456` 输入 `9` | `$1239 456$` |
+| `<光标>456` 输入 `9` `8` | `$98456$` |
+| `12<光标>34`（串内）输入 `9` | `$12934$` |
+| `12<光标>34`（串内）输入 `x` | `$12 x 34$` |
+| `123.456<光标>` 输入 `7` | `$123.4567$` |
+| `\123.456` 回车 | `$123.456 x$` |
+
+### 有意保留的不对称
+
+读进来的 `12.5` 是一个 `Number`（格内 `1`、`2`、`.`、`5`）；逐键敲出的 `12.5` 是 `Number(12) Char(.) Number(5)`，写出 `12 . 5`。四种写法两两实测渲染完全相同：
+
+| 写法对 | 实测（24pt，真实适配器） |
+| --- | --- |
+| `1.5` / `1 . 5` | 30.672 × 16.512 |
+| `.5` / `. 5` | 18.672 × 16.512 |
+| `12` / `1 2` | 24.0 × 15.984 |
+| `98456` / `98 456` | 60.0 × 16.776 |
+
+旧的"数字是连写例外"这条规则本来只影响 token 身份、不影响渲染，现在连同它一起消失：`write_cell` 没有例外分支了，`docs/architecture.md` 里那段说明也重写了。`tests/structured_input.rs::a_separator_keeps_typed_characters_from_becoming_one_shorthand` 按新行为更新（`("12.5","12 . 5")`、`(".5",". 5")`、`("1..2","1 . . 2")`），并且多断言一条更强的不变式：**写出的串必须读回成写出它的那棵树**。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **125 通过 / 5 忽略** |
+| `python -m unittest desktop.test_desktop` | **73 通过** |
+| `python tools/kind_inventory.py` | `Number`：`number` → `cell@inner` → 逐字 `char` |
+| `python tools/engine_boxes.py` | 上表四对写法 |
+
+### 容器化连带改到的三条导航用例（都是预期的）
+
+数字串多了一层，光标要多走一步，三条钉住导航的用例按实际更新并写了原因：`caret_navigation.rs` 的根式与矩阵两条（`root(3, x)` 的度数、`mat(1, 2; 3, 4)` 的格内容都会先进串再出来）、`lyx_traces.rs::root_cell_zero_is_nucleus_and_index_is_one`（从根指数回到被开方式要多一次右移）。这不是回归，是容器模型的可观察结果。
+
+### 新用例的牙齿（五次变异）
+
+| 变异 | 结果 |
+| --- | --- |
+| 去掉 `is_number` 的 `dots <= 1` | 失败：`1.2.3 不应当是 Number` |
+| `is_ascii_digit` 改成 `is_numeric` | 失败：`²3 不应当是 Number` |
+| 关掉 `insert_digit` 的并入分支 | 失败：`a_typed_digit_joins_the_number_run_beside_it` |
+| 前端 `ARRANGEMENTS` 去掉 `number` | 失败：报出未认领排布 |
+| `dissolve_empty_run` 去掉 | 失败：`the_caret_goes_inside_a_number_run`（删掉最后一个数字后写出 `""`） |
+
+**第一次变异检查是"假通过"的**：去掉 `dots <= 1` 之后全套仍然绿。原因是往返自洽——写回把串原样写出、解析用同一条（错的）规则读回。真正的判据是**与引擎一致**，而引擎规则里"至多一个点"那一半从解析路径**根本到不了**（词法不会给出含两个点的 token），所以它只能被**直接**钉住：`math.rs` 新增单元测试 `only_ascii_digits_with_at_most_one_dot_are_a_number`，把规则的两半都写死。这件事值得记下来：**当一个规则来自外部（引擎）而不是自己的约定时，往返测试看不见它。**
+
+改动文件：`crates/core/src/{math,slots,typst,cursor,view}.rs`、`tests/{structured_input,round_trip,caret_navigation,lyx_traces}.rs`、`desktop/{mathview,test_desktop}.py`、`tools/kind_inventory.py`、`docs/{architecture,kind-inventory,validation}.md`。
+
+
 
 
 

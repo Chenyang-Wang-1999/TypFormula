@@ -24,6 +24,7 @@ BACKEND = ROOT / "target/server/release/visual-typst.exe"
 CASES = [
     ("Char", "$x$", []),
     ("Symbol", "$alpha$", []),
+    ("Number", "$12.5$", []),
     ("Raw", "$arrow.r$", []),
     ("Unknown", "$x$", [("input", {"text": "\\"})]),
     ("Text", '$"txt"$', []),
@@ -51,7 +52,7 @@ WIRE = ["kind", "role", "text", "display_glyph", "columns", "attachment", "edit"
         "definitions", "origin", "source_range", "active", "selected"]
 
 # Views that belong to a node kind (`slots::Decl::view`), for the summary.
-VIEW_KINDS = ["char", "symbol", "raw", "unknown", "text", "macro", "macro-collapsed",
+VIEW_KINDS = ["char", "symbol", "number", "raw", "unknown", "text", "macro", "macro-collapsed",
               "macro-argument", "template-call", "parameter", "fraction", "sqrt", "root",
               "script", "delim", "grid", "aligned", "decoration", "absent"]
 

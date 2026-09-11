@@ -160,6 +160,28 @@ class NativeTest(unittest.TestCase):
         self.assertAlmostEqual(direct.height,reordered.height)
         self.assertAlmostEqual(direct.baseline,reordered.baseline)
 
+    def test_a_number_run_is_a_container_with_a_known_arrangement(self):
+        """A run keeps its digits in one cell, so the caret can sit between them.
+
+        One `number` node is one `MathKind::Number`, which is what lets the writer
+        spell `12.5` as a single token; the cell inside it is what the caret walks.
+        The arrangement must be one this frontend knows, or every formula with a
+        plain number would report itself as a frontend/backend mismatch.
+        """
+        self.load("$12.5$")
+        view=self.window.analysis['formulas'][0]['view']
+        numbers=[node for node in self.window.view_nodes(view) if node['kind']=='number']
+        self.assertEqual(len(numbers),1)
+        self.assertEqual(numbers[0]['text'],'')
+        cell=numbers[0]['children'][0]
+        self.assertEqual(cell['role'],'inner')
+        self.assertEqual([child['text'] for child in cell['children'] if child['kind']=='char'],list('12.5'))
+        self.window.typesetter.unknown.clear()
+        box=self.window.typesetter.layout(view)
+        self.assertEqual(self.window.typesetter.unknown,set())
+        runs=[value[0] for kind,_,_,value in box.operations if kind=='text']
+        self.assertEqual(runs,list('12.5'))
+
     def service(self,route,body,client=None):
         result=[];loop=QEventLoop();timer=QTimer();timer.setSingleShot(True);timer.timeout.connect(loop.quit)
         def receive(value,error):result.append((value,error));loop.quit()

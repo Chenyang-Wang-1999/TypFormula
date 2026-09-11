@@ -16,6 +16,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `Char` | `value: char` | 无（叶子） | 边界 | 线性 | 无 | `char` | 自己的字符 | `text`=字符；编辑器里打的 `-` 另带 `display_glyph`=`−`(U+2212) |
 | `Symbol` | `name`, `glyph` | 无 | 边界 | 线性 | 无 | `symbol` | 自己的 `name` | `text`=`glyph`（如 `alpha` → `𝛼`） |
+| `Number` | 无 | `inner`(100%) | 边界 | 线性 | 无 | `number` | 格内字符**不加分隔符**（`Write::Run`） | children 1×`cell@inner`，里面逐字是 `char`（`12.5` 是 4 个）；光标因此能停在数字之间 |
 | `Raw` | `source` | 无 | 边界 | 线性 | 无 | `raw` | 自己的 `source` | `text`=源码片段 + **`edit`**（一个真实光标，前端据此给"打开源码"）；在宏模板里另带 `definitions`/`origin`/`source_range` |
 | `Unknown` | `name`, `saved`, `caret`, `anchor`, `original` | 无 | 边界 | 线性 | 无 | `unknown` | 自己的 `name` | `text`=空串，内容全在 children：`draft-placeholder`/`draft-text`/`draft-caret`，**都不带 role** |
 | `Parameter` | `index` | 无 | 边界 | 线性 | 无 | `parameter` | 占位 `#parameter{n}` | **不上线**（见第五节） |
@@ -38,7 +39,7 @@
 | 字段 | 谁填 | 实测值示例 |
 | --- | --- | --- |
 | `kind` | 全部 | 视图名 |
-| `text` | 每个节点都有这个字段，但**带内容的只有** `Char`/`Symbol`/`Raw`/`Fenced`/`Decoration`/`MacroCall`；`Unknown` 与所有结构性 `Kind` 都是空串 | `hat`、`(\n)`、`x` |
+| `text` | 每个节点都有这个字段，但**带内容的只有** `Char`/`Symbol`/`Number`/`Raw`/`Fenced`/`Decoration`/`MacroCall`；`Unknown` 与所有结构性 `Kind` 都是空串 | `hat`、`(\n)`、`x`、`12.5` |
 | `role` | 父节点填给子节点（`Decl::role_at`）；根节点不填 | `numerator`、`radicand`、`inner` |
 | `display_glyph` | **只有 `Char`**，且只有这个字符在 `config/symbols.json` 里时 | 打的 `-` → `−` |
 | `children` | 除叶子外全部；`Scripts` 恒 3 个（缺席补 `absent`） | — |
@@ -53,8 +54,9 @@
 
 | `Kind` | `MathKind` | 引擎 item 的字段 |
 | --- | --- | --- |
-| `Char` | `Glyph`、`Number` | `GlyphItem`：`text`、`class`、`stretch`、`mid_stretched`、`flac`；`NumberItem`：`text`（数字串被词法成一个 item） |
-| `Symbol` | `Glyph` | 同上（不含 `Number`） |
+| `Char` | `Glyph` | `GlyphItem`：`text`、`class`、`stretch`、`mid_stretched`、`flac` |
+| `Symbol` | `Glyph` | 同上 |
+| `Number` | `Number` | `NumberItem`：`text`（数字串；引擎在 `resolve_text` 里按"全 ASCII 数字、至多一个点、至少一个数字"判定） |
 | `Raw` | `Box`、`Mathml`、`External` | `BoxItem`：`elem`、`locator`；`MathmlItem`：`elem`、`body`；`ExternalItem`：`content`、`locator` |
 | `Text` | `Text` | `TextItem`：`text`、`locator` |
 | `Fraction` | `Fraction` | `FractionItem`：`numerator`、`denominator`、`line`、`padding` |
@@ -91,11 +93,20 @@
 
 实测：30 个用例的完整 `view` JSON 里，`"kind": "parameter"` 与 `"kind": "template-call"` 出现 **0 次**。它们仍必须有 `Decl`（`template_size` 要遍历、`Write::TemplateOnly` 要在写入时停下），但**前端永远看不到它们**。
 
-## 六、探测中发现的八件事
+## 六、探测中发现的十件事
 
 1. **`vec` 不是 accent。** `resolve_vec`（`resolve.rs:1018`）把每个参数变成一行再套定界符（`VecElem` 定义在 `matrix.rs`，默认 `delim: DelimiterPair::PAREN`）——它是**列向量**，和 `mat` 同族。`VecElem` 自己的文档就写着："To typeset a symbol that represents a vector, `math.accent[arrow]` and `bold` are commonly used"（`matrix.rs:23-25`）。编辑器现在把 `vec` 当 `Decoration{name:"vec"}` 画一个箭头。实测：`vec(x)` 与 `mat(x)` 的**映射 SVG 逐字节相同**（29.5584×23.904pt），`vec(x, y)` 与 `mat(x; y)` 也相同；而真正的 accent 宽度**一点不变**（`hat(x)` = `x` = 13.728pt）。
 7. **`mat` 的默认定界符是圆括号，前端画的是方括号。** `MatElem::delim` 默认 `DelimiterPair::PAREN`（`matrix.rs:103`）。`mathview.py` 的 `grid` 分支画的是两条竖线加四个短横（`mathview.py:311-314`），即方括号。实测 `(mat(x))` 比 `mat(x)` 宽出正好一对定界符（48.2304 − 29.5584 = 18.672pt，与 `(x)` − `x` 相同），说明 `mat` 自己那对确实画着圆括号。
 8. **一条被证伪的怀疑。** 我一度以为映射会漏掉 `vec` 的定界符（因为 `vec(x)` 与 `mat(x)` 完全一样）。查下来不是：`mat` 的默认定界符本来就是圆括号，所以 `mat(x)` 与 `mat(x, delim: "(")` 是同一个东西，两者相同是必然的。`Write::Matrix` 因此也需要重新审视——它写出的 `mat(…)` 在前端是方括号，在文档里是圆括号。
+9. **数字串是一个"像 text 一样的容器"。** `Number` 有一个格，里面是逐字的 `Char`，所以光标**能停在数字之间**（`12|34` 插一个 `9` 得到 `12934`），这是叶子模型根本表达不了的。前端仍然只多一个排布名（`number`），通用"有子节点"分支会把那个格画出来；名字必须在 `ARRANGEMENTS` 白名单里，否则整篇带数字的公式都会报"不认识的排布"（`desktop/test_desktop.py::test_a_number_run_is_a_container_with_a_known_arrangement` 守着）。
+10. **普通模式敲出的小数与读进来的小数不是同一棵树**（有意）：读 `12.5` 是一个 `Number(12.5)`，逐键敲 `1` `2` `.` `5` 是 `Number(12) Char(.) Number(5)`，写出 `12 . 5`。实测四种写法两两渲染完全相同（见下），所以是纯表示差异；命令模式走解析器，得到的是一个 `Number`。
+
+| 写法对 | 实测（24pt，真实适配器） |
+| --- | --- |
+| `1.5` / `1 . 5` | 30.672 × 16.512（相同） |
+| `.5` / `. 5` | 18.672 × 16.512（相同） |
+| `12` / `1 2` | 24.0 × 15.984（相同） |
+| `98456` / `98 456` | 60.0 × 16.776（相同） |
 2. **单字母名字在 Typst 里不是标识符。** `lexer.rs:742-753`：只占一个字形簇的名字词法成 `MathText`，不是 `MathIdent`，因此 `f(x)` **本来就不是函数调用**（渲染成并排），宏调用要求名字 ≥2 个字形。实测 `#let f(a) = $ #a $` + `$ f(x) $` 不展开，而 `twice`/`foo`/`f2` 都会展开成 `macro`。这不是编辑器的缺陷。
 3. **`Kind::Symbol` 只覆盖 `config/symbols.json` 的 40 条**：20 个希腊字母（15 小写 `alpha`…`omega` + 5 大写 `Delta`/`Gamma`/`Omega`/`Sigma`/`Theta`），其余 20 条是关系与算术符号（`<=`、`>=`、`!=`、`+-`、`-+`、`minus.plus`、`plus.minus`、`times`、`dot`、`div`，以及 `+ - * < = >` 和 `\/`、`\\`、`slash`、`backslash`）。`arrow.r`、`dif`、`sum`、`oo` 都**不在**表里 → 落成 `Raw`（由编译器出图，这本身是对的）。
 4. **`macro-collapsed` 的文案与判据对不上。** `view.rs` 用 `definition.is_some()` 在两段文案里二选一，而文案说的是"参数个数与定义不符"和"展开较大"。实测 16 层 `twice(twice(…))`（参数个数**是**对的，只是展开规模超限）报的是"参数个数与定义不符，显示调用与参数"。三个状态配两个标签，其中一个必然说错。

@@ -289,6 +289,13 @@ impl Editor {
             if ch == '"' || ch == '\n' { self.anchor = None; self.pop(true); return; }
             self.erase_selection(); self.plain_insert(MathAtom::character(ch)); return;
         }
+        if self.number_cell() {
+            // A run holds digits, so a digit goes in at the caret and anything else
+            // ends the run there. That is the same character handling a text run
+            // gets, minus the freedom to hold something that is not a digit.
+            if ch.is_ascii_digit() { self.erase_selection(); self.plain_insert(MathAtom::character(ch)); return; }
+            self.leave_number();
+        }
         if ch == '"' {
             let saved = self.take_selection(); let pos = self.cursor.pos;
             self.plain_insert(MathAtom { kind: Kind::Text, cells: vec![saved] });
@@ -314,7 +321,54 @@ impl Editor {
         if ch == '\n' { return; }
         if ch == '^' || ch == '_' { self.script(ch == '^'); return; }
         self.erase_selection();
+        if ch.is_ascii_digit() { self.insert_digit(ch); return; }
         self.plain_insert(MathAtom::character(ch));
+    }
+    /// A digit joins the number run beside the caret instead of becoming loose.
+    ///
+    /// The lexer groups a run into one token, so the tree agrees with the source
+    /// only while the run stays one `Number`. Both sides are as close, so the left
+    /// one wins; either way the caret ends up *inside* the run, right after the
+    /// digit that was just typed, which is what makes `|456` plus `9` read `9456`
+    /// with the caret between the `9` and the `4` rather than in front of the `9`.
+    fn insert_digit(&mut self, ch: char) {
+        let pos = self.cursor.pos;
+        if pos > 0 && matches!(self.data()[pos - 1].kind, Kind::Number) { self.push(pos - 1, 0, true); }
+        else if matches!(self.data().get(pos).map(|a| &a.kind), Some(Kind::Number)) { self.push(pos, 0, false); }
+        else {
+            let at = self.cursor.pos;
+            self.plain_insert(MathAtom::number(""));
+            self.push(at, 0, true);
+        }
+        self.plain_insert(MathAtom::character(ch));
+    }
+    /// Ends the run the caret is in by splitting it, then leaves for the parent.
+    ///
+    /// Called for anything that is not a digit. Splitting keeps the caret where the
+    /// user put it and keeps both halves valid runs, so the character that ended the
+    /// run is handled at the formula level with its usual meaning (`/` opens a
+    /// fraction, `^` an attachment, `"` a text run).
+    fn leave_number(&mut self) {
+        let Some(slice) = self.cursor.slices.last().cloned() else { return };
+        let digits = self.data().clone();
+        let (left, right) = digits.split_at(self.cursor.pos);
+        let mut replacement = vec![];
+        if !left.is_empty() { replacement.push(MathAtom { kind: Kind::Number, cells: vec![left.to_vec()] }); }
+        if !right.is_empty() { replacement.push(MathAtom { kind: Kind::Number, cells: vec![right.to_vec()] }); }
+        let caret = slice.atom + usize::from(!left.is_empty());
+        self.cursor.slices.pop();
+        self.data_mut().splice(slice.atom..slice.atom + 1, replacement);
+        self.cursor.pos = caret;
+    }
+    /// A run with no digits left is removed, never written as an empty atom.
+    ///
+    /// `write_cell` puts one separator between two atoms, so an empty run would
+    /// write a stray separator and read back as a different tree.
+    fn dissolve_empty_run(&mut self) {
+        if !self.data().is_empty() || !matches!(self.owner().map(|o| &o.kind), Some(Kind::Number)) { return; }
+        self.pop(false);
+        let at = self.cursor.pos;
+        self.data_mut().remove(at);
     }
     fn begin_command(&mut self) {
         let saved = self.take_selection();
@@ -415,6 +469,11 @@ impl Editor {
         Some(CommandContext { source, start, end: start+draft.len(), caret: start+caret, draft, draft_caret: caret })
     }
     pub(crate) fn text_cell(&self) -> bool { matches!(self.owner().map(|o| &o.kind),Some(Kind::Text)) }
+    /// Whether the caret is inside a number run, whose cell takes digits and
+    /// nothing else. Unlike a text run it does **not** trap the arrow keys: a run
+    /// is something the reader passes through, so `key` leaves the boundaries to
+    /// the ordinary cell handling and left/right walk out of it.
+    fn number_cell(&self) -> bool { matches!(self.owner().map(|o| &o.kind), Some(Kind::Number)) }
     fn quoted_draft(&self) -> bool {
         let Some(name) = self.pending() else { return false; };
         let mut quoted = false; let mut escaped = false;
@@ -679,7 +738,7 @@ impl Editor {
         }
         let pos = self.cursor.pos-1;
         if self.data()[pos].confirm_deletion() { self.anchor = Some(self.cursor.clone()); self.cursor.pos = pos; }
-        else { self.data_mut().remove(pos); self.cursor.pos = pos; }
+        else { self.data_mut().remove(pos); self.cursor.pos = pos; self.dissolve_empty_run(); }
     }
     fn delete(&mut self) {
         if self.pending().is_some() { return; }
@@ -697,7 +756,7 @@ impl Editor {
             return;
         }
         if self.data()[pos].confirm_deletion() { self.anchor = Some(self.cursor.clone()); self.cursor.pos += 1; }
-        else { self.data_mut().remove(pos); }
+        else { self.data_mut().remove(pos); self.dissolve_empty_run(); }
     }
     fn key(&mut self, key: &str, shift: bool, ctrl: bool) {
         if self.pending().is_some() { self.draft_key(key, shift, ctrl); return; }

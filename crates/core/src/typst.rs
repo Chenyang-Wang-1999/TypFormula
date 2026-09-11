@@ -567,6 +567,11 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             if let Some(glyph) = symbol(&raw) { MathAtom { kind: Kind::Symbol { name: raw, glyph: glyph.into() }, cells: vec![] } }
             else if !raw.is_empty() && raw.chars().all(is_operator) { MathAtom::from_source(raw) }
             else if matches!(node.kind(), SyntaxKind::MathText | SyntaxKind::Text | SyntaxKind::Int | SyntaxKind::Float) {
+                // The lexer keeps a numeric run in one node and one grapheme
+                // cluster in the others, so a run becomes one atom here. Which
+                // runs count is the engine's rule (`math::is_number`) and not the
+                // lexer's: `²3` is one token but resolves to a `Text`.
+                if is_number(&raw) { return vec![MathAtom::number(&raw)]; }
                 return raw.chars().map(MathAtom::character).collect();
             } else { MathAtom::from_source(raw) }
         }
@@ -584,24 +589,19 @@ fn parse_marker(node: &SyntaxNode) -> MathData {
 pub fn write_cell(data: &MathData) -> String {
     if data.is_empty() { return "\"\"".into(); }
     let mut out = String::new();
-    // A separator is the default between two atoms: the source is re-parsed
-    // whenever the document is analyzed, so characters that would lex as one
-    // token have to be kept apart. Two letters would become one identifier
-    // (`xy`), and two operator characters would become one Typst shorthand --
-    // `->` is an arrow, `||` is `‖`, `...` is `…` -- turning typed characters
-    // into a single uneditable fragment.
-    let mut previous_digit = false;
-    let mut previous_dot = false;
+    // A separator goes between every two atoms: the source is re-parsed whenever
+    // the document is analyzed, so characters that would lex as one token have to
+    // be kept apart. Two letters would become one identifier (`xy`), two operator
+    // characters one Typst shorthand -- `->` is an arrow, `||` is `‖`, `...` is
+    // `…` -- turning typed characters into a single uneditable fragment.
+    //
+    // Digits used to be the one exception, because a digit run was several `Char`
+    // atoms that had to stay lexed as one number. A run is one `Kind::Number` now,
+    // so there is nothing left to hold together and the exception is gone;
+    // `tests/structured_input.rs` keeps the separator rule pinned.
     for atom in data {
-        let value = match atom.kind { Kind::Char { value } => Some(value), _ => None };
-        let digit = value.is_some_and(|value| value.is_ascii_digit());
-        let dot = value == Some('.');
-        // Only a number is written as one run: `12`, `1.5`, `.5`. A dot never
-        // joins another dot, so `...` stays three characters.
-        let number = (digit && (previous_digit || previous_dot)) || (dot && previous_digit);
-        if !out.is_empty() && !number { out.push(' '); }
+        if !out.is_empty() { out.push(' '); }
         out.push_str(&write_atom(atom));
-        previous_digit = digit; previous_dot = dot;
     }
     out
 }
@@ -658,6 +658,14 @@ pub fn write_atom(atom: &MathAtom) -> String {
         },
         Write::TemplateOnly => unreachable!("template edges never belong to the editable source tree"),
         Write::Quoted => serde_json::to_string(&atom.cells[0].iter().map(|a| if let Kind::Char { value } = a.kind { value.to_string() } else { write_atom(a) }).collect::<String>()).unwrap(),
+        Write::Run => {
+            let run: String = atom.cells[0].iter().map(write_atom).collect();
+            // A run is digits and at most one dot by construction; if an edit ever
+            // left something else in the cell, the separator that would have to
+            // come back is the safe spelling, so say so loudly here instead.
+            debug_assert!(is_number(&run), "数字串的格子里出现了非数字：{run:?}");
+            run
+        }
         Write::Template(template) => fill_template(template, atom),
         Write::Named => match &atom.kind {
             Kind::MacroCall { name, function } => if *function { format!("{name}({})", joined(&atom.cells)) } else { name.clone() },

@@ -5,6 +5,11 @@ fn input(e:&mut Editor,s:&str){e.apply(Action::Input{text:s.into()}).unwrap();}
 fn command(s:&str)->Editor{let mut e=Editor::default();input(&mut e,&format!("\\{s}"));key(&mut e,"Enter");assert!(e.pending().is_none(),"{s}: {}",e.message);e}
 fn load(s:&str)->Editor{let mut e=Editor::default();e.apply(Action::Import{source:s.into()}).unwrap();e}
 fn raw(a:&MathAtom,s:&str){assert!(matches!(&a.kind,Kind::Raw{source} if source==s),"{a:?}");}
+/// The spelling of one `Number`: the characters of its single cell.
+fn run(a:&MathAtom)->String{
+    assert!(matches!(a.kind,Kind::Number),"{a:?}");
+    a.cells[0].iter().map(|c|if let Kind::Char{value}=c.kind {value.to_string()} else {format!("{c:?}")}).collect()
+}
 
 #[test]
 fn nested_raw_keeps_its_editable_fraction_and_source() {
@@ -29,7 +34,11 @@ fn compiler_owns_symbols_operators_shorthands_and_escapes() {
         assert_eq!(typst::write_cell(&e.root),s);
         assert_eq!(e.root,load(s).root);
     }
-    for s in ["x","123"] { assert!(command(s).root.iter().all(|a|matches!(a.kind,Kind::Char{..}))); }
+    for s in ["x"] { assert!(command(s).root.iter().all(|a|matches!(a.kind,Kind::Char{..}))); }
+    // A run of digits is one `Number` holding them in one cell, which is how both
+    // the lexer and the engine treat it: one token, one `NumberItem`.
+    assert_eq!(command("123").root.len(),1);
+    assert_eq!(run(&command("123").root[0]),"123");
     for s in ["cancel( x/y  + dif x )", "lr((x), size: #150%)", "text(\"hello\")"] {
         raw(&command(s).root[0],s);raw(&load(s).root[0],s);
     }
@@ -71,13 +80,96 @@ fn a_separator_keeps_typed_characters_from_becoming_one_shorthand() {
         assert_eq!(reparsed.root.len(),e.root.len(),"{written} must stay separate atoms");
         assert_eq!(typst::write_cell(&reparsed.root),written,"{written} must be stable");
     }
-    // Digits are the one run written together, and they lex back into the same
-    // characters. A dot joins a neighbouring digit, never another dot.
-    for (typed,written) in [("12.5","12.5"),(".5",".5"),("1..2","1. .2")] {
+    // A run keeps its digits in one cell, so the writer puts no separator inside it
+    // (`Write::Run`); only the separator between atoms is left. A dot typed in
+    // normal mode is an ordinary character and gets that separator, while a dot read
+    // from source joins its digits, because the lexer keeps `12.5` in one token.
+    //
+    // The two spellings render identically -- measured with the real adapter,
+    // `1.5` and `1 . 5` are both 30.672 x 16.512pt at 24pt -- so neither is a
+    // loss, but a typed decimal and a written one are not the same tree.
+    for (typed,written) in [("12.5","12 . 5"),(".5",". 5"),("1..2","1 . . 2")] {
         let mut e=Editor::default();input(&mut e,typed);
         assert_eq!(typst::write_cell(&e.root),written,"{typed}");
+        assert_eq!(load(&written).root,e.root,"{written} must read back as the tree that wrote it");
     }
-    assert_eq!(load("12.5").root,{let mut e=Editor::default();input(&mut e,"12.5");e.root});
+    for source in ["12.5","123.456","0.5"] {
+        assert_eq!(load(source).root.len(),1,"{source}");
+        assert_eq!(run(&load(source).root[0]),source);
+    }
+    // The rule is the engine's, so it is ASCII digits only. `²3` is one lexer
+    // token (`char::is_numeric` is true for `²`) but `resolve_text` rejects it and
+    // the engine makes a `Text` of it, so it must not become a `Number` here.
+    assert!(load("²3").root.iter().all(|a|!matches!(a.kind,Kind::Number{..})),"{:?}",load("²3").root);
+}
+
+#[test]
+fn a_typed_digit_joins_the_number_run_beside_it() {
+    // `123` then `4` is one run, in the tree and therefore in the source.
+    let mut e=Editor::default();input(&mut e,"123");input(&mut e,"4");
+    assert_eq!(e.root.len(),1);assert_eq!(run(&e.root[0]),"1234");
+    assert_eq!(typst::write_cell(&e.root),"1234");
+    // A decimal that came from source keeps its dot when a digit is appended.
+    let mut e=load("123.456");key(&mut e,"End");input(&mut e,"7");
+    assert_eq!(typst::write_cell(&e.root),"123.4567");
+    // Command mode hands the draft to the parser, so a dot belongs to the run.
+    assert_eq!(typst::write_cell(&command("123.456").root),"123.456");
+    // A dot typed in normal mode never extends the run.
+    let mut e=Editor::default();input(&mut e,"123");input(&mut e,".");input(&mut e,"456");
+    assert_eq!(typst::write_cell(&e.root),"123 . 456");
+}
+
+#[test]
+fn the_caret_goes_inside_a_number_run() {
+    // A run is a container, so the caret reaches *between* its digits -- which a
+    // leaf could not express at all: there was no way to put a `9` after the `2`
+    // of `1234`. Entering takes one move (which lands before the first digit), so
+    // three moves put the caret between the `2` and the `3`.
+    let mut e=load("1234");
+    for _ in 0..3 { key(&mut e,"ArrowRight"); }
+    assert_eq!(e.cursor.slices.len(),1,"the caret is inside the run");
+    assert_eq!(e.cursor.pos,2);
+    input(&mut e,"9");
+    assert_eq!(typst::write_cell(&e.root),"12934","the digit goes in at the caret");
+    assert_eq!(e.cursor.pos,3,"and the caret follows it");
+    // A run on either side of the caret takes the digit, and the caret stays inside
+    // it: typed before `456`, `9` then `8` reads `98456`, not `89456`.
+    let mut e=load("456");input(&mut e,"9");input(&mut e,"8");
+    assert_eq!(e.root.len(),1);assert_eq!(run(&e.root[0]),"98456");
+    assert_eq!(typst::write_cell(&e.root),"98456");
+    // A run is not a trap: left/right walk out of it, unlike a text run, whose
+    // boundaries swallow the arrows.
+    let mut e=load("12");key(&mut e,"ArrowRight");key(&mut e,"ArrowLeft");
+    assert!(e.cursor.slices.is_empty(),"left leaves the run:{:?}",e.cursor);
+    // Anything that is not a digit ends the run at the caret instead of landing in
+    // it, and keeps its usual meaning there.
+    let mut e=load("1234");for _ in 0..3 { key(&mut e,"ArrowRight"); }input(&mut e,"x");
+    assert_eq!(typst::write_cell(&e.root),"12 x 34");
+    assert_eq!(e.root.iter().map(|a|a.kind.clone()).collect::<Vec<_>>(),
+               vec![Kind::Number,Kind::Char{value:'x'},Kind::Number]);
+    assert_eq!(e.cursor.pos,2,"the caret stays where the user put it");
+    // A character that opens a structure keeps its own rule at the split point.
+    // `/` takes the atom on its left as the numerator and moves the caret into the
+    // empty denominator -- the same thing it does between any two atoms -- so the
+    // right half of the run stays after the fraction.
+    let mut e=load("1234");for _ in 0..3 { key(&mut e,"ArrowRight"); }input(&mut e,"/");
+    assert_eq!(typst::write_cell(&e.root),r#"frac(12, "") 34"#);
+    assert_eq!(e.cursor.slices.last().unwrap().cell,1,"the caret is the denominator");
+    input(&mut e,"7");
+    assert_eq!(typst::write_cell(&e.root),r#"frac(12, 7) 34"#);
+    // Deleting the last digit removes the run rather than leaving an empty one,
+    // which would be written as a stray separator. The spaces matter: `x1y` is one
+    // identifier to the lexer, so the run has to stand alone between two atoms.
+    let mut e=load("x 1 y");for _ in 0..3 { key(&mut e,"ArrowRight"); }key(&mut e,"Backspace");
+    assert_eq!(typst::write_cell(&e.root),"x y");
+    assert!(e.root.iter().all(|a|!matches!(a.kind,Kind::Number)),"{:?}",e.root);
+    // Backspace at the *start* of the run is the ordinary cell rule (LyX's
+    // pullArg): the container dissolves and keeps its content, so the digit becomes
+    // a loose character. It renders identically (`1 2 3` measured the same as `123`)
+    // and the next parse of the formula forms the run again.
+    let mut e=load("x 1 y");key(&mut e,"ArrowRight");key(&mut e,"ArrowRight");key(&mut e,"Backspace");
+    assert_eq!(typst::write_cell(&e.root),"x 1 y");
+    assert!(e.root.iter().all(|a|!matches!(a.kind,Kind::Number)),"{:?}",e.root);
 }
 
 #[test]
