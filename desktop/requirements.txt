@@ -1,1 +1,7 @@
 PyQt5>=5.15.9,<5.16
+# The live preview shows Tinymist's own preview page, which is HTML; the web view is a
+# separate wheel from PyQt5 itself, so it has to be named here or `pip install -r` leaves
+# the preview unable to open. Importing it also constrains start-up: QtWebEngineWidgets
+# must be imported, and `Qt.AA_ShareOpenGLContexts` set, before QApplication exists
+# (desktop/__main__.py does both).
+PyQtWebEngine>=5.15.4,<5.16

@@ -93,7 +93,11 @@ Qt 5 的 SVG Tiny 加载器不支持 Typst 输出中的 glyph `<symbol>`，会�
 
 **哪些调用落在这里，判据是语法而不是名字**（见 [architecture.md](architecture.md)）：实参**全是位置实参**的调用会被建成 `MacroCall`——名字在配置里就借用那个形状，名字不在配置里就是 `raw_macro`（光标在外画这个调用自己的一张图，进去画名字与参数槽）。所以 `bb(A)`、`binom(n, k)`、`text("hello")` 现在**是可编辑的结构节点**，而**有具名实参**的仍在 `Raw`（一个格子表拼不回 `lr(x, size: #100%)`）。`cases(...)` 与 `cancel(...)` 早就不属于这一类了。<br>**"没有图像的片段"的测试范例因此换成了裸标识符**（`undefinedname`）：标识符永远不会变成调用，而任何调用形式都可能被结构化。
 
-桌面窗口不包含实时预览 Dock，也不会在输入后自动生成页面。F5 通过 `/api/pdf` 编译当前内存源码，原生 PDF 保留可搜索文字、链接及 Typst 提供的文档结构；临时文件位于系统临时目录的 `VisualTypst` 子目录。文件菜单“导出 PDF”可选择永久保存位置。
+**实时预览是 Tinymist 的功能，不是我们自己画的**（视图 → 显示 / 隐藏实时预览，默认关闭）：开启时向 Tinymist 的 LSP 会话发 `tinymist.doStartPreview`，它由自己的进程提供预览页与一个推送**增量**渲染的 WebSocket（先一整帧 `new`，之后是 `diff-v1` 差量），编辑器只把这个页面装进一个 web view（`desktop/preview.py`）。所以增量渲染、局部渲染、滚动同步、反色都由 Tinymist 负责；**关闭时会 `tinymist.doKillPreview`**，因为开着的预览就是一个在跑的编译器。整页编译仍走 `/api/preview`（导出 SVG 用），两者互不影响：预览在 Tinymist 进程里，不占 `render_adapter` 的锁。
+
+因为预览页是 HTML，需要 `PyQtWebEngine`（已写进 `desktop/requirements.txt`），并且 **QtWebEngine 必须在 `QApplication` 之前导入、同时设 `AA_ShareOpenGLContexts`**（`desktop/__main__.py` 里的 `preview.prepare()`）；缺这个 wheel 时预览报"不可用"而不是崩掉。注意 QtWebEngine **在 `QT_QPA_PLATFORM=offscreen` 下无法构造**（是访问违例而不是异常），所以测试套件用替身 web view 跑启停逻辑（`Window.preview_widget` 就是为此可替换），真窗口的行为由实测探针验证。
+
+F5 通过 `/api/pdf` 编译当前内存源码，原生 PDF 保留可搜索文字、链接及 Typst 提供的文档结构；临时文件位于系统临时目录的 `VisualTypst` 子目录。文件菜单“导出 PDF”可选择永久保存位置。
 
 当前边界：
 

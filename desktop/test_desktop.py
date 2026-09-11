@@ -368,7 +368,7 @@ class NativeTest(unittest.TestCase):
         self.assertIn({'id':f'{definition}:{end}','start':definition,'end':end},calls[0]['raw'])
         node=next(node for node in window.view_nodes(window.analysis['formulas'][0]['view']) if node['kind']=='raw')
         self.assertIsInstance(window.typesetter.raw(node),dict,'the batch result is what this fragment draws')
-        self.assertEqual(window.preview_revision,-1,'an image request must not compile a live page preview')
+        self.assertEqual(window.preview_revision,-1,'an image request must not touch the preview')
         self.assertEqual(window.source,before);self.assertEqual(len(window.history),history,'asking for an image never edits the document')
 
     def test_a_definition_fragment_keeps_the_call_that_renders_it(self):
@@ -865,6 +865,11 @@ class NativeTest(unittest.TestCase):
         self.assertGreaterEqual(editor.line_numbers.width(),editor.line_number_width())
 
     def test_background_services_do_not_compile_live_preview_or_editor_raw(self):
+        """The idle pass keeps attachments and highlights current, and nothing else.
+
+        The live preview is **not** part of it: it runs only while its dock is open, and
+        the render pass that would page-compile the document is the export path.
+        """
         from unittest.mock import patch
         self.load('$ sum_1^2 lr(a, size: #100%) $');window=self.window;window.raw_timer.stop();calls=[]
         def request(route,body,callback,key=None):
@@ -874,11 +879,69 @@ class NativeTest(unittest.TestCase):
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
             window.background()
         self.assertIn('/api/attachments',calls)
-        self.assertNotIn('/api/preview',calls);self.assertNotIn('/api/render',calls)
+        self.assertNotIn('/api/preview',calls);self.assertNotIn('/api/preview/live',calls)
+        self.assertNotIn('/api/render',calls)
         self.assertEqual(window.editor.document().revision(),document_revision)
 
-    def test_window_has_no_live_preview_pane_and_pdf_button_uses_typst_pdf(self):
-        self.assertFalse(hasattr(self.window,'preview_dock'))
+    def test_the_live_preview_starts_only_when_it_is_switched_on(self):
+        """Tinymist serves and renders the preview; switching it off must stop that.
+
+        The preview is a running compiler, so "only render while it is on" is not a
+        drawing detail: turning it on asks Tinymist to start one, and turning it off
+        kills it. Nothing here renders anything — the test asserts the *requests*, and
+        that the page is loaded from the address the reply named.
+
+        The web view is a stand-in, because a real one **cannot be constructed under the
+        offscreen platform** (QtWebEngine wants a GL context and the process dies with an
+        access violation, not an exception). `Window.preview_widget` exists to be
+        replaced for exactly this reason; the start/stop logic under test is the real one.
+        """
+        from unittest.mock import patch
+        window=self.window;asked=[];loaded=[]
+        class View:
+            def load(self,url):loaded.append(url.toString())
+            def setUrl(self,url):loaded.append('blank:'+url.toString())
+        window.preview_view=View()
+        def request(route,body,callback,key=None):
+            asked.append((route,body.get('action')))
+            if route=='/api/preview/live' and body.get('action')=='start':
+                callback({'staticServerPort':38251,'dataPlanePort':38251,'isPrimary':True},None)
+            else:callback({},None)
+        with patch.object(window.services,'request',side_effect=request):
+            self.assertFalse(window.preview_started,'没有开启时不该有预览在跑')
+            window.set_preview(True)
+        self.assertIn(('/api/preview/live','start'),asked,'开启时才向 Tinymist 要预览')
+        self.assertEqual(len(loaded),1,'按回复里的地址加载预览页')
+        # The page and its WebSocket share a port, so the reply's address is the whole URL.
+        self.assertIn('38251',loaded[0])
+        with patch.object(window.services,'request',side_effect=request):
+            window.set_preview(False)
+        self.assertIn(('/api/preview/live','kill'),asked,'关闭时必须停掉 Tinymist 的预览')
+        self.assertFalse(window.preview_started,'关闭后不再有预览在跑')
+        # Hiding also blanks the view, so a hidden dock cannot keep a live page running.
+        self.assertTrue(loaded[-1].startswith('blank:'),f'关闭后页面要清空：{loaded}')
+
+    def test_closing_the_window_stops_a_running_preview(self):
+        """A preview left running is a compiler left running, so closing kills it."""
+        from unittest.mock import patch
+        window=self.window;killed=[]
+        class View:
+            def load(self,url):pass
+            def setUrl(self,url):pass
+        window.preview_view=View()
+        def request(route,body,callback,key=None):
+            if route=='/api/preview/live' and body.get('action')=='kill':killed.append(route)
+            callback({'staticServerPort':1,'dataPlanePort':1,'isPrimary':True},None)
+        with patch.object(window.services,'request',side_effect=request):
+            window.set_preview(True)
+            self.assertTrue(window.preview_started)
+            events=type('E',(object,),{'ignore':lambda self:None,'accept':lambda self:None})()
+            window.closeEvent(events)
+        self.assertTrue(killed,'关窗要停掉预览')
+
+    def test_pdf_button_uses_typst_pdf(self):
+        self.assertTrue(hasattr(self.window,'preview_dock'),'实时预览有自己的 dock')
+        self.assertFalse(self.window.preview_dock.isVisible(),'实时预览默认关闭')
         self.load('= PDF\n\nHello $x^2$');window=self.window
         result=self.service('/api/pdf',window.body()|{'pdf':True})
         data=base64.b64decode(result['pdf'],validate=True);self.assertTrue(data.startswith(b'%PDF'))

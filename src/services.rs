@@ -31,29 +31,71 @@ pub fn find_tinymist() -> Result<PathBuf, String> {
 }
 
 struct DocumentLsp { lsp: Lsp, path: String, source: String, version: i64 }
+impl DocumentLsp {
+    /// The one LSP session, started on first use and reused while the file stays the
+    /// same. Both the language methods and the live preview hang off it: Tinymist hosts
+    /// the preview **inside** its own process, so there is nothing to spawn for one.
+    fn ensure<'a>(slot: &'a mut Option<DocumentLsp>, bin: &Path, workspace: &Path, path: &str, file: &Path, source: &str) -> Result<&'a mut DocumentLsp, String> {
+        if slot.as_ref().is_none_or(|s| s.path != path) {
+            let mut lsp = Lsp::start(bin, workspace)?;
+            lsp.uri = url::Url::from_file_path(file).map_err(|_|"无效文件 URI")?.into();
+            lsp.notify("textDocument/didOpen", json!({"textDocument":{"uri":lsp.uri,"languageId":"typst","version":1,"text":source}}))?;
+            lsp.request("workspace/executeCommand", json!({"command":"tinymist.pinMain","arguments":[file]}))?;
+            *slot = Some(DocumentLsp { lsp, path: path.into(), source: source.into(), version: 1 });
+        }
+        let session = slot.as_mut().unwrap();
+        if session.source != source {
+            session.version += 1; session.source = source.into();
+            session.lsp.diagnostics = json!([]); session.lsp.diagnostic_version = None;
+            session.lsp.notify("textDocument/didChange",json!({"textDocument":{"uri":session.lsp.uri,"version":session.version},"contentChanges":[{"text":source}]}))?;
+        }
+        Ok(session)
+    }
+}
 impl Services {
-    /// The native process is reused for a real file, with monotonically versioned full sync.
-    pub fn language(&self, req: Value) -> Result<Value, String> {
+    /// Start Tinymist's own live preview and answer where to load it from.
+    ///
+    /// The preview is a Tinymist feature, not one of ours: the command makes its LSP
+    /// process serve a self-contained page plus a WebSocket that pushes **incremental**
+    /// renderings (a `new` frame, then `diff-v1` deltas), and the window shows that page
+    /// in a web view. Nothing here renders anything, and because it is a different
+    /// process from the layout adapter it cannot queue behind fragment images.
+    ///
+    /// Measured against tinymist 0.15.8: the reply carries `staticServerPort`,
+    /// `staticServerAddr` and `dataPlanePort` — the static and data planes share one
+    /// port by default, so the page and its WebSocket come from the same URL.
+    pub fn preview(&self, req: Value) -> Result<Value, String> {
         let path = req["path"].as_str().unwrap_or("main.typ");
+        let file = crate::workspace::resolve(&self.workspace, path)?;
+        let source = req["source"].as_str().unwrap_or_default();
+        let action = req["action"].as_str().unwrap_or("start");
+        let mut guard = self.document_lsp.lock().map_err(|e|e.to_string())?;
+        let result = (|| {
+            let session = DocumentLsp::ensure(&mut guard, self.bin.as_ref().map_err(Clone::clone)?, &self.workspace, path, &file, source)?;
+            match action {
+                "start" => {
+                    // The argument list is passed as **one** array element, the way
+                    // Tinymist's own client does it. `--data-plane-host 127.0.0.1:0` asks
+                    // the OS to pick a free port, so two windows never collide.
+                    let arguments = json!([["--task-id", "visual-typst", "--data-plane-host", "127.0.0.1:0", file.to_string_lossy()]]);
+                    session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doStartPreview","arguments":arguments}))
+                }
+                "kill" => { session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doKillPreview","arguments":["visual-typst"]})) }
+                other => Err(format!("不支持的预览动作 {other}")),
+            }
+        })();
+        if result.is_err() { *guard = None; }
+        result
+    }
+    /// The native process is reused for a real file, with monotonically versioned full sync.
+    pub fn language(&self, req: Value) -> Result<Value, String> {        let path = req["path"].as_str().unwrap_or("main.typ");
         let file = crate::workspace::resolve(&self.workspace, path)?;
         let source = req["source"].as_str().ok_or("缺少文档源码")?;
         let method = req["method"].as_str().unwrap_or("diagnostics");
         if !["diagnostics", "completion", "hover", "definition", "formatting", "semanticTokens/full"].contains(&method) { return Err("不支持的 LSP 方法".into()); }
         let mut guard = self.document_lsp.lock().map_err(|e|e.to_string())?;
         let result = (|| {
-            if guard.as_ref().is_none_or(|s|s.path != path) {
-                let mut lsp = Lsp::start(self.bin.as_ref().map_err(Clone::clone)?, &self.workspace)?;
-                lsp.uri = url::Url::from_file_path(&file).map_err(|_|"无效文件 URI")?.into();
-                lsp.notify("textDocument/didOpen", json!({"textDocument":{"uri":lsp.uri,"languageId":"typst","version":1,"text":source}}))?;
-                lsp.request("workspace/executeCommand", json!({"command":"tinymist.pinMain","arguments":[file]}))?;
-                *guard = Some(DocumentLsp { lsp, path:path.into(), source:source.into(), version:1 });
-            }
-            let session = guard.as_mut().unwrap();
-            if session.source != source {
-                session.version += 1; session.source = source.into();
-                session.lsp.diagnostics = json!([]); session.lsp.diagnostic_version = None;
-                session.lsp.notify("textDocument/didChange",json!({"textDocument":{"uri":session.lsp.uri,"version":session.version},"contentChanges":[{"text":source}]}))?;
-            }
+            let session = DocumentLsp::ensure(&mut guard, self.bin.as_ref().map_err(Clone::clone)?, &self.workspace, path, &file, source)?;
             let lsp_method = if method == "diagnostics" { "hover" } else { method };
             let mut params = json!({"textDocument":{"uri":session.lsp.uri},"position":req.get("position").cloned().unwrap_or(json!({"line":0,"character":0}))});
             if method == "formatting" { params["options"] = json!({"tabSize":2,"insertSpaces":true}); }

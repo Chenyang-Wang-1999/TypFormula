@@ -12,6 +12,8 @@
 
 桌面窗口已移除实时预览 Dock 和自动页面编译。专项测试确认后台编辑周期不会请求 `/api/preview`，F5 路径调用 `/api/pdf`，返回值由 `typst-pdf` 生成且以 `%PDF` 开头，并通过系统默认阅读器 URL 打开。原生适配器回归现为 16 项。
 
+> **后记（2026-09-12）**：实时预览后来**以另一条路加回来了**——走 Tinymist 自己的预览（`/api/preview/live` + web view），默认关闭、开启才渲染。上面这句"已移除"描述的是**当时**的状态与当时那条路（自己的整页编译）；`后台编辑周期不会请求 /api/preview` 这一条**至今仍然成立**（预览走的是另一个路由，且只在开启时发）。详见本文末"实时预览回来了"一节。
+
 原生预览回归 15 项通过，新增页面哈希协议测试。31 页、8.58MiB 的合成预览在 release 引擎中首次约 315–337ms、完整热输出约 233–242ms；带相同页面哈希的下一次请求约 1ms、3.7KiB，31 页均跳过 SVG 和源码映射导出。此前 debug 热输出约 1.13s。正式 `build-desktop.cmd` 已切换为 release 后端。
 
 - `python -m unittest desktop.test_desktop -v`：21 项通过。使用离屏 Qt，不打开可见应用窗口；覆盖源码/UTF-16 映射、实际键盘输入、公式选区与撤销、双栏同步、宏预热、自然尺寸滚动、文件保存、真实 Tinymist 高亮、预览映射及多页导出。
@@ -1656,6 +1658,125 @@ thread '…is_writable' panicked at crates\core\src\typst.rs:730:27:
 
 
 改动文件：`crates/core/src/{math,slots,typst,view,cursor}.rs`、`desktop/window.py`、`src/services.rs`、`tests/round_trip.rs`、`README.md`、`AGENTS.md`、`config/README.md`、`docs/{architecture,kind-inventory,desktop,validation}.md`。
+
+## 实时预览回来了：用 Tinymist 的预览，不做自己的渲染 · 2026-09-12
+
+### 先澄清一件事：预览不是"被删掉的代码"
+
+读者的描述是"这个前端之前把实时预览机制去掉了"。查证结果是：**git 里从来没有过那个 Dock**。`desktop/` 的**第一个提交**（`d15f35d 桌面端`）一进来就带着 `# Kept off-window only for explicit SVG export; there is no live preview pane.`，同时 `docs/desktop.md` / `docs/validation.md` 是**新增文件**、开头就写着"已移除实时预览 Dock"。所以那是**在提交之前**于工作区里摘掉的，无从恢复，只能重做。
+
+残留物倒是留了一地：`Page` 类、`preview_container`/`preview_scroll`（建好但**从未挂进窗口**）、`compile()`（唯一 `/api/preview` 调用者，只剩导出 SVG 在用）、`fit_preview`（无调用者）、`reveal_preview`（无调用者，且第 914 行引用了一个**从未存在过**的 `preview_dock`——一个必然 AttributeError 的死代码）。这些正是这次清理的对象。
+
+### 选型：为什么不复用 `/api/preview`
+
+两条路都试算过，最后**没走**"把 `/api/preview` 挂到空闲计时器"这条，理由不是"不符合指示"，而是它**会打破文档里已经写着的承诺**：
+
+| | Tinymist 预览（采用） | 复用 `/api/preview`（未采用） |
+| --- | --- | --- |
+| 实时性 | Tinymist 推送**增量**帧 | 自己 debounce |
+| 与片段取图抢锁 | **不抢**（Tinymist 自己的进程） | **抢**：`/api/render`、`/api/preview`、`/api/pdf` 共用同一个 `render_adapter` 互斥量 |
+| 新依赖 | `PyQtWebEngine` | 无 |
+| 编译器份数 | 2（Tinymist + 适配器） | 1 |
+
+`docs/architecture.md:76` 与 `docs/validation.md` 里都写着"整页编译不会把公式取图排在后面"（实测 1200 段文档整页预览 14.4 s，期间 `/api/status` 8 ms）。那句在**进程/路由**层面仍然成立（`rpc.rs` 每请求一线程），但 `render_adapter` 的锁会让每 550 ms 一次的整页编译把视口取图整段挡住。Tinymist 预览不碰那把锁，所以那句承诺**继续成立**——这是选它的硬理由。
+
+### 实测：`doStartPreview` 到底返回什么
+
+返回形状是从 Tinymist 的 VS Code 客户端代码里读来的，不是实测的，所以先量：
+
+```
+workspace/executeCommand "tinymist.doStartPreview"
+  arguments: [["--task-id","probe","--data-plane-host","127.0.0.1:0", <绝对路径>]]
+→ {"dataPlanePort":11451,"isPrimary":true,
+   "staticServerAddr":"127.0.0.1:11451","staticServerPort":11451}
+静态页: HTTP 200 · text/html · 2,046,807 字节 · 确认是预览应用
+doKillPreview → {"result": null}，端口随即关闭
+```
+
+三点出乎预期：**①** 还有一个 VS Code 客户端不读的字段 `staticServerAddr`（自带 host，比只给端口更好用）；**②** 静态服务与 data plane **默认同端口**，所以一个 URL 就够（页面和它开的 WebSocket 同源）；**③** `doKillPreview` 是真的优雅关闭（日志 `Preview server joined` / `Data plane server shutdown` / `killed`），不是只摘任务。
+
+**探针第一次挂死，是我自己的 bug**：`stderr=subprocess.PIPE` 却不排空，Tinymist 的日志写满管道后**阻塞**，于是 `initialize` 永远不回。这不是 Tinymist 的问题，也不是"服务器不回话"——是经典管道死锁。**对 Rust 宿主也是真实风险**：`src/services.rs` 给 LSP 设的是 `stderr(Stdio::null())`，恰好绕过了；任何改成管道的人都必须持续排空。
+
+### 改法
+
+| 层 | 做什么 |
+| --- | --- |
+| `src/services.rs` | 抽出 `DocumentLsp::ensure`——语言方法与预览**共用同一个 LSP 会话**（预览就托管在 Tinymist 自己进程里，没有第二个进程要起）；新增 `Services::preview` 转发 `doStartPreview` / `doKillPreview` |
+| `src/rpc.rs` | 新路由 `/api/preview/live` |
+| `desktop/preview.py`（新） | QtWebEngine 的 import 顺序约束、从回复取页面 URL、缺 wheel 时"不可用"而不是崩 |
+| `desktop/__main__.py` | 在**建 `QApplication` 之前**调 `preview.prepare()`（import + `AA_ShareOpenGLContexts`，顺序反了是硬错误） |
+| `desktop/window.py` | "实时预览" dock（默认隐藏）、视图菜单"显示 / 隐藏实时预览"、`preview_widget`/`set_preview`/`start_preview`/`stop_preview`；关窗停预览；删掉 `reveal_preview` 那段死代码 |
+| `desktop/requirements.txt` | 加 `PyQtWebEngine>=5.15.4,<5.16`（**独立 wheel**，不是 PyQt5 的附带品） |
+
+"只有开启时才渲染"落在实现上就是：**开启**才发 `doStartPreview`，**关闭**立刻 `doKillPreview` 并把页面清成 `about:blank`——开着的预览就是一个在跑的编译器，不能让它留在后台。
+
+### 两个测试坑
+
+1. **QtWebEngine 在 `QT_QPA_PLATFORM=offscreen` 下无法构造**：不是抛异常，是**访问违例**（退出码 `-1073741819`），整个测试进程当场死。所以桌面套件用替身 web view 跑启停逻辑，`Window.preview_widget` 就是为可替换而拆出来的。第一次跑套件时正是这个原因让"预览"两条用例失败、随后整片崩掉——**我起初以为是断言写错，实际是平台限制**。
+2. 真窗口的行为测试**测不到**，于是另外跑了一次真平台探针（已删）：真实窗口 + 真 Tinymist + 真 web view，结果 `loadFinished ok=True`、`url=http://127.0.0.1:4151/`、`page title='untitled.typ'`、页面 HTML 2,047,014 字节且含 `typst`/`svg`/`canvas`，关闭后 `started=False`、`dock=False`、`url=about:blank`，**且 4151 端口确实关闭**（`TcpClient` 连接被拒）。也就是说"页面真的跑起来了"和"关掉真的停了"都有实测，不是靠断言推的。
+
+### 新增用例的牙齿
+
+- `tests/services.rs::tinymist_serves_the_live_preview_on_the_ports_it_reports`（对着**真** Tinymist，`--ignored` 类）：断言两个端口为真、`isPrimary`、静态与 data plane 同端口，**真去连一次**确认返回 200 且页面是预览应用，`kill` 之后**再连必须失败**。
+- `test_desktop.py::test_the_live_preview_starts_only_when_it_is_switched_on`：开启才发 `start`、按回复里的端口加载、关闭发 `kill` 且把页面清空。
+- `test_desktop.py::test_closing_the_window_stops_a_running_preview`：关窗必须停预览。
+- 改掉三处钉"没有预览"的断言：`test_background_services_...`（现在断言后台周期**不碰** `/api/preview/live`）、`preview_revision == -1` 那句的措辞、以及原来 `assertFalse(hasattr(window,'preview_dock'))` 反过来断言 dock 存在且默认关闭。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **137 通过 / 5 忽略** |
+| `cargo test --test services -- --ignored` | **5 通过**（含新增的预览契约） |
+| `python -m unittest desktop.test_desktop` | **87 通过**（新增 2 条） |
+| 真窗口探针 | 页面加载成功、关闭后端口确实关闭 |
+
+改动文件：`src/{services,rpc}.rs`、`desktop/{preview,window,__main__,requirements.txt,test_desktop.py}`、`tests/services.rs`、`README.md`、`AGENTS.md`、`docs/{architecture,desktop,validation}.md`。
+
+## 梳理宏展开机制时发现：单字母宏名不展开 · 2026-09-12
+
+### 现象
+
+对着真实 release 二进制逐条实测宏展开，发现**单字母名字的宏参数调用不展开**：
+
+| 定义 + 调用 | 画出来的顶层节点 |
+| --- | --- |
+| `#let a(x) = $#x + 1$` · `$a(y)$` | `char "a"` + `decorated "(y)"`（**字面量**） |
+| `#let ab(x) = $#x + 1$` · `$ab(y)$` | `macro "ab"`（展开成 `y + 1`） |
+
+名字长度逐个试过：`a` `b` `x` `f` `q` `A` 全部**不展开**，`ab` `xy` `aa` `dbl` `abc` `a1` `AA` 全部展开。判据干净得只有一条：**标识符长度**。
+
+### 根因不在本项目，是 Typst 数学词法器的规则
+
+用 `typst-syntax` 直接打印语法树（`Source::detached`）：
+
+```
+$ a(y) $     → Math → [MathText "a", MathDelimited "(y)"]         ← 没有 MathCall
+$ ab(y) $    → Math → [MathCall → MathIdent "ab", MathArgs "(y)"]
+```
+
+`MathTextKind::get` 只把**多字符**的数学文本识别成 `MathIdent`，单字母是 `MathText`。于是 `a(y)` 在引擎眼里就是"字母 a 后面跟一个括号组"，与 `(a)(y)` 同类，**根本没有可绑定的调用节点**。
+
+同一轮还确认了注册表这一侧是**对的**：`macro_registry("#let a(x) = …")` 给出 `bound = true`、`expandable = Some(true)`——单字母定义的识别、分类、模板构建全部正常，问题纯粹在**更早一步拿不到 `MathCall`**。
+
+### 处理：只记录，不改代码
+
+已按读者指示**不动代码**。修它要动解析器去把 `MathText`+`MathDelimited` 也认成调用，而那会改变渲染语义：`a(y)` 的引擎真实排版就是"a 后跟括号组"，认成宏展开会让编辑器画的东西和引擎不一致（本项目一直按"引擎说什么就是什么"办）。单字母宏名在真实文档里也极少见。
+
+### 顺带确认下来、值得记的几条机制
+
+这一轮梳理同时把展开机制的关键规则逐条实测钉住了（都在真实二进制上跑）：
+
+| 规则 | 实测 |
+| --- | --- |
+| 模板拼接 | `$dbl(y)$` 展开后 `macro` 节点里，**模板的 `+ 1` 与实参格 `y` 在同一条 cell 线上**——参数位置被实参替换，其余模板内容原样内联 |
+| 实参个数必须相等 | `$dbl(y, z)$`（2 实参 vs 1 参数）**不展开**，画成 `raw_macro`（`raw` 文本 `dbl(y, z)`） |
+| 嵌套模板递归绑定 | `outer` 的模板里调 `inner`，展开是**递归内联**的：`macro "outer"` → 里面直接是 `scripts`（`inner` 的 `#a^2`），`absent` 占位于没有的上下标格 |
+| 不可展宏的公式整体锁死 | `#let q(x) = $lr(#x, size: #100%)$`（命名参数）→ 该定义体的公式 `editable=false`，理由是"位于不可展开的 let 定义中，按设计保留源码模式"；而同文档里 `$q(a)$` 仍可编辑 |
+
+最后一条与 `src/desktop.rs::scan_syntax` / `analyze_formula` 里那段 `blocked` 判定对应：公式落在**不可展开**的 `#let` 里时按源码保留，`opaque()` 会沿语法树找出这个位置。
+
+**这一轮没有代码改动**（探针已删，工作区只剩上一轮预览的改动）。
 
 
 

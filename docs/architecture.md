@@ -28,7 +28,9 @@ Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`�
 
 派生数据同样按视图缓存，避免每个编辑周期重算整篇：附件请求表 `Window.attachment_nodes` 记住每个视图的「定义前缀 + 表达式 + 显示模式」，`Window.visible_formula_starts` 先把各编辑器的公式对象按公式起点分组，再做可见性判断，因此 `load_raw` 是"对象数 + 公式数"而不是两者相乘。语义高亮的 span 每次回复都会整体替换，所以那一侧不缓存，改为每个视图复用同一 `QTextCharFormat`，并且只为可见视图构建（源码 dock 默认隐藏，展开时经 `visibilityChanged` 立即着色）。
 
-窗口不包含实时页面预览。F5 通过原生 `typst-pdf` 编译当前内存源码并交给系统默认阅读器；公式 Raw 和附件位置继续使用独立后台服务，不依赖 PDF 编译。详情及范围见 [desktop.md](desktop.md)。
+实时页面预览**由 Tinymist 提供，编辑器不渲染它**：视图菜单开启后，宿主在自己的 LSP 会话上发 `tinymist.doStartPreview`（`/api/preview/live`），Tinymist 用它自己的进程提供预览页与推送增量渲染的 WebSocket，窗口只把那个页面装进一个 web view。它**默认关闭**，关闭即 `doKillPreview`——开着的预览就是一个在跑的编译器。这条与 `/api/preview`（导出用的整页 SVG）是两条互不相干的路：预览在 Tinymist 进程里，**不占 `render_adapter` 的锁**，所以"整页编译不会把公式取图排在后面"这句在引入预览后依然成立。
+
+F5 通过原生 `typst-pdf` 编译当前内存源码并交给系统默认阅读器；公式 Raw 和附件位置继续使用独立后台服务，不依赖 PDF 编译。详情及范围见 [desktop.md](desktop.md)。
 
 ## 状态所有权
 
@@ -74,6 +76,8 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 后端没有网络端口：`visual-typst --stdio <目录>` 由窗口启动，请求按 id 匹配回包，`src/rpc.rs` 每请求分发一个线程，`Services` 通过互斥量共享，因此整页编译不会把公式取图和语言请求排在它后面。项目目录由启动参数指定，窗口把当前文档所在目录作为编译根；`src/workspace.rs` 用规范化路径限制项目边界，任何越界或含父级步骤的路径都被拒绝。
 
 `/api/lsp` 提供 completion / hover / definition / formatting / diagnostics / semanticTokens。一个文档使用一个常驻 Tinymist 进程，版本递增并全文同步；换文件或协议失败时重建。诊断来自 publishDiagnostics，窗口防抖、版本检查和过期结果丢弃。公式补全仍使用隔离的临时源码投影，以保留原型已验证的命令行为。
+
+`/api/preview/live` 是**同一条 LSP 会话**上的两个 Tinymist 命令（`doStartPreview` / `doKillPreview`），回答里带着预览服务的端口；窗口据此加载页面。预览的渲染全在 Tinymist 那边，这里只转发，所以它既不走排版适配器也不占它的锁。返回形状（`staticServerPort` / `dataPlanePort` / `isPrimary`）不是公开协议，靠 `tests/services.rs::tinymist_serves_the_live_preview_on_the_ports_it_reports` 对着真 Tinymist 钉住。
 
 `/api/packages` 从官方索引查版本，安装精确版本到标准缓存。下载有超时与大小限制；包解压仅接收普通文件和目录，拒绝链接、越界和过大归档。先解压到临时目录并校验 manifest 存在，再重命名发布缓存，避免半安装状态。
 
@@ -420,11 +424,20 @@ render.raw: [{start:684, end:694}]
 
 前端另有一张 `ARRANGEMENTS` 白名单：遇到不认识的排布**报告一次**（经 `Typesetter.warn` 到状态栏），而不是静默按横排画错。
 
-回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 **15** 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符。
+回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 **16** 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符。
 
 每个 `Kind` 实际给前端提供了什么、对应的引擎 item 又有什么、两者差在哪，逐条列在 `docs/kind-inventory.md`（从真实后端与真实适配器取回，不是读代码推的）。
 
-## 整页预览
+## 两条预览路径，别混起来
+
+**实时预览走 Tinymist，整页 SVG 走我们自己的适配器**，两者互不依赖：
+
+| | 实时预览 | 整页 SVG |
+| --- | --- | --- |
+| 入口 | 视图菜单 → 显示 / 隐藏实时预览（默认关） | 文件 → 导出 SVG |
+| 谁渲染 | **Tinymist**（它自己的进程与 WebSocket，增量推送） | native-adapter（`/api/preview`） |
+| 编辑器做什么 | 把 Tinymist 的页面装进 web view | 把返回的页面 SVG 装进 `QSvgWidget` |
+| 关闭时 | `tinymist.doKillPreview`（开着的预览就是编译器） | 无状态 |
 
 原生 `RenderRequest.preview` 为 true 时，直接编译原文，不插入结构编辑器的 24pt 字号或映射标签。FontStore 加载随附字体及系统字体；日期由系统提供。已打开的项目内文档与未保存的 import/include 依赖作为 overlays 传入。页面尺寸、字体和正文样式由原文决定。窗口按需请求整页 SVG、保留上次成功页面并显示错误，页面尺寸按编辑区宽度缩放。
 

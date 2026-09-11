@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (QApplication,QMainWindow,QWidget,QSplitter,QDockWid
     QLineEdit,QPushButton,QFormLayout,QComboBox,QListWidget,QTextEdit)
 from .model import ROOT,load_settings,validate_settings,config_path,atomic_write,from_byte,to_byte,u16,from_u16,difference
 from .bridge import Core,Services
+from . import preview
 from .editor import Editor,SourceEditor
 from .mathview import Typesetter,MathCanvas
 from .svg import qt_svg
@@ -87,7 +88,13 @@ class Window(QMainWindow):
         self.outline.itemClicked.connect(lambda item,_:self.jump_byte(item.data(0,Qt.UserRole)))
         self.preview_container=QWidget();self.preview_layout=QVBoxLayout(self.preview_container);self.preview_layout.setAlignment(Qt.AlignTop)
         self.preview_scroll=QScrollArea();self.preview_scroll.setWidgetResizable(True);self.preview_scroll.setWidget(self.preview_container)
-        # Kept off-window only for explicit SVG export; there is no live preview pane.
+        # The live preview is Tinymist's own page in a web view, in its own dock, and it
+        # is **off** until asked for: starting it starts a compiler, so nothing is
+        # started here. `preview_dock` holds the web view once `set_preview(True)` runs.
+        self.preview_dock=QDockWidget("实时预览",self);self.preview_dock.hide()
+        self.addDockWidget(Qt.RightDockWidgetArea,self.preview_dock)
+        self.preview_view=None;self.preview_started=False
+        # Kept off-window only for explicit SVG export; the live preview is the dock above.
         self.math_scroll=QScrollArea(self.editor.viewport());self.math_scroll.setWidgetResizable(False)
         self.math_canvas=MathCanvas(self);self.math_scroll.setWidget(self.math_canvas);self.math_scroll.hide()
         self.math_scroll.setStyleSheet("QScrollArea {border:1px solid #458cc9;background:#f6faff;}")
@@ -128,6 +135,7 @@ class Window(QMainWindow):
             (edit,"copy","复制",lambda:self.focus_edit("copy"),"Ctrl+C",None),(edit,"cut","剪切",lambda:self.focus_edit("cut"),"Ctrl+X",None),
             (edit,"paste","粘贴",lambda:self.focus_edit("paste"),"Ctrl+V",None),(edit,"findReplace","查找 / 替换…",self.find_replace,"Ctrl+H",None),
             (view,"toggleSource","显示 / 隐藏源码栏",lambda:self.source_dock.setVisible(not self.source_dock.isVisible()),None,None),
+            (view,"togglePreview","显示 / 隐藏实时预览",lambda:self.set_preview(not self.preview_dock.isVisible()),None,None),
             (view,"split","分栏",self.split,None,None),
             (view,"increaseEditorFont","放大编辑字号",lambda:self.change_font(1),"Ctrl+=",None),(view,"decreaseEditorFont","缩小编辑字号",lambda:self.change_font(-1),"Ctrl+-",None),
             (math,"insertInline","行内公式",lambda:self.insert_formula(False),"Ctrl+Alt+I",mathbar),
@@ -861,6 +869,66 @@ class Window(QMainWindow):
             if isinstance(key,str):del self.typesetter.cache[key]
         self.typesetter.touch()
 
+    def preview_widget(self):
+        """The web view the preview is shown in, created on first use.
+
+        Separate from `set_preview` so it can be replaced: QtWebEngine **cannot run under
+        the offscreen platform** — constructing one there is an access violation, not an
+        error — so the test suite swaps in a stand-in and exercises the real start/stop
+        logic against it. Everything else about the preview is the same in both.
+        """
+        if self.preview_view is None:
+            self.preview_view=preview.view()
+            if self.preview_view is not None:self.preview_dock.setWidget(self.preview_view)
+        return self.preview_view
+
+    def set_preview(self,on):
+        """Show or hide the live preview, starting and stopping Tinymist's preview with it.
+
+        Only the **on** transition costs anything: Tinymist serves the page and pushes
+        incremental renderings, so a visible preview is a running compiler. Hiding it
+        therefore kills the preview rather than leaving one compiling in the background,
+        which is what "只有开启时才渲染" asks for.
+        """
+        if not on:
+            self.preview_dock.hide()
+            self.stop_preview()
+            return
+        preview.prepare()
+        if self.preview_widget() is None:
+            self.report(preview.available()[1]);return
+        self.preview_dock.show()
+        self.start_preview()
+
+    def start_preview(self):
+        """Ask Tinymist for a preview and load the page it serves.
+
+        The reply names the ports; the page and the WebSocket it opens share one, so one
+        URL is the whole of it. The answer arrives out of band, and the revision guard is
+        what keeps a stale reply from loading a preview of a document that has moved on —
+        the same guard `compile` uses for its pages.
+        """
+        if self.preview_started or not self.services or self.preview_widget() is None:return
+        self.preview_started=True
+        revision=self.revision
+        def started(result,error):
+            if error:
+                self.preview_started=False;self.report("实时预览启动失败："+error);return
+            target=preview.url(result)
+            if target is None:
+                self.preview_started=False;self.report("实时预览没有返回地址："+str(result));return
+            self.preview_revision=revision
+            self.preview_widget().load(target)
+            self.report("实时预览已开启")
+        self.services.request("/api/preview/live",self.body()|{"action":"start"},started)
+
+    def stop_preview(self):
+        """Stop Tinymist's preview, if one is running. Safe to call when none is."""
+        if not self.preview_started:return
+        self.preview_started=False
+        if self.preview_view is not None:self.preview_view.setUrl(QUrl("about:blank"))
+        if self.services:self.services.request("/api/preview/live",self.body()|{"action":"kill"},lambda result,error:None)
+
     def compile(self,callback=None):
         revision=self.revision
         self.report("正在编译预览…")
@@ -904,16 +972,6 @@ class Window(QMainWindow):
 
     def fit_preview(self):
         if self.pages:self.preview_zoom=max(.15,(self.preview_scroll.viewport().width()-32)/max(page.data["width"] for page in self.pages));self.zoom_preview(0)
-
-    def reveal_preview(self):
-        if self.preview_revision!=self.revision:
-            self.compile(lambda result,error:self.reveal_preview() if not error else None);return
-        position=to_byte(self.source,self.focused_editor().source_selection()[1])
-        targets=[(abs(item["start"]-position),page,item) for page in self.pages for item in page.data.get("mapping",[])]
-        if not targets:self.report("当前位置没有可定位的预览内容");return
-        _,page,item=min(targets,key=lambda entry:entry[0]);self.preview_dock.show()
-        y=page.y()+int(item["y"]*self.preview_zoom)
-        self.preview_scroll.ensureVisible(int(item["x"]*self.preview_zoom),y,30,60)
 
     def compile_pdf(self,save_as=False,open_after=True):
         if not self.finish_formula():return
@@ -1224,6 +1282,8 @@ class Window(QMainWindow):
         self.compile_timer.stop();self.core.close()
         self.completion_timer.stop()
         self.raw_timer.stop();self.math_popup.hide()
+        # A running preview is a running compiler: stop it before the services pipe goes.
+        self.stop_preview()
         if self.services:self.services.close()
         if self.lsp:self.lsp.close()
         if self in Window.windows:Window.windows.remove(self)

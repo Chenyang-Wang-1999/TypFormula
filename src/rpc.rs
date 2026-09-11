@@ -39,6 +39,7 @@ pub fn dispatch(services: &Services, request: &Value) -> Result<Value,String> {
         "/api/glyphs"=>services.glyphs(serde_json::from_value(body).map_err(|e|e.to_string())?),
         "/api/completion"=>serde_json::to_value(services.complete(serde_json::from_value(body).map_err(|e|e.to_string())?)?).map_err(|e|e.to_string()),
         "/api/lsp"=>services.language(body),
+        "/api/preview/live"=>services.preview(body),
         "/api/packages"=>packages::handle(body),
         _=>Err("未知后端请求".into()),
     }

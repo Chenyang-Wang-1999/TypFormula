@@ -13,7 +13,7 @@ visual-typst/
 │   ├── document.rs             文档所有权：源码是唯一权威 + 一个活动公式会话；`Document::annotate` 给每个 Raw 算源码区间（`Locator`）
 │   ├── desktop.rs              `--desktop-core` 的协议：`analyze`/`analyze_formula`/`scan`（含 `style_expressions`），一行一个 JSON 动作
 │   ├── rpc.rs                  `--stdio` 的协议：`dispatch` 把请求路由到 services/lsp/packages/preview
-│   ├── services.rs             Tinymist 会话、公式/附件/字形适配器子进程、整页预览与 PDF；`ask_adapter` 是三条适配器请求的公共入口
+│   ├── services.rs             Tinymist 会话（语言方法**与实时预览**共用）、公式/附件/字形适配器子进程、整页预览与 PDF；`ask_adapter` 是三条适配器请求的公共入口
 │   ├── packages.rs             @preview 包索引检索、下载、解压到 Typst 缓存
 │   └── workspace.rs            工作区内路径解析（拒绝越界）
 ├── crates/core/                编辑内核（crate `visual-typst-core`）：只依赖 `typst-syntax` 与 serde
@@ -31,6 +31,7 @@ visual-typst/
 │   ├── window.py               主窗口：源码/编辑区投影、公式会话驱动、Raw 取图调度、源码栏、大纲、预览、菜单
 │   ├── editor.py               编辑区控件：自定义公式对象、投影与光标映射、行号、语法高亮
 │   ├── mathview.py             **公式排版与绘制**：`Typesetter`（Box 布局）、`FormulaObject`（页面里的公式）、`MathCanvas`（公式编辑框）
+│   ├── preview.py              实时预览的接线：QtWebEngine 的 import 顺序约束、从 Tinymist 回复里取页面地址（渲染归 Tinymist）
 │   ├── mathfont.py             字体家族解析与字形映射（`glyph(..., substituted=True)` 是"引擎给的串原样画"的分界）
 │   ├── model.py                UTF-8 / UTF-16 / Qt 位置映射（`to_byte`/`from_byte`/`u16`/`from_u16`）、`Projection`、设置读写
 │   ├── bridge.py               子进程桥：`Core`（`--desktop-core`）、`Services`（`--stdio`）
@@ -65,7 +66,7 @@ visual-typst/
 │   ├── failed_block.rs         取不到图的片段：进入修复与恢复
 │   ├── attachments.rs          limits / stretch 的附件布局
 │   ├── desktop.rs              `--desktop-core` 协议
-│   ├── services.rs             服务路由
+│   ├── services.rs             服务路由；含对着真 Tinymist 钉住实时预览返回形状的用例
 │   └── workspace.rs            路径解析
 ├── tools/                      用真实 release 二进制取证据的脚本
 │   ├── kind_inventory.py       线上实测：每个 Kind 的 view JSON + 排布名双向对照（不一致则退出码 1）
