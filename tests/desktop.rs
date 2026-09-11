@@ -3,7 +3,7 @@ use visual_typst::{desktop::analyze, document::Document};
 
 #[test]
 fn native_projection_keeps_opaque_definitions_in_source_and_preserves_active_session() {
-    let source="#let opaque(x) = $cancel(#x)$\n#let expanded(x) = $#x + cancel(a)$\n中文 $expanded(y)$";
+    let source="#let opaque(x) = $lr(#x, size: #100%)$\n#let expanded(x) = $#x + lr(a, size: #100%)$\n中文 $expanded(y)$";
     let mut document=Document::default();
     document.apply(json!({"action":"set_source","source":source})).unwrap();
     let start=source.rfind('$').unwrap();

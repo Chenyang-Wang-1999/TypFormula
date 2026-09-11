@@ -92,16 +92,26 @@ class Box:
         self.raws += [(QRectF(rect).translated(x,y), node) for rect,node in other.raws]
 
 class Typesetter:
-    # The arrangements this frontend knows how to draw. `kind` is the name the
-    # backend declares for a node (`slots::Decl::view`), and everything in this
-    # set has a branch in `layout`. A name outside it is a frontend/backend
-    # mismatch, not a node to guess at.
+    # The arrangements this frontend knows how to draw. `kind` is the wire name
+    # the backend emits (`view_atom`), and everything in this set has a branch in
+    # `layout`. A name outside it is a frontend/backend mismatch, not a node to
+    # guess at.
+    #
+    # The set is deliberately organised by *editing and drawing logic*, not by
+    # Typst construct: `decorated` covers every one-cell node whose body is
+    # wrapped by something the frontend draws (a radical, a delimiter pair, an
+    # accent, a rule), because their editing is identical and only the drawing
+    # differs -- the `marker` field says which drawing. `table` and `multiline`
+    # are the two column-major arrangements (a dense matrix and a ragged
+    # alignment); `raw_macro` is a known callee the kernel cannot expand; `style`
+    # is a font variant, drawn from the engine's image of the call until the
+    # substituted glyphs arrive.
     ARRANGEMENTS = frozenset({
         "char", "symbol", "number", "raw", "text", "unknown", "parameter",
         "draft-text", "draft-placeholder", "draft-caret", "absent", "stop",
-        "cell", "empty-cell", "fraction", "sqrt", "root", "script",
-        "grid", "aligned", "delim", "decoration", "line",
-        "macro", "macro-argument", "macro-collapsed", "template-call",
+        "cell", "empty-cell", "fraction", "decorated", "root", "scripts",
+        "table", "multiline", "style",
+        "macro", "macro-argument", "raw_macro", "template-call",
     })
 
     def __init__(self, settings, cache=None):
@@ -209,6 +219,21 @@ class Typesetter:
                 return self.cache[key]
         return None
 
+    def image_box(self, node, metrics, factor):
+        """The compiled image of one fragment, or None while there is none to draw.
+
+        Metrics are ratios relative to the actual Typst environment.
+        """
+        item = self.raw(node)
+        if not isinstance(item, dict): return None
+        size = self.settings["font_size"] * metrics.fontDpi() / 72 * self.settings["svg_scale"]
+        width = max(1, item["base_font_size_pt"] * size)
+        height = max(1, item["base_font_height_pt"] * size)
+        base = item.get("base_font_baseline_pt", item["base_font_height_pt"]) * size
+        box = Box(width,height,base,[("svg",0,0,(item["svg"],width,height))])
+        box.raws.append((QRectF(0,0,width,height),node))
+        return box
+
     def note_unknown(self, kind):
         """Report an arrangement this frontend does not implement, once per kind."""
         if kind in self.unknown: return
@@ -265,16 +290,9 @@ class Typesetter:
         if kind == "stop":
             return Box(2,em,ascent,stops=[(1,0,em,node["cursor"],node.get("active",False))])
         if kind == "raw":
+            box = self.image_box(node, metrics, factor)
+            if box is not None: return box
             item = self.raw(node)
-            if isinstance(item, dict):
-                # Metrics are ratios relative to the actual Typst environment.
-                size = self.settings["font_size"] * metrics.fontDpi() / 72 * self.settings["svg_scale"]
-                width = max(1, item["base_font_size_pt"] * size)
-                height = max(1, item["base_font_height_pt"] * size)
-                base = item.get("base_font_baseline_pt", item["base_font_height_pt"]) * size
-                box = Box(width,height,base,[("svg",0,0,(item["svg"],width,height))])
-                box.raws.append((QRectF(0,0,width,height),node))
-                return box
             if item is False:
                 # Asked for and refused. Its source is shown instead, marked with
                 # dashes and warm ground, and the core lets a horizontal key enter
@@ -283,6 +301,15 @@ class Typesetter:
                 box = Box(width,em,ascent,[("text",0,ascent,(glyph,draw_font,kind))])
                 box.operations.insert(0,("failed",0,0,(width,em)))
                 box.raws.append((QRectF(0,0,width,em),node))
+                return box
+        if kind == "raw_macro" and not node.get("_active"):
+            # A call the kernel declines to expand is drawn as *the document has it* --
+            # one compiled image of the call's own source -- while the caret is outside
+            # the node. Entering it swaps to the name and its argument slots, which is
+            # what its children are; only the inside view lays those out.
+            box = self.image_box(node, metrics, factor)
+            if box is not None:
+                if node.get("selected"): box.operations.insert(0,("selection",0,0,(box.width,box.height)))
                 return box
         if not children:
             text = node.get("display_glyph") or node.get("text", "")
@@ -303,15 +330,20 @@ class Typesetter:
             box.add(numerator,(width-numerator.width)/2)
             box.add(denominator,(width-denominator.width)/2,numerator.height+6)
             box.operations.append(("line",2,numerator.height+3,(width-4,0)))
-        elif kind in ("sqrt","root"):
+        elif kind == "root":
+            # A radical *with a degree*: two cells, unlike the unary `decorated`.
             body=self.layout(self.slot(children,"radicand",0),factor)
-            index=self.layout(self.slot(children,"index",1),factor*.55) if kind=="root" else Box(0,0,0)
+            index=self.layout(self.slot(children,"index",1),factor*.55)
             lead=max(em*.6,index.width+4);top=max(3,index.height-body.height*.4)
             box=Box(lead+body.width+3,body.height+top+3,top+body.baseline)
             box.add(body,lead,top);box.add(index,0,0)
             points=[(lead-em*.6,top+body.height*.6),(lead-em*.45,top+body.height*.5),(lead-em*.22,top+body.height),(lead,top),(box.width,top)]
             for (x,y),(xx,yy) in zip(points,points[1:]):box.operations.append(("line",x,y,(xx-x,yy-y)))
-        elif kind == "script":
+        elif kind == "decorated":
+            # Not an early return: the `selected` marking below is applied to every
+            # box, so this branch has to leave its result in `box` like the others.
+            box = self.layout_decorated(node,children,factor,em,ascent,text_mode)
+        elif kind == "scripts":
             base = self.layout(self.slot(children,"base",0),factor)
             up,down = [self.layout(self.slot(children,role,index),factor*.7)
                        for role,index in (("upper",1),("lower",2))]
@@ -352,61 +384,76 @@ class Typesetter:
                 box.add(base,(core_width-base.width)/2,lift)
                 box.add(up,(core_width-up.width)/2 if centered_up else core_width,0)
                 box.add(down,(core_width-down.width)/2 if centered_down else core_width,down_y)
-        elif kind in ("grid","aligned"):
-            cells=[self.layout(child,factor) for child in children]
-            columns=max(1,node.get("columns",1));rows=(len(cells)+columns-1)//columns
-            widths=[max((c.width for i,c in enumerate(cells) if i%columns==j),default=0) for j in range(columns)]
-            heights=[max(c.height for c in cells[r*columns:(r+1)*columns]) for r in range(rows)]
+        elif kind == "style":
+            # A font variant. Typst applies one by *substituting codepoints* through a
+            # table the kernel cannot reach, so the glyphs are asked for separately and
+            # stamped on as `_glyph`. Four cases, and the order between them is the point:
+            #
+            #   caret inside                    -> the cells, so the body stays editable
+            #   `_glyph` present and non-empty  -> the substituted glyphs
+            #   `_glyph` present but empty      -> an anomaly: report it, show the source
+            #   `_glyph` absent (not asked yet) -> the engine's image of the call, which is
+            #                                      the one drawing that is always right
+            glyph = node.get("_glyph")
+            inner = lambda: self.layout(self.slot(children, "inner", 0), factor)
+            if node.get("_active"):
+                box = inner()
+            elif glyph:
+                text, draw_font, width = self.run(glyph, factor)
+                box = Box(width, em, ascent, [("text", 0, ascent, (text, draw_font, kind))])
+            elif "_glyph" in node:
+                self.note_unknown_marker("style:" + (node.get("style_name") or ""))
+                text, draw_font, width = self.source_run(node.get("text", ""), factor)
+                box = Box(width, em, ascent, [("text", 0, ascent, (text, draw_font, kind))])
+                box.operations.insert(0, ("failed", 0, 0, (width, em)))
+            else:
+                box = self.image_box(node, metrics, factor) or inner()
+        elif kind in ("table","multiline"):
+            # A ragged row is padded to `columns` for the flat cell list, so the
+            # padding has to be dropped here or the source would appear to have cells it
+            # does not: `mat(a, b; c)` is a two-cell row and a one-cell row, not three
+            # cells and an empty slot.
+            lengths=node.get("row_lengths") or []
+            cells=[]
+            for i,child in enumerate(children):
+                row,col=divmod(i,max(1,node.get("columns",1)))
+                if lengths and row<len(lengths) and col>=lengths[row]: continue
+                cells.append((i,child))
+            columns=max(1,node.get("columns",1));rows=(len(children)+columns-1)//columns
+            boxes={i:self.layout(child,factor) for i,child in cells}
+            widths=[max((boxes[i].width for i,_ in cells if i%columns==j),default=0) for j in range(columns)]
+            heights=[max((boxes[i].height for i,_ in cells if i//columns==r),default=0) for r in range(rows)]
             box=Box(sum(widths)+12*(columns-1),sum(heights)+4*(rows-1),sum(heights)/2+em*.25)
-            for i,cell in enumerate(cells):
+            # `mat` centres every cell; a ragged alignment alternates so its columns
+            # read as relations. `is_mat` is the wire's word for which of the two.
+            center=node.get("is_mat",False)
+            for i,_ in cells:
                 row,col=divmod(i,columns)
-                align=(widths[col]-cell.width)/2 if kind=="grid" or columns==1 else widths[col]-cell.width if col%2==0 else 0
-                box.add(cell,sum(widths[:col])+12*col+align,sum(heights[:row])+4*row)
-            if kind=="grid":
-                inner=box;box=Box(inner.width+12,inner.height,inner.baseline);box.add(inner,6,0)
-                for x,direction in [(1,1),(box.width-1,-1)]:
-                    box.operations.extend([("line",x,0,(0,box.height)),("line",x,0,(direction*4,0)),("line",x,box.height,(direction*4,0))])
+                align=(widths[col]-boxes[i].width)/2 if center or columns==1 else widths[col]-boxes[i].width if col%2==0 else 0
+                box.add(boxes[i],sum(widths[:col])+12*col+align,sum(heights[:row])+4*row)
+            border=node.get("border") or ""
+            if border:
+                # The engine's `MatElem` defaults to a parenthesis pair. The frontend
+                # used to draw square brackets for every table whatever the source
+                # said; carrying the pair on the wire is what makes the two agree.
+                left,right=(list(border)+["",""])[:2]
+                marks=[m for m in (self.layout({"kind":"symbol","text":ch},factor) for ch in (left,right)) if m.width]
+                if marks:
+                    inner=box;pad=2
+                    box=Box(inner.width+sum(m.width for m in marks)+pad*len(marks),
+                            max([inner.height]+[m.height for m in marks]),inner.baseline)
+                    box.add(inner,marks[0].width+pad,0)
+                    box.add(marks[0],0,(box.height-marks[0].height)/2)
+                    if len(marks)>1:
+                        box.add(marks[1],box.width-marks[1].width,(box.height-marks[1].height)/2)
         else:
             parts=[self.layout(child,factor,text_mode or kind=="text") for child in children]
-            if kind == "delim":
-                left,right=(node.get("text", "(\n)").split("\n")+[""])[:2]
-                parts=[self.layout({"kind":"symbol","text":left},factor)]+parts+[self.layout({"kind":"symbol","text":right},factor)]
             baseline=max((part.baseline for part in parts),default=ascent)
             height=baseline+max((part.height-part.baseline for part in parts),default=descent)
             box=Box(sum(p.width for p in parts),height,baseline)
             x=0
             for part in parts:
                 box.add(part,x,baseline-part.baseline);x+=part.width
-            if kind=="line":
-                # `LineItem` holds only the position, so the node says which one it
-                # is instead of naming a command the frontend would decode.
-                if node.get("text")=="below":
-                    box.operations.append(("line",0,box.height,(box.width,0)));box.height+=3
-                else:
-                    old=box;box=Box(old.width,old.height+5,old.baseline+5);box.add(old,0,5)
-                    box.operations.append(("line",0,2,(box.width,0)))
-            elif kind=="decoration":
-                # A mark above the base. The drawing is chosen by the name, and only
-                # by names the backend can actually produce: `hat`/`vec` are the two
-                # accents its command table accepts (`crates/core/src/cursor.rs`), so
-                # anything else here would be a branch no formula can reach.
-                #
-                # Every accent this backend accepts is an above one. A bottom accent
-                # needs the mark's own metrics, which is the engine-data channel that
-                # does not exist yet, so guessing a lower position would only be wrong
-                # in a different way.
-                #
-                # `vec` is deliberately *not* an arrow: Typst's `vec` is a column
-                # vector (`(x)` over one element), not the accent `arrow`. Drawing an
-                # arrow for it was a guess made when this file was written and it
-                # contradicts the document; the arrow belongs to `arrow(x)`, which the
-                # backend leaves as `Raw` and the engine draws itself.
-                name=node.get("text","") if node.get("text") in ("hat","vec") else ""
-                old=box;box=Box(old.width,old.height+5,old.baseline+5);box.add(old,0,5)
-                if name=="hat":
-                    box.operations.extend([("line",0,4,(box.width/2,-4)),("line",box.width/2,0,(box.width/2,4))])
-                else:
-                    box.operations.append(("line",0,2,(box.width,0)))
         if kind in ('unknown','text'):
             inner=box;box=Box(inner.width+8,inner.height+4,inner.baseline+2)
             mode='string' if kind=='text' or node.get('_string_mode') else 'command'
@@ -414,6 +461,85 @@ class Typesetter:
             box.add(inner,4,2)
         if node.get("selected"):
             box.operations.insert(0,("selection",0,0,(box.width,box.height)))
+        return box
+
+    # The decorations this frontend can draw, by `marker`. The vocabulary is a
+    # contract with the kernel, exactly like the arrangement names above, so an
+    # unknown marker is a mismatch to report rather than something to guess at.
+    MARKERS = frozenset({"radical", "delim", "overline", "underline", "hat", "cancel"})
+
+    def note_unknown_marker(self, marker):
+        """Report a decoration this frontend cannot draw, once per marker."""
+        if marker in self.unknown: return
+        self.unknown.add(marker)
+        if self.warn: self.warn(f"未知的装饰 {marker!r}：已按上方横线显示，前后端可能不同步")
+
+    def layout_decorated(self, node, children, factor, em, ascent, text_mode):
+        """One cell wrapped by something the frontend draws, chosen by `marker`.
+
+        A radical, a delimiter pair, an accent and a rule all arrive as
+        `decorated`, because their *editing* is identical: one cell, entered at
+        the edge, linear left/right, no vertical move. Only the drawing differs,
+        so the marker is the whole of the difference. The body's role follows the
+        shape rather than the marker: a radical takes a `radicand`, every other
+        wrapper an `inner` cell.
+        """
+        marker=node.get("marker","")
+        if marker not in self.MARKERS: self.note_unknown_marker(marker)
+        body=self.layout(self.slot(children,"radicand" if marker=="radical" else "inner",0),factor)
+        if marker=="radical":
+            # The hook alone, then the body. `root` draws the same hook with a
+            # degree in front of it; the only difference is the lead-in width.
+            lead=max(em*.6,4);top=3
+            box=Box(lead+body.width+3,body.height+top+3,top+body.baseline)
+            box.add(body,lead,top)
+            points=[(lead-em*.6,top+body.height*.6),(lead-em*.45,top+body.height*.5),(lead-em*.22,top+body.height),(lead,top),(box.width,top)]
+            for (x,y),(xx,yy) in zip(points,points[1:]):box.operations.append(("line",x,y,(xx-x,yy-y)))
+            return box
+        if marker=="delim":
+            # The pair travels in `text` as left, newline, right -- the spelling the
+            # frontend has always read -- and is drawn as plain symbols, which does
+            # not stretch with the body yet.
+            left,right=(node.get("text","(\n)").split("\n")+[""])[:2]
+            parts=[self.layout({"kind":"symbol","text":left},factor),body,
+                   self.layout({"kind":"symbol","text":right},factor)]
+            baseline=max((part.baseline for part in parts),default=ascent)
+            height=baseline+max((part.height-part.baseline for part in parts),default=em-ascent)
+            box=Box(sum(p.width for p in parts),height,baseline)
+            x=0
+            for part in parts:
+                box.add(part,x,baseline-part.baseline);x+=part.width
+            return box
+        if marker=="cancel":
+            # A strike drawn *over* the body, not around it: measured against the
+            # engine, `cancel(x)` and `x` are the same box (13.728x10.872 at 24pt)
+            # while `hat(x)` and `overline(x)` both grow theirs. So this branch
+            # returns the body's own box with one extra stroke, where the marks
+            # below lift the body to make room. `CancelItem`'s default is the
+            # rising diagonal of the content box, lengthened by 0.3em — extended
+            # along its own direction and centred, so both ends overhang equally.
+            box=Box(body.width,body.height,body.baseline)
+            box.add(body,0,0)
+            dx,dy=body.width,-body.height
+            length=math.hypot(dx,dy) or 1.0
+            ux,uy=dx/length,dy/length
+            half=em*.15
+            box.operations.append(("line",-ux*half,box.height-uy*half,(dx+2*ux*half,dy+2*uy*half)))
+            return box
+        if marker=="underline":
+            box=Box(body.width,body.height,body.baseline)
+            box.add(body,0,0)
+            box.operations.append(("line",0,box.height,(box.width,0)));box.height+=3
+            return box
+        # A mark above the base: `overline`, `hat`, and any other above-accent. A
+        # bottom accent needs the mark's own metrics, which is the engine-data
+        # channel that does not exist yet, so guessing a lower position would only
+        # be wrong in a different way.
+        old=body;box=Box(old.width,old.height+5,old.baseline+5);box.add(old,0,5)
+        if marker=="hat":
+            box.operations.extend([("line",0,4,(box.width/2,-4)),("line",box.width/2,0,(box.width/2,4))])
+        else:
+            box.operations.append(("line",0,2,(box.width,0)))
         return box
 
     def paint(self, painter, box, x=0,y=0,active=False):

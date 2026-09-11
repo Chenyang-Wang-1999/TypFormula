@@ -98,6 +98,29 @@ fn a_radical_walks_its_two_cells_and_then_leaves() {
 }
 
 #[test]
+fn a_radical_is_entered_backward_at_the_end_of_its_radicand() {
+    // A radical's cells are stored `[radicand, index]` while the degree is drawn to
+    // the LEFT, so walking left out of the radicand reaches the index cell from its
+    // right and the caret lands at that cell's END.
+    //
+    // This is `move_horizontal`'s `root_back`, not `entry_cell`: entering the node
+    // from outside goes through the entry role and lands at the end either way, which
+    // is why an earlier version of this test passed even with the rule disabled. It
+    // takes being *inside* the radicand at its start and stepping left across the cell
+    // boundary to reach it.
+    let mut editor = load("root(3, x + 1)");
+    key(&mut editor, "End");
+    key(&mut editor, "ArrowLeft");
+    // Backward entry is the radicand, met from its right, so the caret lands at the
+    // end of `x + 1` (3 atoms).
+    assert_eq!(caret(&editor), (vec![0], 3), "向左进入根式落在被开方式末尾");
+    key(&mut editor, "Home");
+    assert_eq!(caret(&editor), (vec![0], 0), "先回到被开方式开头");
+    key(&mut editor, "ArrowLeft");
+    assert_eq!(caret(&editor), (vec![1], 1), "向左跨格到根指数，从右侧进入所以落在格尾");
+}
+
+#[test]
 fn an_attachment_is_reached_from_the_end_of_its_base() {
     let mut editor = load("x^2");
     key(&mut editor, "ArrowRight");

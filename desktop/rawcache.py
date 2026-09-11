@@ -72,7 +72,7 @@ class RawCache:
         current={}
         if state:
             for node in nodes(state['view']):
-                if node.get('kind')!='script':continue
+                if node.get('kind')!='scripts':continue
                 raw=tuple((n.get('_raw_key'),n.get('text','')) for n in nodes(node['children'][0]) if n.get('kind')=='raw')
                 if not raw:continue
                 slots=node['children'][1:]

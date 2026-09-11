@@ -30,7 +30,7 @@ fn function_parameters_and_later_bindings_do_not_resolve_outer_macros() {
 fn expandability_is_decided_by_structure_alone() {
     // A template that no render result can affect: the editor can show every
     // parameter in a slot, which is the whole condition.
-    let source = "#let opaque(x) = x + 1\n#let f(x, y) = $cancel(a) + #x/#y$\n#[#let g(z) = $#z + cancel(b)$\n]";
+    let source = "#let opaque(x) = x + 1\n#let f(x, y) = $lr(a, size: #100%) + #x/#y$\n#[#let g(z) = $#z + lr(b, size: #100%)$\n]";
     let registry = typst::macro_registry(source);
     assert!(registry.get("f").unwrap().expandable, "{}", registry.get("f").unwrap().reason);
     // A binding inside a completed content block is out of scope at the end of the
@@ -39,16 +39,16 @@ fn expandability_is_decided_by_structure_alone() {
     // A definition whose body is not a formula, or that hides a parameter, stays
     // source-mode regardless of what its fragments would render as.
     assert!(!typst::macro_registry("#let opaque(x) = x + 1").get("opaque").unwrap().expandable);
-    assert!(!typst::macro_registry("#let hidden(x) = $cancel(a)$").get("hidden").unwrap().expandable);
+    assert!(!typst::macro_registry("#let hidden(x) = $lr(a, size: #100%)$").get("hidden").unwrap().expandable);
 }
 
 #[test]
 fn a_template_fragment_is_asked_for_at_its_own_place_in_the_definition() {
-    let source = "#let f(x, y) = $cancel(a) + #x/#y$";
+    let source = "#let f(x, y) = $lr(a, size: #100%) + #x/#y$";
     let definition = typst::macro_registry(source).get("f").cloned().unwrap();
-    let ranges = typst::definition_raw_ranges(&definition, "cancel(a)");
+    let ranges = typst::definition_raw_ranges(&definition, "lr(a, size: #100%)");
     assert_eq!(ranges.len(),1,"{ranges:?}");
-    assert_eq!(&source[ranges[0].0..ranges[0].1],"cancel(a)");
+    assert_eq!(&source[ranges[0].0..ranges[0].1],"lr(a, size: #100%)");
     // The prefix the range is measured in is the document prefix, so the offset is
     // the document's own — nothing here is a private copy of the definition.
     assert_eq!(typst::definition_prefix(&definition),source);
@@ -56,15 +56,15 @@ fn a_template_fragment_is_asked_for_at_its_own_place_in_the_definition() {
 
 #[test]
 fn a_call_site_fragment_carries_the_definition_range_it_is_rendered_from() {
-    let source="#let fixed(x) = $#x + cancel(a)$\n$ fixed(z) $";
+    let source="#let fixed(x) = $#x + lr(a, size: #100%)$\n$ fixed(z) $";
     let mut doc=Document::default();doc.apply(json!({"action":"set_source","source":source})).unwrap();
     doc.apply(json!({"action":"activate_formula","start":source.rfind("$ fixed").unwrap()})).unwrap();
     let response=doc.response();
-    let definition=source.find("cancel(a)").unwrap();
+    let definition=source.find("lr(a, size: #100%)").unwrap();
     let raw=response["render"]["raw"].as_array().unwrap().clone();
     assert_eq!(raw.len(),1,"{response}");
     assert_eq!(raw[0]["start"].as_u64().unwrap() as usize,definition);
-    assert_eq!(raw[0]["end"].as_u64().unwrap() as usize,definition+"cancel(a)".len());
+    assert_eq!(raw[0]["end"].as_u64().unwrap() as usize,definition+"lr(a, size: #100%)".len());
     let view=response["view"].to_string();
     assert!(view.contains(&format!("\"source_range\":[{definition},")),"{view}");
     assert_eq!(response["source"],source,"asking for an image never edits the document");
@@ -72,9 +72,9 @@ fn a_call_site_fragment_carries_the_definition_range_it_is_rendered_from() {
 
 #[test]
 fn duplicate_fragments_in_one_definition_keep_distinct_ranges() {
-    let source="#[#let unused = $cancel(a)$]\n#let fixed(x) = $#x + cancel(a) + b^(cancel(a))$\n$ fixed(z) $";
+    let source="#[#let unused = $lr(a, size: #100%)$]\n#let fixed(x) = $#x + lr(a, size: #100%) + b^(lr(a, size: #100%))$\n$ fixed(z) $";
     let definition=typst::macro_registry(source).get("fixed").cloned().unwrap();
-    let ranges=typst::definition_raw_ranges(&definition,"cancel(a)");
+    let ranges=typst::definition_raw_ranges(&definition,"lr(a, size: #100%)");
     assert_eq!(ranges.len(),2,"{ranges:?}");
     assert_ne!(ranges[0],ranges[1]);
     let owner=source.find("#let fixed").unwrap();
@@ -91,9 +91,9 @@ fn duplicate_fragments_in_one_definition_keep_distinct_ranges() {
 #[ignore = "requires the built native renderer"]
 fn a_call_site_fragment_renders_from_the_document_its_own_call() {
     let service=Services::new(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    let source="#let fixed(x) = $#x + cancel(a)$\n$ fixed(z) $";
+    let source="#let fixed(x) = $#x + lr(a, size: #100%)$\n$ fixed(z) $";
     let definition=typst::macro_registry(source).get("fixed").cloned().unwrap();
-    let (start,end)=typst::definition_raw_ranges(&definition,"cancel(a)")[0];
+    let (start,end)=typst::definition_raw_ranges(&definition,"lr(a, size: #100%)")[0];
     let request=RenderRequest{preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),
         source:source.into(),raw:vec![RawRange{id:format!("{start}:{end}"),start,end}],formulas:vec![],preview_hashes:vec![],context_end:None};
     let result=service.render(request).unwrap();

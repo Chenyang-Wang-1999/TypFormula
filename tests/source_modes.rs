@@ -4,10 +4,18 @@ fn input(e:&mut Editor,s:&str){e.apply(Action::Input{text:s.into()}).unwrap();}
 fn key(e:&mut Editor,s:&str){e.apply(Action::Key{key:s.into(),ctrl:false,shift:false}).unwrap();}
 fn source(e:&Editor)->String{typst::write_cell(&e.root)}
 fn find_raw(v:&View)->Option<&View>{if v.kind=="raw"{Some(v)}else{v.children.iter().find_map(find_raw)}}
+/// 公式第一个原子被画成什么排布——"这个名字还绑着可展宏吗"现在靠它分辨。
+///
+/// 从前这一问能用 `Kind` 回答：未绑定的调用是 `Raw`、绑定的可展宏是 `MacroCall`。放宽
+/// 之后两者都是 `MacroCall`（名字未知的调用画成 `raw_macro`、可展宏画成 `macro`），
+/// 所以判据移到了**画法**上——而这正是它本来想说的意思。
+fn first_view_kind(e:&mut Editor)->String{
+    e.response().view.children.iter().find(|c|c.kind!="stop").map(|c|c.kind.clone()).unwrap_or_default()
+}
 
 #[test]
 fn one_fallback_command_has_one_source_and_no_inner_cursor() {
-    let mut e=Editor::default();let command="cancel(sqrt(x)  + dif y)";
+    let mut e=Editor::default();let command="lr(sqrt(x)  + dif y, size: #100%)";
     input(&mut e,&format!("\\{command}"));key(&mut e,"Enter");
     assert_eq!(e.root.len(),1);assert_eq!(source(&e),command);assert!(e.root[0].cells.is_empty());
     key(&mut e,"Backspace");assert!(e.root.is_empty());e.apply(Action::Undo).unwrap();assert_eq!(source(&e),command);
@@ -18,7 +26,7 @@ fn special_syntax_keeps_spelling_without_implicit_strings() {
     // Plain input is one character per key, and the two characters are written
     // apart: joined, `>=` would be re-read as one shorthand token.
     let mut e=Editor::default();input(&mut e,">=");assert_eq!(source(&e),"> =");
-    for command in ["x >= y", r"\/", "cancel(x >= y)"] {
+    for command in ["x >= y", r"\/", "lr(x >= y, size: #100%)"] {
         let mut e=Editor::default();input(&mut e,&format!("\\{command}"));key(&mut e,"Enter");
         assert_eq!(source(&e),command,"{command}");
     }
@@ -29,16 +37,16 @@ fn special_syntax_keeps_spelling_without_implicit_strings() {
 
 #[test]
 fn failed_source_can_be_corrected_or_restored_on_escape() {
-    let mut e=Editor::default();input(&mut e,"\\undefinedfunc(x)");key(&mut e,"Enter");
+    let mut e=Editor::default();input(&mut e,"\\undefinedname");key(&mut e,"Enter");
     let view=e.response().view;let raw=find_raw(&view).unwrap();let edit=raw.edit.clone().unwrap();
     e.apply(Action::EditSource{cursor:edit.clone(),source:raw.text.clone()}).unwrap();
-    assert_eq!(e.pending(),Some("undefinedfunc(x)"));
-    key(&mut e,"Escape");assert_eq!(source(&e),"undefinedfunc(x)");
-    e.apply(Action::EditSource{cursor:edit,source:"undefinedfunc(x)".into()}).unwrap();
-    e.apply(Action::Key{key:"a".into(),ctrl:true,shift:false}).unwrap();input(&mut e,"cancel(x)");key(&mut e,"Enter");
-    assert_eq!(source(&e),"cancel(x)");
-    e.apply(Action::Undo).unwrap();assert_eq!(e.pending(),Some("cancel(x)"));
-    key(&mut e,"Escape");assert_eq!(source(&e),"undefinedfunc(x)");
+    assert_eq!(e.pending(),Some("undefinedname"));
+    key(&mut e,"Escape");assert_eq!(source(&e),"undefinedname");
+    e.apply(Action::EditSource{cursor:edit,source:"undefinedname".into()}).unwrap();
+    e.apply(Action::Key{key:"a".into(),ctrl:true,shift:false}).unwrap();input(&mut e,"lr(x, size: #100%)");key(&mut e,"Enter");
+    assert_eq!(source(&e),"lr(x, size: #100%)");
+    e.apply(Action::Undo).unwrap();assert_eq!(e.pending(),Some("lr(x, size: #100%)"));
+    key(&mut e,"Escape");assert_eq!(source(&e),"undefinedname");
     e.apply(Action::EditSource{cursor:Cursor::default(),source:"stale".into()}).unwrap();assert!(e.pending().is_none());
 }
 
@@ -56,10 +64,13 @@ fn quote_mode_keeps_literal_operators_and_finishes_with_quote_or_enter() {
 
 #[test]
 fn quote_inside_command_uses_enter_to_close_string_before_confirming() {
-    let mut e=Editor::default();input(&mut e,"\\cancel(\"a >= b");
+    // The string is left open on purpose: Enter closes it before the command is
+    // confirmed. The named argument is typed only after that, so the draft still
+    // holds an odd number of quotes while the assertion about string mode runs.
+    let mut e=Editor::default();input(&mut e,"\\lr(\"a >= b");
     assert!(e.string_mode());assert!(e.response().command.is_none());
-    key(&mut e,"Enter");assert!(!e.string_mode());assert_eq!(e.pending(),Some("cancel(\"a >= b\""));
-    input(&mut e,")");key(&mut e,"Enter");assert_eq!(source(&e),"cancel(\"a >= b\")");assert!(e.pending().is_none());
+    key(&mut e,"Enter");assert!(!e.string_mode());assert_eq!(e.pending(),Some("lr(\"a >= b\""));
+    input(&mut e,", size: #100%)");key(&mut e,"Enter");assert_eq!(source(&e),"lr(\"a >= b\", size: #100%)");assert!(e.pending().is_none());
 }
 
 #[test]
@@ -111,11 +122,11 @@ fn macro_projections_share_only_their_own_argument_and_keep_clicked_occurrence()
 #[test]
 fn macro_classification_uses_typst_references_instead_of_text_replacement() {
     let defs = [RATIO,
-        "#let opaque(x) = $frac(1, cancel(#x))$",
-        "#let fixed(x) = $frac(#x, cancel(y))$",
+        "#let opaque(x) = $frac(1, lr(#x, size: #100%))$",
+        "#let fixed(x) = $frac(#x, lr(y, size: #100%))$",
         "#let literal(x) = $frac(x, x)$",
         "#let word(alpha) = $frac(alpha, alpha)$",
-        "#let quoted(x) = $#x + cancel(\"x\")$",
+        "#let quoted(x) = $#x + lr(\"x\", size: #100%)$",
         "#let dynamic(x) = if x == 1 { $1$ } else { $2$ }",
         "#let defaults(x: 1) = $#x$",
         "#let constant = $sqrt(2)$",
@@ -135,15 +146,15 @@ fn macro_classification_uses_typst_references_instead_of_text_replacement() {
 fn macro_edits_reclassify_without_losing_arguments_and_undo_restores_definitions() {
     let mut e = macro_editor();
     let old = e.response().source;
-    e.apply(Action::SetDefinitions { definitions:"#let ratio(x, y) = $cancel(#x + #y)$".into() }).unwrap();
+    e.apply(Action::SetDefinitions { definitions:"#let ratio(x, y) = $lr(#x + #y, size: #100%)$".into() }).unwrap();
     assert!(matches!(e.root[0].kind, Kind::Raw { .. }));
     assert_eq!(source(&e), "ratio(a, b) + ratio(c, d)");
     e.apply(Action::Undo).unwrap();
     assert_eq!(e.response().source, old);
     e.apply(Action::SetDefinitions { definitions:String::new() }).unwrap();
-    assert!(matches!(e.root[0].kind, Kind::Raw { .. }));
+    assert_eq!(first_view_kind(&mut e),"raw_macro","定义被清掉后它不再是宏调用，只是名字未知的调用");
     e.apply(Action::SetDefinitions { definitions:RATIO.into() }).unwrap();
-    assert!(matches!(e.root[0].kind, Kind::MacroCall { .. }));
+    assert_eq!(first_view_kind(&mut e),"macro","定义回来后又成了可展的宏调用");
     let old = e.response().source;
     for invalid in ["#let ratio(x) = $", "$x$", "#import \"a.typ\""] {
         assert!(e.apply(Action::SetDefinitions { definitions:invalid.into() }).is_err());
@@ -154,7 +165,7 @@ fn macro_edits_reclassify_without_losing_arguments_and_undo_restores_definitions
 }
 #[test]
 fn macro_cache_reuses_analysis_and_free_raw_uses_definition_scope() {
-    let defs = "#let amount = 2\n#let fixed(x) = $frac(#x, cancel(amount))$\n#let amount = 5\n";
+    let defs = "#let amount = 2\n#let fixed(x) = $frac(#x, lr(amount, size: #100%))$\n#let amount = 5\n";
     let registry = typst::macro_registry(defs);
     let again = typst::macro_registry(defs);
     assert!(std::sync::Arc::ptr_eq(&registry, &again));
@@ -162,7 +173,7 @@ fn macro_cache_reuses_analysis_and_free_raw_uses_definition_scope() {
     e.apply(Action::Import { source:format!("{defs}$fixed(a)$") }).unwrap();
     let view = e.response().view;
     let raw = views(&view, "raw")[0];
-    assert_eq!(raw.text, "cancel(amount)");
+    assert_eq!(raw.text, "lr(amount, size: #100%)");
     assert!(!raw.definitions.as_ref().unwrap().contains("amount = 5"));
     assert!(std::sync::Arc::ptr_eq(&registry, &typst::macro_registry(defs)));
     assert!(!std::sync::Arc::ptr_eq(&registry, &typst::macro_registry(RATIO)));
@@ -180,7 +191,7 @@ fn macro_names_shadow_builtins_and_empty_command_slots_are_editable() {
     key(&mut e, "Home"); key(&mut e, "Backspace");
     assert!(matches!(e.root[0].kind, Kind::MacroCall { .. }));
     assert_eq!(e.response().selected_source, "ratio(a, b)");
-    let parsed = typst::parse_document("#let frac(x, y) = $cancel(#x + #y)$\n$frac(a, b)$").unwrap();
+    let parsed = typst::parse_document("#let frac(x, y) = $lr(#x + #y, size: #100%)$\n$frac(a, b)$").unwrap();
     assert!(matches!(parsed.root[0].kind, Kind::Raw { .. }));
     let registry = typst::macro_registry("#let ratio(x) = $#x$\n#let ratio = 3");
     assert!(registry.entries[0].expandable && registry.entries[0].shadowed);
@@ -193,7 +204,7 @@ fn repeated_nested_calls_have_a_bounded_projection() {
     let mut e = Editor::default();
     e.apply(Action::Import { source:format!("#let twice(x) = $#x + #x$\n$ {expr} $") }).unwrap();
     let view = e.response().view;
-    assert!(!views(&view, "macro-collapsed").is_empty());
+    assert!(!views(&view, "raw_macro").is_empty());
     assert!(views(&view, "stop").len() < 10000);
     assert_eq!(source(&e), expr);
 }
@@ -206,7 +217,7 @@ fn jacobian_expands_dependencies_and_links_outer_parameters() {
     e.apply(Action::Import { source:format!("{PD}\n{JAC}\n$ jac(a, b, x, y) $") }).unwrap();
     let state = e.response();
     assert!(state.macros.iter().all(|d| d.expandable));
-    assert_eq!(views(&state.view, "grid").len(), 1);
+    assert_eq!(views(&state.view, "table").len(), 1);
     assert_eq!(views(&state.view, "fraction").len(), 4);
     assert_eq!(e.root.len(), 1);
     assert_eq!(e.root[0].cells.len(), 4);
@@ -234,7 +245,7 @@ fn jacobian_expands_dependencies_and_links_outer_parameters() {
 }
 #[test]
 fn nested_templates_capture_versions_even_after_opaque_shadowing() {
-    let defs = format!("{PD}\n{JAC}\n#let pd(f, x) = $cancel(#f + #x)$\n#let later(f, x) = $pd(#f, #x)$");
+    let defs = format!("{PD}\n{JAC}\n#let pd(f, x) = $lr(#f + #x, size: #100%)$\n#let later(f, x) = $pd(#f, #x)$");
     let mut e = Editor::default();
     e.apply(Action::Import { source:format!("{defs}\n$jac(a, b, x, y) + pd(a, x) + later(a, x)$") }).unwrap();
     let state = e.response();
@@ -249,17 +260,17 @@ fn nested_templates_capture_versions_even_after_opaque_shadowing() {
     e.apply(Action::SetDefinitions { definitions:defs }).unwrap();
     let state = e.response();
     assert_eq!(views(&state.view, "fraction").len(), 4);
-    assert_eq!(views(&state.view, "sqrt").len(), 1);
+    assert_eq!(views(&state.view, "decorated").len(), 1);
     let registry = typst::macro_registry(&format!("{PD}\n#let local(pd, f, x) = $pd(#f, #x)$"));
     assert!(!registry.get("local").unwrap().expandable);
     let registry = typst::macro_registry(&format!("{PD}\n#let pd(f, x) = $pd(#f, #x)$"));
     assert!(!registry.get("pd").unwrap().expandable, "self recursion must not bind the previous pd");
     e.apply(Action::Import { source:"#let value = $sqrt(2)$\n#let value = $value + 1$\n$value$".into() }).unwrap();
-    assert_eq!(views(&e.response().view, "sqrt").len(), 1, "normal initializers see the preceding binding");
+    assert_eq!(views(&e.response().view, "decorated").len(), 1, "normal initializers see the preceding binding");
 }
 #[test]
 fn composed_arguments_keep_outer_colors_and_lexical_raw_contexts() {
-    let defs = "#let amount = 2\n#let pair(x) = $frac(#x, #x + cancel(amount))$\n#let amount = 5\n#let outer(y) = $pair(#y + 1)$\n#let amount = 9";
+    let defs = "#let amount = 2\n#let pair(x) = $frac(#x, #x + lr(amount, size: #100%))$\n#let amount = 5\n#let outer(y) = $pair(#y + 1)$\n#let amount = 9";
     let mut e = Editor::default();
     e.apply(Action::Import { source:format!("{defs}\n$outer(a)$") }).unwrap();
     let state = e.response();
@@ -267,11 +278,11 @@ fn composed_arguments_keep_outer_colors_and_lexical_raw_contexts() {
     assert_eq!(args.len(), 2);
     assert!(args.iter().all(|a| a.text == "y" && a.columns == 0));
     let raw = views(&state.view, "raw")[0];
-    assert_eq!(raw.text, "cancel(amount)");
+    assert_eq!(raw.text, "lr(amount, size: #100%)");
     assert!(!raw.definitions.as_ref().unwrap().contains("amount = 5"));
     assert!(!raw.definitions.as_ref().unwrap().contains("amount = 9"));
     // A reference in the argument expression belongs to the caller's scope.
-    e.apply(Action::SetDefinitions { definitions:defs.replace("pair(#y + 1)", "pair(#y + cancel(amount))") }).unwrap();
+    e.apply(Action::SetDefinitions { definitions:defs.replace("pair(#y + 1)", "pair(#y + lr(amount, size: #100%))") }).unwrap();
     let state = e.response();
     let raws = views(&state.view, "raw");
     assert_eq!(raws.len(), 3);
@@ -295,18 +306,31 @@ fn definition_edits_reuse_only_the_unchanged_prefix_and_rebuild_dependents() {
     // template body is unchanged, so equal templates are correct here.
     assert_eq!(tail_edit.entries[2].name, "renamed");
     assert_eq!(tail_edit.entries[2].params, vec!["x".to_string()]);
-    let pd_edit = typst::macro_registry(&original.replace("frac(partial #f, partial #x)", "cancel(#f + #x)"));
+    let pd_edit = typst::macro_registry(&original.replace("frac(partial #f, partial #x)", "lr(#f + #x, size: #100%)"));
     assert!(pd_edit.entries.iter().all(|d| !d.expandable));
     let restored = typst::macro_registry(&original);
     assert!(restored.entries.iter().all(|d| d.expandable));
     // An identical definition set is served from the cache, address for address.
     assert!(std::sync::Arc::ptr_eq(&first, &restored));
+    // `jac` calls `pd`, which this registry does not define. That used to make `jac`
+    // unexpandable: the calibration was "a parameter used inside a `Raw`", and an
+    // unknown call *was* a `Raw`, so `#f1` sat inside one and could not be offered as a
+    // slot. Now an unknown call whose arguments are all positional is a `MacroCall`
+    // (`raw_macro`: one image of the call, or its name and the argument slots once the
+    // caret enters), so the parameters do reach cells and expansion is safe.
     let removed = typst::macro_registry(JAC);
-    assert!(!removed.entries[0].expandable);
+    assert!(removed.entries[0].expandable,
+            "被调名字未知不再阻止展开：那个调用会画成 raw_macro，参数仍然可编辑");
     let mut e = Editor::default();
     e.apply(Action::Import { source:format!("{original}\n$jac(a,b,x,y)$") }).unwrap();
     e.apply(Action::SetDefinitions { definitions:JAC.into() }).unwrap();
-    assert!(matches!(e.root[0].kind, Kind::Raw { .. }));
+    // `JAC` defines `jac` but not `pd`. That used to keep the call unexpanded (it was a
+    // `Raw`); now it expands, and what is unknown about it shows up *inside* the
+    // expansion as a `raw_macro` — the call itself, drawn as one image until the caret
+    // enters it.
+    assert!(matches!(e.root[0].kind, Kind::MacroCall { .. }));
+    assert!(!views(&e.response().view, "raw_macro").is_empty(),
+            "未定义的 pd(…) 在展开结果里画成 raw_macro");
     e.apply(Action::Undo).unwrap();
     assert_eq!(views(&e.response().view, "fraction").len(), 4);
 }
@@ -320,13 +344,13 @@ fn dependency_graphs_are_shared_and_projection_limits_do_not_change_classificati
     let mut e = Editor::default();
     e.apply(Action::Import { source:format!("{defs}\n$layer29(a)$") }).unwrap();
     let state = e.response();
-    assert_eq!(views(&state.view, "macro-collapsed").len(), 1);
+    assert_eq!(views(&state.view, "raw_macro").len(), 1);
     assert_eq!(source(&e), "layer29(a)");
     let mut chain = "#let layer0(x) = $#x$".to_string();
     for i in 1..70 { chain.push_str(&format!("\n#let layer{i}(x) = $layer{}(#x)$", i-1)); }
     e.apply(Action::Import { source:format!("{chain}\n$layer69(a)$") }).unwrap();
     assert!(e.response().macros.iter().all(|d| d.expandable));
-    assert_eq!(views(&e.response().view, "macro-collapsed").len(), 1);
+    assert_eq!(views(&e.response().view, "raw_macro").len(), 1);
 }
 
 

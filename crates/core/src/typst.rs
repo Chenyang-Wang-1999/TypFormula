@@ -9,6 +9,10 @@ use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}};
 
 pub const PROJECTION_LIMIT: usize = 4096;
 const SIZE_CAP: usize = PROJECTION_LIMIT + 1;
+/// The table an empty `mat()` is given, since its source says nothing about shape.
+/// Kept here rather than in `cursor` because the parser is what builds it.
+const NEW_TABLE_COLUMNS: usize = 2;
+const NEW_TABLE_CELLS: usize = NEW_TABLE_COLUMNS * NEW_TABLE_COLUMNS;
 // Definition-prefix text kept in the registry cache. A document with F formulas
 // asks for F distinct prefixes, so the budget has to cover a whole document for
 // the second pass over it (font change, split, LSP reclassification, reopening a
@@ -547,10 +551,26 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             if let Some(bottom) = a.bottom() { script.cells[script_cell(false)] = parse_cell(bottom.to_untyped(), ctx); }
             script
         }
+        // `√x`/`∛x` are *syntax* rather than a call, but they mean the two shapes the
+        // commands `sqrt`/`root` mean — and neither shape carries data of its own, so
+        // the node is the call either way. That keeps `√x` and `sqrt(x)` **one** node
+        // instead of two, and the written form is unchanged: `√x` has always been
+        // written `sqrt(x)` (the shape's spelling is what decides, not the source).
         Some(ast::Expr::MathRoot(r)) => {
-            let body = parse_cell(r.radicand().to_untyped(), ctx);
-            if let Some(i) = r.index() { MathAtom { kind: Kind::Root, cells: vec![body, i.to_string().chars().map(MathAtom::character).collect()] } }
-            else { MathAtom { kind: Kind::Sqrt, cells: vec![body] } }
+            let radicand = parse_cell(r.radicand().to_untyped(), ctx);
+            // A radical's slots are `[radicand, index]` — the reverse of Typst's
+            // `root(index, radicand)`, which is what the shape's write template says.
+            //
+            // The degree is built as the `Number` that `root(3, x)` parses to, not from
+            // its characters: `MathRoot::index` hands back a literal `u8`, and spelling
+            // it out as a bare `Char` gave `∛x` and `root(3, x)` two different trees for
+            // the same maths — which `round_trip.rs` caught the moment anything covered
+            // this branch at all.
+            let (name, cells) = match r.index() {
+                Some(degree) => ("root", vec![radicand, vec![MathAtom::number(&degree.to_string())]]),
+                None => ("sqrt", vec![radicand]),
+            };
+            MathAtom { kind: Kind::MacroCall { name: name.into(), function: true }, cells }
         }
         Some(ast::Expr::MathDelimited(d)) => {
             let raw = node.full_text();
@@ -576,10 +596,19 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
                 }
                 return vec![MathAtom::raw(node.full_text())];
             }
-            // A name the table does not know is not a command: leave the text as
-            // the engine spelled it and let the compiler draw it.
+            // A name the command file does not know is not a *command* — but it is still
+            // a call, and its arguments are still parseable. So it becomes a `MacroCall`
+            // all the same: the node stores the name and its arguments, and the frontend
+            // draws the call's own source as one image while the caret is outside and
+            // swaps to the name plus those argument slots once it enters
+            // (`view::MACRO_COLLAPSED`, the `raw_macro` arrangement). That is the whole
+            // difference from a configured name: the *shape* is unknown, so there is no
+            // slot schema to borrow, and no template to expand.
             if !candidate_names().contains(&name.as_str()) {
-                return vec![MathAtom::from_source(node.full_text())];
+                let Some(args) = positional_args(call, ctx) else {
+                    return vec![MathAtom::from_source(node.full_text())];
+                };
+                return vec![MathAtom { kind: Kind::MacroCall { name, function: true }, cells: args }];
             }
             let mut args = vec![];
             // Cells per **row**, in source order: a comma keeps the count, a
@@ -587,6 +616,11 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             // `mat(1; 2; 3)` is three rows of one — the *columns* of the table are
             // the width of its first row, which is why every row has to agree before
             // this can be a table at all.
+            //
+            // The two loops below read the same argument list for two different
+            // questions: this one wants the **rows** (so it watches the semicolons),
+            // and `positional_args` wants the cells. A table is the only shape that
+            // asks about rows, which is why it cannot go through that helper whole.
             let mut cells_per_row = vec![];
             let mut width = 0;
             for item in call.args().arg_items() {
@@ -597,46 +631,58 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
                 if item.ends_in_semicolon { cells_per_row.push(width); width = 0; }
             }
             if width > 0 { cells_per_row.push(width); }
-            // Only a matrix whose rows are all the same width is one: `mat(a, b; c)`
-            // is not a table Typst can lay out, so it stays source. An empty `mat()`
-            // has no rows at all and is still the matrix the author asked for, so the
-            // editor's own default stands in for the shape it cannot read.
-            if name == "mat" {
-                return match (args.len(), cells_per_row.iter().all(|w| *w == cells_per_row[0])) {
-                    (n, true) if n > 0 => vec![MathAtom { kind: Kind::Table { columns: cells_per_row[0] }, cells: args }],
-                    (0, _) => vec![MathAtom::nest(Kind::Table { columns: 2 }, 4)],
-                    _ => vec![MathAtom::from_source(node.full_text())],
+            // A table's rows come from how the argument list is punctuated, and *which*
+            // punctuation counts is the command file's answer — `mat` splits on
+            // semicolons, while `vec` and `cases` take one argument per row however the
+            // arguments are separated. Everything else about the table (its delimiters,
+            // whether it is centred) follows from that same name.
+            if let Some(rows) = slots::command_spec(&name).and_then(|spec| spec.rows) {
+                let row_lengths = match rows {
+                    // `mat` ends a row at each semicolon, so the row widths are whatever
+                    // the punctuation said — they need not agree. `mat(a, b; c)` really is
+                    // a table the engine lays out (two rows, two columns then one), so it
+                    // is one here too.
+                    "mat" if !args.is_empty() => cells_per_row,
+                    // One argument per row, so every row is one cell wide.
+                    "mat" => { args = vec![vec![]; NEW_TABLE_CELLS]; vec![NEW_TABLE_COLUMNS; NEW_TABLE_COLUMNS] }
+                    _ => vec![1; args.len()],
                 };
-            }
-            let kind = match slots::command_kind(&name) {
-                Some(kind) => kind,
-                None => return vec![MathAtom::from_source(node.full_text())],
-            };
-            // The name is part of the spelling the table records, so it is what fills
-            // a kind whose own data is a name or a position: `hat` is the accent
-            // called `hat`, `overline` the one that goes above, and the two delimiter
-            // pairs are spelled by their own characters.
-            let kind = match kind {
-                Kind::Accent { .. } => Kind::Accent { name: name.clone() },
-                Kind::Line { .. } => Kind::Line { above: name == "overline" },
-                Kind::Fenced { .. } => match name.as_str() {
-                    "abs" => Kind::Fenced { left: "|".into(), right: "|".into() },
-                    _ => Kind::Fenced { left: "‖".into(), right: "‖".into() },
-                },
-                // Cells are stored in the order the *editor* walks them, which is not
-                // always the order Typst writes: `root(index, radicand)` is stored as
-                // `[radicand, index]`, the reverse. Which is which is read off the
-                // same `Write` template that writes it back, so they cannot drift.
-                other => {
-                    if let slots::Write::Template(template) = other.decl().write {
-                        if placeholder_indices(template).first() == Some(&1) && args.len() == 2 {
-                            args.swap(0, 1);
-                        }
-                    }
-                    other
+                let columns = row_lengths.iter().copied().max().unwrap_or(1);
+                // Each row is padded to `columns` **before** the rows are flattened, which
+                // is what makes `chunks(columns)` give the rows back. Padding once at the
+                // end instead would misalign every row after a short one: `mat(a; b, c)`
+                // would flatten to `[a, b, c, _]` and be read back as rows `[a, b]` and
+                // `[c, _]`. `Multiline` stores its rows the same way, for the same reason.
+                let mut cells: Vec<MathData> = vec![];
+                let mut at = 0;
+                for &length in &row_lengths {
+                    let mut row = args[at..at + length].to_vec();
+                    at += length;
+                    row.resize(columns, vec![]);
+                    cells.extend(row);
                 }
+                return vec![MathAtom { kind: Kind::Table { columns, row_lengths, name: name.clone() }, cells }];
+            }
+            // The name is part of the spelling the table records, and it is also what
+            // fills a kind whose own data is a name or a position — so the whole
+            // name→shape step lives in `slots::configured_kind`. What is left here is
+            // the one thing about the *argument list* rather than the name: cells are
+            // stored in the order the shape's slots are walked, which is not always the
+            // order Typst writes them (`root(index, radicand)` is stored reversed, and
+            // the write template is what says so).
+            let Some(shape) = slots::configured_kind(&name) else {
+                return vec![MathAtom::from_source(node.full_text())];
             };
-            MathAtom { kind, cells: args }
+            if let slots::Write::Template(template) = shape.decl().write {
+                if placeholder_indices(template).first() == Some(&1) && args.len() == 2 {
+                    args.swap(0, 1);
+                }
+            }
+            // The node stores the **call**, not the shape: slots, view and spelling are
+            // looked up from `config/commands.json` when it is drawn or written, and
+            // never kept in it. That is what lets the file decide what is structured —
+            // and what keeps a node from holding a shape the file no longer declares.
+            MathAtom { kind: Kind::MacroCall { name, function: true }, cells: args }
         }
         Some(ast::Expr::MathShorthand(_)) | Some(ast::Expr::Escape(_)) => MathAtom::from_source(node.full_text()),
         Some(ast::Expr::Linebreak(_)) | Some(ast::Expr::MathAlignPoint(_)) => return parse_marker(node),
@@ -659,6 +705,25 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
         }
     };
     if matches!(atom.kind, Kind::Text) && atom.cells[0].is_empty() { vec![] } else { vec![atom] }
+}
+
+/// The positional arguments of a call, or `None` when it has any other kind of one.
+///
+/// A named argument (`delim: #none`), a spread or a trailing semicolon cannot be
+/// represented by a plain cell list, so a call that has one stays source text. This is
+/// what keeps `mat(x, delim: #none)` verbatim while `cancel(a + b)` is structured.
+fn positional_args(call: ast::MathCall, ctx: &ParseContext) -> Option<Vec<MathData>> {
+    let mut args = vec![];
+    for item in call.args().arg_items() {
+        let ast::Arg::Pos(expr) = item.arg else { return None };
+        if item.ends_in_semicolon { return None; }
+        let mut arg = parse_cell(expr.to_untyped(), ctx);
+        // An empty text run is how the source spells an empty cell, and the parser
+        // turns it back into one; anywhere else it is a cell with nothing in it.
+        if arg.len() == 1 && matches!(arg[0].kind, Kind::Text) && arg[0].cells[0].is_empty() { arg.clear(); }
+        args.push(arg);
+    }
+    Some(args)
 }
 
 /// The command names the parser may meet as an ordinary call.
@@ -771,6 +836,9 @@ pub fn write_atom(atom: &MathAtom) -> String {
         Write::Positioned { above, below } => fill_template(match &atom.kind {
             Kind::Line { above: true } => above,
             Kind::Line { above: false } => below,
+            // A configured call borrows the shape, so the position is not in the
+            // node: the name is what says which side the rule goes.
+            Kind::MacroCall { name, .. } => if name == "overline" { above } else { below },
             other => unreachable!("{other:?} 声明为按位置拼写，但它没有位置"),
         }, atom),
         Write::Named => match &atom.kind {
@@ -788,10 +856,41 @@ pub fn write_atom(atom: &MathAtom) -> String {
             Kind::Fenced { left, right } if left == "|" && right == "|" => format!("abs({})", cell(0)),
             Kind::Fenced { left, right } if left == "‖" && right == "‖" => format!("norm({})", cell(0)),
             Kind::Fenced { left, right } => format!("{left}{}{right}", cell(0)),
+            // A configured call borrows the shape, so the pair is not in the node
+            // either: `abs` and `norm` are written by name, the way they were read.
+            Kind::MacroCall { name, .. } => match name.as_str() {
+                "abs" => format!("abs({})", cell(0)),
+                _ => format!("norm({})", cell(0)),
+            },
             other => unreachable!("{other:?} 声明为定界包裹"),
         },
         Write::Matrix => match &atom.kind {
-            Kind::Table { columns } => format!("mat({})", atom.cells.chunks(*columns).map(|row| joined(row)).collect::<Vec<_>>().join("; ")),
+            Kind::Table { columns, row_lengths, name } => {
+                // One writer for every table. The command name is the callee, the row
+                // convention is the difference between them, and `row_lengths` is what
+                // keeps a ragged row ragged: cells are padded to `columns` for layout,
+                // so the padding has to be trimmed back off here.
+                //
+                // An empty cell writes as *nothing* — `write_cell` answers a quoted empty
+                // string for one, which is how a text run spells it, and `mat(a, ; c, d)`
+                // is not `mat(a, "", c, d)`. The one exception is the **last cell of the
+                // last row**: nothing follows it, so writing it bare would leave a
+                // trailing comma and no argument, and `mat(, ; , )` would read back as
+                // rows of two and *one*. An empty text run is the spelling that survives,
+                // because the parser turns one back into an empty cell.
+                let rows = slots::command_spec(name).and_then(|spec| spec.rows);
+                let separator = if rows == Some("mat") { "; " } else { ", " };
+                let last_row = row_lengths.len().saturating_sub(1);
+                let body = atom.cells.chunks(*columns).enumerate().map(|(r, row)| {
+                    let used = row_lengths.get(r).copied().unwrap_or(row.len()).min(row.len());
+                    row[..used].iter().enumerate().map(|(i, cell)| {
+                        if !cell.is_empty() { write_cell(cell) }
+                        else if r == last_row && i + 1 == used { "\"\"".to_string() }
+                        else { String::new() }
+                    }).collect::<Vec<_>>().join(", ")
+                }).collect::<Vec<_>>().join(separator);
+                format!("{name}({body})")
+            }
             other => unreachable!("{other:?} 声明为矩阵"),
         },
         Write::Rows => match &atom.kind {

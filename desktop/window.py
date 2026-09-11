@@ -532,10 +532,31 @@ class Window(QMainWindow):
             self.contexts=(self.analysis,index)
         return self.contexts[1]
 
+    def raw_fragments(self, view):
+        """Every node that is drawn from a compiled image, outermost first.
+
+        Three kinds are: `raw` (a fragment the editor does not model), `raw_macro` (a call
+        it declines to expand, drawn as the document has it until the caret enters) and
+        `style` (a font variant, drawn from the call's image until the substituted glyphs
+        arrive). A fragment *inside* one of them is skipped: the outer node is one image of
+        its own source, so its slots are not asked for until the caret enters it.
+        """
+        out = []
+        def walk(node, inside):
+            kind = node.get('kind')
+            if kind in ('raw_macro','style'):
+                out.append(node)
+                inside = True
+            elif kind == 'raw' and not inside:
+                out.append(node)
+            for child in node.get('children') or []: walk(child, inside)
+        walk(view, False)
+        return out
+
     def index_fragment_contexts(self,view,script,formula,index):
         """Walk one view, remembering the script each of the formula's own fragments sits in."""
-        if script is None and view.get('kind')=='script':script=view
-        if view.get('kind')=='raw':
+        if script is None and view.get('kind')=='scripts':script=view
+        if view.get('kind') in ('raw','raw_macro','style'):
             start=self.fragment_start(view)
             if start is None or not formula['start']<=start<formula['end']:return
             if script is not None:
@@ -555,7 +576,7 @@ class Window(QMainWindow):
         """Give every fragment of a view the attachment it is drawn in, if any."""
         index=self.context_index()
         for node in self.view_nodes(view):
-            if node.get('kind')!='raw':continue
+            if node.get('kind') not in ('raw','raw_macro','style'):continue
             node['_context']=index.get(':'.join((node.get('render_id') or '').split(':')[:2]))
         return view
 
@@ -656,8 +677,7 @@ class Window(QMainWindow):
             if not request:continue
             by_id={item['id']:item for item in request.get('raw',[])}
             wanted=0
-            for node in self.view_nodes(formula.get('view',{})):
-                if node.get('kind')!='raw':continue
+            for node in self.raw_fragments(formula.get('view',{})):
                 stable=node.get('_raw_key');text=node.get('text','');shared=raw_key(node)
                 if not node.get('render_id'):
                     # No range means the service can never be asked for this fragment.

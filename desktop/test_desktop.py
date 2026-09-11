@@ -94,9 +94,9 @@ class NativeTest(unittest.TestCase):
         window.redo();self.assertTrue(window.source.startswith("正文"))
 
     def test_opaque_macro_stays_code_and_loaded_formula_folds(self):
-        self.load("#let opaque(x) = $cancel(#x)$\n$opaque(y)$")
+        self.load("#let opaque(x) = $lr(#x, size: #100%)$\n$opaque(y)$")
         self.assertEqual(len(self.window.editor.object_data),1)
-        self.assertIn("$cancel(#x)$",self.window.editor.toPlainText())
+        self.assertIn("$lr(#x, size: #100%)$",self.window.editor.toPlainText())
 
     def test_formula_session_edits_authoritative_source(self):
         self.load("Before $a/b$ after")
@@ -188,12 +188,13 @@ class NativeTest(unittest.TestCase):
         The arrangement must be one this frontend knows, like `number`, or a formula
         with an overline would report a frontend/backend mismatch; and the two sides
         have to land differently, which is the point of storing a position instead
-        of a command name.
+        of a command name. Both arrive as `decorated`, and the marker says which
+        decoration it is -- the wire no longer carries the position in `text`.
         """
         def lay(source):
             self.load(source)
             view=self.window.analysis['formulas'][0]['view']
-            lines=[node for node in self.window.view_nodes(view) if node['kind']=='line']
+            lines=[node for node in self.window.view_nodes(view) if node['kind']=='decorated']
             self.window.typesetter.unknown.clear()
             box=self.window.typesetter.layout(view)
             self.assertEqual(self.window.typesetter.unknown,set(),source)
@@ -203,9 +204,9 @@ class NativeTest(unittest.TestCase):
         # Typst math commands carry no backslash -- `\o` would be an escape -- so
         # the source spells the command the way the writer does.
         lines,above=lay("$overline(x)$")
-        self.assertEqual([node['text'] for node in lines],['above'])
+        self.assertEqual([node['marker'] for node in lines],['overline'])
         lines,below=lay("$underline(x)$")
-        self.assertEqual([node['text'] for node in lines],['below'])
+        self.assertEqual([node['marker'] for node in lines],['underline'])
         # A rule above grows the box upwards and lifts the baseline; a rule below
         # grows it downwards and leaves the baseline where it was.
         self.assertGreater(above.height,base.height)
@@ -262,7 +263,7 @@ class NativeTest(unittest.TestCase):
         self.assertIsNone(result[0][1],result[0][1]);return result[0][0]
 
     def test_preview_contains_real_source_positions_and_raw_svg(self):
-        self.load("= Native test\nBefore $cancel(a)$ after.")
+        self.load("= Native test\nBefore $lr(a, size: #100%)$ after.")
         window=self.window;window.completion_timer.stop()
         result=self.service('/api/preview',window.body()|{'preview':True})
         self.assertEqual(len(result['pages']),1)
@@ -352,15 +353,19 @@ class NativeTest(unittest.TestCase):
         The fragment's own text lives in the definition, so that is the range the
         batch asks for; the document's call to the macro is what compiles it.
         """
-        self.load('#let fixed(x) = $#x + cancel(a)$\n$fixed(y)$')
+        fragment='lr(a, size: #100%)'
+        self.load(f'#let fixed(x) = $#x + {fragment}$\n$fixed(y)$')
         window=self.window;window.compile_timer.stop()
         before=window.source;history=len(window.history)
         calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
             window.load_raw()
         self.assertEqual(len(calls),1)
-        definition=window.source.index('cancel(a)')
-        self.assertIn({'id':f'{definition}:{definition+9}','start':definition,'end':definition+9},calls[0]['raw'])
+        # The range is derived from the fragment rather than written out: an opaque
+        # fixture of a different length silently changed what this asserted before.
+        definition=window.source.index(fragment)
+        end=definition+len(fragment)
+        self.assertIn({'id':f'{definition}:{end}','start':definition,'end':end},calls[0]['raw'])
         node=next(node for node in window.view_nodes(window.analysis['formulas'][0]['view']) if node['kind']=='raw')
         self.assertIsInstance(window.typesetter.raw(node),dict,'the batch result is what this fragment draws')
         self.assertEqual(window.preview_revision,-1,'an image request must not compile a live page preview')
@@ -369,7 +374,7 @@ class NativeTest(unittest.TestCase):
     def test_a_definition_fragment_keeps_the_call_that_renders_it(self):
         """Typst typesets a definition's fragment where the macro is called, so the
         context cut may not drop a call that is later in the document."""
-        self.load('#let fixed(x) = $#x + cancel(a)$\n\n$ fixed(y) $')
+        self.load('#let fixed(x) = $#x + lr(a, size: #100%)$\n\n$ fixed(y) $')
         window=self.window;window.compile_timer.stop();window.raw_timer.stop()
         # Only the definition's own formula is on screen; its call sits below it.
         with patch.object(window,'visible_formula_starts',return_value={window.source.index('$#x')}):
@@ -384,7 +389,7 @@ class NativeTest(unittest.TestCase):
     def test_typst_controls_native_limit_placement(self):
         self.load('$ sum_1^2 $')
         view=self.window.analysis['formulas'][0]['view']
-        script=next(node for node in self.window.view_nodes(view) if node['kind']=='script')
+        script=next(node for node in self.window.view_nodes(view) if node['kind']=='scripts')
         result=self.service('/api/attachments',{'path':'untitled.typ','expression':script['attachment'],'definitions':'','display':True})
         self.assertEqual(result['upper'],'limits')
         key=('',script['attachment'],True);self.window.typesetter.placements[key]=result
@@ -401,6 +406,81 @@ class NativeTest(unittest.TestCase):
             else:callback({},None)
         return calls,request
 
+    def test_a_font_variant_draws_the_calls_image_until_its_glyphs_arrive(self):
+        """`bold(A)` has three drawings, and the order between them is the point.
+
+        Typst applies a font variant by *substituting codepoints* through a table the
+        kernel cannot reach, so the glyphs are fetched separately. Until they arrive the
+        engine's **image of the call** is drawn -- the one drawing that is always right,
+        because the engine typesets the variant itself. Once they arrive the substituted
+        glyphs are drawn instead. An empty answer is an anomaly (the glyphs of a variant
+        should never be empty unless the body is), so it is reported and the source shown.
+        """
+        from unittest.mock import patch
+        self.load('$bold(A)$');window=self.window
+        node=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n['kind']=='style')
+        self.assertEqual(node['style_name'],'bold')
+        self.assertEqual(node['text'],'bold(A)','样式节点带着整段调用拼写：取图与取字形簇都用它')
+        calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.load_raw()
+        self.assertIsInstance(window.typesetter.raw(node),dict,'调用本身被当成一个片段取图')
+        view=window.analysis['formulas'][0]['view']
+        outside=window.typesetter.layout(view)
+        self.assertTrue(any(op[0]=='svg' for op in outside.operations),'字形簇未到：画引擎给的整张图')
+        # The glyphs arrive: they replace the image.
+        node['_glyph']='\U0001D400'   # 𝐀
+        drawn=[value[0] for kind,_,_,value in window.typesetter.layout(view).operations if kind=='text']
+        self.assertIn('\U0001D400',drawn,'取到字形簇后改画字形簇')
+        self.assertFalse(any(op[0]=='svg' for op in window.typesetter.layout(view).operations),'有字形簇就不再画图')
+        # An empty answer for a non-empty body is an anomaly, not a blank.
+        node['_glyph']=''
+        box=window.typesetter.layout(view)
+        self.assertTrue(any(op[0]=='failed' for op in box.operations),'空字形簇要报错（暖色底+虚线）')
+        drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
+        self.assertIn('bold(A)',drawn,'并且退回源码')
+        # Entering the node shows the cells, so the body stays editable.
+        window.activate(window.analysis['formulas'][0]['start'])
+        window.math_action('key',key='ArrowRight')
+        self.assertFalse(any(op[0]=='svg' for op in window.math_canvas.box.operations),
+                         '光标进入后画格子，不再画图')
+
+    def test_a_collapsed_call_is_drawn_as_the_document_has_it_until_the_caret_enters(self):
+        """A call the kernel will not expand is one image -- until the caret goes in.
+
+        `raw_macro` has two drawings. Outside the node the document is what the engine
+        typesets the call to, so the call's own source is asked for as a fragment and
+        drawn; inside, the name and its argument slots are laid out so the arguments can
+        be edited. Both come from the same view: the children are always there, and only
+        the inside view uses them.
+        """
+        defs="#let layer0(x) = $#x$"+"".join(f"\n#let layer{i}(x) = $layer{i-1}(#x) + layer{i-1}(#x)$" for i in range(1,16))
+        self.load(defs+"\n$layer15(a)$");window=self.window
+        calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.load_raw()
+        formula=window.analysis['formulas'][-1]
+        collapsed=next(n for n in window.view_nodes(formula['view']) if n['kind']=='raw_macro')
+        self.assertEqual(collapsed['text'],'layer15(a)','片段要的是调用本身，不是一句文案')
+        start,end=(int(part) for part in collapsed['render_id'].split(':')[:2])
+        self.assertIn({'id':f'{start}:{end}','start':start,'end':end},calls[0]['raw'],
+                      '调用本身被当成一个片段取图')
+        self.assertIsInstance(window.typesetter.raw(collapsed),dict,'取回来的图就是它的画法')
+        # Nothing is asked for from *inside* the call: it is drawn as one image, so its
+        # argument slots are not separate fragments until the caret enters it.
+        for body in calls:
+            for item in body['raw']:
+                self.assertFalse(start < item['start'] and item['end'] <= end,
+                                 f"调用内部的片段不该单独取图：{item}")
+        # Outside the node: one svg, no argument cells.
+        outside=window.typesetter.layout(formula['view'])
+        self.assertTrue(any(op[0]=='svg' for op in outside.operations),'光标在外时画成一张图')
+        # Inside it: the name and the slots, and no image.
+        window.activate(formula['start'])
+        window.math_action('key',key='ArrowRight')
+        inside=[op for op in window.math_canvas.box.operations if op[0]=='svg']
+        self.assertEqual(inside,[],'光标进入后改用名字与参数槽')
+
     def test_raw_keeps_svg_when_adjacent_text_moves_its_source_range(self):
         """A fragment that is not in an attachment renders from its own source alone.
 
@@ -409,7 +489,7 @@ class NativeTest(unittest.TestCase):
         for the fragments that do follow a sibling.
         """
         from unittest.mock import patch
-        self.load('$cancel(a)$');window=self.window;calls,request=self.fake_render()
+        self.load('$lr(a, size: #100%)$');window=self.window;calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
             window.load_raw();self.assertEqual(len(calls),1)
             raw=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n['kind']=='raw')
@@ -428,7 +508,14 @@ class NativeTest(unittest.TestCase):
         self.load('$stretch(->)^x$\n\n$stretch(->)^(1234)$');window=self.window
         calls,request=self.fake_render()
         def fragment(index):
-            return next(n for n in window.view_nodes(window.analysis['formulas'][index]['view']) if n['kind']=='raw')
+            """The base fragment of one formula, which is drawn from a compiled image.
+
+            It used to be a `raw`; `stretch(->)` has a purely positional argument, so it
+            is a `raw_macro` now -- the whole call is the image, and the `->` inside it is
+            not drawn separately (see `window.raw_fragments`).
+            """
+            return next(n for n in window.view_nodes(window.analysis['formulas'][index]['view'])
+                        if n['kind'] in ('raw','raw_macro'))
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
             window.load_raw()
             self.assertEqual(len(calls),1,'both fragments come from one batch compile')
@@ -442,7 +529,7 @@ class NativeTest(unittest.TestCase):
                     'each fragment draws the image rendered at its own range')
             # The same formula: widening the script asks for its base again.
             window.activate(window.analysis['formulas'][0]['start'])
-            script=next(n for n in window.view_nodes(window.math_state['view']) if n['kind']=='script')
+            script=next(n for n in window.view_nodes(window.math_state['view']) if n['kind']=='scripts')
             stop=next(n for n in window.view_nodes(script['children'][1]) if n.get('cursor'))
             window.math_action('click',cursor=stop['cursor']);window.math_action('input',text='57')
             calls.clear();window.load_raw()
@@ -452,13 +539,13 @@ class NativeTest(unittest.TestCase):
 
     def test_script_edits_invalidate_only_base_raw_when_leaving_slot(self):
         from unittest.mock import patch
-        self.load('$cancel(a)_(1)+cancel(b)$');window=self.window;calls,request=self.fake_render()
+        self.load('$lr(a, size: #100%)_(1)+lr(b, size: #100%)$');window=self.window;calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request):
             window.activate(0)
             raw=[n for n in window.view_nodes(window.math_state['view']) if n['kind']=='raw']
             for n in raw:window.typesetter.cache[n['_raw_key']]={'svg':'<svg/>','base_font_size_pt':1,'base_font_height_pt':1}
             keys=[n['_raw_key'] for n in raw]
-            script=next(n for n in window.view_nodes(window.math_state['view']) if n['kind']=='script')
+            script=next(n for n in window.view_nodes(window.math_state['view']) if n['kind']=='scripts')
             stop=next(n for n in window.view_nodes(script['children'][2]) if n.get('cursor'))
             window.math_action('click',cursor=stop['cursor']);window.math_action('input',text='2')
             self.assertIn(keys[0],window.typesetter.cache)
@@ -468,7 +555,7 @@ class NativeTest(unittest.TestCase):
             window.load_raw();self.assertEqual(len(calls),1);self.assertEqual(len(calls[0]['raw']),1)
 
     def test_equal_raw_sources_share_one_render_result(self):
-        self.load('$cancel(a)$\n$cancel(a)$');window=self.window;calls,request=self.fake_render()
+        self.load('$lr(a, size: #100%)$\n$lr(a, size: #100%)$');window=self.window;calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request):window.load_raw()
         self.assertEqual(len(calls),1)
         raws=[next(n for n in window.view_nodes(formula['view']) if n['kind']=='raw') for formula in window.analysis['formulas']]
@@ -483,24 +570,24 @@ class NativeTest(unittest.TestCase):
         still waits for the next edit.
         """
         import desktop.rawcache as rawcache
-        self.load('$cancel(a)$\n$partial + 1$');window=self.window;calls,request=self.fake_render()
+        self.load('$lr(a, size: #100%)$\n$partial + 1$');window=self.window;calls,request=self.fake_render()
         def pass_once():
             with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
                 window.load_raw()
         pass_once();pass_once()
         self.assertEqual(len(calls),1,'every fragment is reused by default')
-        call=window.source.index('cancel(a)');plain=window.source.index('partial')
+        call=window.source.index('lr(a, size: #100%)');plain=window.source.index('partial')
         starts=[[item['start'] for item in body['raw']] for body in calls]
         self.assertIn(call,starts[0]);self.assertIn(plain,starts[0])
         with patch.object(rawcache,'MODE','plain'):
-            self.assertTrue(rawcache.reusable('partial'));self.assertFalse(rawcache.reusable('cancel(a)'))
+            self.assertTrue(rawcache.reusable('partial'));self.assertFalse(rawcache.reusable('lr(a, size: #100%)'))
             self.assertFalse(rawcache.reusable('mat(1, 2)'),'a call written as text is one')
             self.assertTrue(rawcache.reusable('#f'),'a parameter reference is not a call')
             pass_once();pass_once()
         self.assertEqual([[item['start'] for item in body['raw']] for body in calls[1:]],
             [[call],[call]],'only the fragment holding a call is asked for again')
         node=next(node for node in window.view_nodes(window.analysis['formulas'][0]['view']) if node['kind']=='raw')
-        self.assertEqual(node['text'],'cancel(a)')
+        self.assertEqual(node['text'],'lr(a, size: #100%)')
         self.assertIsInstance(window.typesetter.raw(node),dict,'the image in hand keeps being drawn')
         drawn=[window.typesetter.raw(node) for formula in window.analysis['formulas']
             for node in window.view_nodes(formula['view']) if node['kind']=='raw']
@@ -512,7 +599,7 @@ class NativeTest(unittest.TestCase):
         self.assertEqual(len(calls),before,'a refused fragment is not asked for again in the same revision')
 
     def test_distinct_visible_raws_across_formulas_use_one_batch_compile(self):
-        self.load('$cancel(a)$\n$cancel(b)$\n$cancel(c)$');window=self.window;calls,request=self.fake_render()
+        self.load('$lr(a, size: #100%)$\n$lr(b, size: #100%)$\n$lr(c, size: #100%)$');window=self.window;calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request):window.load_raw()
         self.assertEqual(len(calls),1)
         self.assertEqual(len(calls[0]['raw']),3)
@@ -590,7 +677,7 @@ class NativeTest(unittest.TestCase):
 
     def test_background_services_do_not_compile_live_preview_or_editor_raw(self):
         from unittest.mock import patch
-        self.load('$ sum_1^2 cancel(a) $');window=self.window;window.raw_timer.stop();calls=[]
+        self.load('$ sum_1^2 lr(a, size: #100%) $');window=self.window;window.raw_timer.stop();calls=[]
         def request(route,body,callback,key=None):
             calls.append(route)
             callback({},None)
@@ -613,7 +700,7 @@ class NativeTest(unittest.TestCase):
             output=Path(opened.call_args.args[0].toLocalFile());self.assertTrue(output.is_file());self.assertEqual(output.read_bytes(),data)
 
     def test_distant_formula_projections_survive_typst_incremental_edit(self):
-        source=''.join(f'paragraph {i}\n\n$cancel(x_{i})$\n\n' for i in range(80))
+        source=''.join(f'paragraph {i}\n\n$lr(x_{i}, size: #100%)$\n\n' for i in range(80))
         self.load(source);window=self.window
         before=[formula['view'] for formula in window.analysis['formulas']]
         calls=[];original=window.core.call
@@ -745,9 +832,9 @@ class NativeTest(unittest.TestCase):
     def test_a_failed_fragment_is_reported_and_entered_with_a_horizontal_key(self):
         """A Raw without an image has nothing to click, so a key has to open it."""
         window=self.window
-        self.load('$ undefinedfunc(α) $');window.activate(0);window.compile_timer.stop()
+        self.load('$ undefinedname $');window.activate(0);window.compile_timer.stop()
         text=next(node['text'] for node in window.view_nodes(window.math_state['view']) if node['kind']=='raw')
-        self.assertEqual(text,'undefinedfunc(α)')
+        self.assertEqual(text,'undefinedname')
         # What load_raw records when the render pass returns nothing for a fragment.
         node=next(node for node in window.view_nodes(window.math_state['view']) if node['kind']=='raw')
         window.typesetter.cache[raw_key(node)]=False
@@ -759,7 +846,7 @@ class NativeTest(unittest.TestCase):
         # Escape restores the fragment and closes the draft.
         window.math_action('key',key='Escape')
         self.assertFalse(window.math_state['pending'])
-        self.assertEqual(window.source,'$ undefinedfunc(α) $')
+        self.assertEqual(window.source,'$ undefinedname $')
 
     def test_a_fragment_without_a_source_range_is_marked_as_failed(self):
         window=self.window

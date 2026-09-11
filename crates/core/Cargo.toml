@@ -19,6 +19,8 @@ unicode-segmentation = "1"
 typst-syntax = { path = "../../vendor/typst/crates/typst-syntax" }
 
 # `build.rs` turns `config/symbols.json` into the symbol table `typst.rs`
-# includes.
+# includes, and reads `config/commands.json`. `serde` itself is needed for the
+# derive on the command entry, which may be a bare shape name or an object.
 [build-dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"

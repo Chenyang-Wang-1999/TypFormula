@@ -18,7 +18,10 @@ use typst::utils::{LazyHash, Protected};
 mod render;
 
 #[derive(Deserialize)]
-struct Request { #[serde(default="default_path")] path: String, expression: String, #[serde(default)] definitions: String, display: bool }
+struct Request { #[serde(default="default_path")] path: String, expression: String, #[serde(default)] definitions: String, display: bool,
+    /// Ask for the **substituted glyphs** instead of the attachment placement.
+    #[serde(default)]
+    glyphs: bool }
 
 struct FormulaWorld { library: LazyHash<Library>, fonts: typst_kit::fonts::FontStore, source: Source, overlays: std::collections::HashMap<String,String>, time: typst_kit::datetime::Time }
 fn font_store(system:bool)->typst_kit::fonts::FontStore {
@@ -107,6 +110,31 @@ fn collect_equations<'a>(
         collect_equations(&styled.child, parent.chain(&styled.styles), arenas, out);
     }
 }
+/// Read the text of a **flat** math item: the substituted glyphs of one font variant.
+///
+/// Only a flat run of characters has a glyph form. A body with structure — a fraction, a
+/// script, a table — has no single run, so this refuses it and the caller falls back to
+/// the image of the whole call, which the engine typesets correctly. Refusing is the
+/// honest answer: a caller that concatenated a fraction's parts would draw nonsense.
+///
+/// Nesting needs no recursion *here* because the IR has already collapsed it: the engine
+/// resolves `bold(upright(a))` into `𝐚`, which is also why substituting per level in the
+/// frontend would be wrong (`bold(italic(a))` is bold, measured 0.633pt wide, while
+/// substituting italic and then bold gives 0.529).
+fn collect_glyphs(item: &MathItem, out: &mut String) -> Result<(), String> {
+    match item {
+        // Explicit spacing and introspection tags carry no glyph of their own.
+        MathItem::Spacing(..) | MathItem::Space | MathItem::Tag(_) => Ok(()),
+        MathItem::Component(comp) => match &comp.kind {
+            MathKind::Group(group) => { for child in &group.items { collect_glyphs(child, out)?; } Ok(()) }
+            MathKind::Glyph(glyph) => { out.push_str(&glyph.text); Ok(()) }
+            MathKind::Text(text) => { out.push_str(&text.text); Ok(()) }
+            MathKind::Number(number) => { out.push_str(&number.text); Ok(()) }
+            _ => Err("主体不是一行字形，请用整段调用的图".into()),
+        },
+    }
+}
+
 fn resolve(req: Request) -> Result<Value, String> {
     let space = if req.display { " " } else { "" };
     let source = Source::detached(format!("#set text(font: \"New Computer Modern Math\", size: 24pt)\n{}\n${space}{}{space}$", req.definitions, req.expression));
@@ -127,6 +155,16 @@ fn resolve(req: Request) -> Result<Value, String> {
     let introspector = EmptyIntrospector;
     let mut engine = Engine { world: world_ref.track(), library: &world.library, introspector: Protected::new(introspector.track()), traced: traced.track(), sink: sink.track_mut(), route: Route::default() };
     let item = resolve_equation(equation, &mut engine, Locator::root(), &arenas, styles).map_err(diagnostics)?;
+    // A font variant is applied by *substituting codepoints* — `resolve` passed codex's
+    // `to_style(c, …)` output into the item's text before this IR existed — so the
+    // substituted glyphs are simply read back out of it. That is why this needs neither
+    // codex nor a table of its own, and why the editor's glyphs cannot drift from the
+    // engine's: they *are* the engine's.
+    if req.glyphs {
+        let mut out = String::new();
+        collect_glyphs(&item, &mut out)?;
+        return Ok(json!({"engine":"Typst math IR 59b5999","glyphs":out}));
+    }
     let (script, _) = outer_script(&item).ok_or("分支未解析成单个上下标对象")?;
     if script.top_left.is_some() || script.bottom_left.is_some() { return Err("暂不支持左侧附件的槽位映射".into()); }
     let upper = placement(&script.top, &script.top_right)?;
@@ -163,7 +201,7 @@ fn main() {
 mod tests {
     use super::*;
     fn query(expression: &str, display: bool) -> Value {
-        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display }).unwrap()
+        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display, glyphs: false }).unwrap()
     }
     #[test]
     fn typst_decides_both_defaults_and_explicit_overrides() {
@@ -178,7 +216,7 @@ mod tests {
     fn lim_branch_ignores_document_blank_lines_but_keeps_its_math_styles() {
         for definitions in ["", "\n\n", "#let unrelated = 1\n\n"] {
             for display in [true, false] {
-                let result = resolve(Request { path:"main.typ".into(), expression: "lim_(x -> oo)".into(), definitions: definitions.into(), display }).unwrap();
+                let result = resolve(Request { path:"main.typ".into(), expression: "lim_(x -> oo)".into(), definitions: definitions.into(), display, glyphs: false }).unwrap();
                 assert_eq!(result["lower"], if display { "limits" } else { "scripts" });
             }
         }
@@ -186,9 +224,9 @@ mod tests {
     #[test]
     fn empty_slots_still_get_a_position_and_definitions_are_evaluated() {
         assert_eq!(query("sum_()", true)["lower"], "limits");
-        let custom = resolve(Request { path:"main.typ".into(), expression: "my_1".into(), definitions: "#let my = math.op(\"my\", limits: true)".into(), display: true }).unwrap();
+        let custom = resolve(Request { path:"main.typ".into(), expression: "my_1".into(), definitions: "#let my = math.op(\"my\", limits: true)".into(), display: true, glyphs: false }).unwrap();
         assert_eq!(custom["lower"], "limits");
-        assert!(resolve(Request { path:"main.typ".into(), expression: "unknown_name_1".into(), definitions: String::new(), display: true }).is_err());
+        assert!(resolve(Request { path:"main.typ".into(), expression: "unknown_name_1".into(), definitions: String::new(), display: true, glyphs: false }).is_err());
     }
     #[test]
     fn attachment_service_returns_only_placement_even_for_stretch() {
@@ -196,6 +234,29 @@ mod tests {
         assert_eq!(long["upper"], "limits");
         assert!(long.get("stretch").is_none());
         assert!(long.get("base").is_none());
+    }
+    fn glyphs(expression: &str) -> Result<String, String> {
+        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display: true, glyphs: true })
+            .map(|value| value["glyphs"].as_str().unwrap_or_default().to_string())
+    }
+    /// A font variant is applied by substituting codepoints, and the substitution has
+    /// already happened by the time the IR exists — so this reads it back rather than
+    /// reproducing it, and the editor's glyphs cannot drift from the engine's.
+    ///
+    /// The nesting is the part worth pinning: `bold(upright(a))` collapses in **one**
+    /// query, because the engine resolves it to the upright bold `𝐚`. A caller that
+    /// substituted level by level would be wrong — `bold(italic(a))` is bold (`italic` is
+    /// a no-op on a letter that is already italic, measured 0.633pt wide), while
+    /// substituting italic and then bold would give 0.529pt.
+    #[test]
+    fn a_font_variant_returns_the_substituted_glyphs() {
+        assert_eq!(glyphs("bold(upright(a))").unwrap(), "\u{1D41A}");
+        assert_eq!(glyphs("upright(A)").unwrap(), "A");
+        assert_eq!(glyphs("bold(123)").unwrap(), "\u{1D7CF}\u{1D7D0}\u{1D7D1}");
+        // A body with structure has no single glyph run. Refusing is the honest answer:
+        // the caller falls back to the image of the whole call, which the engine typesets
+        // correctly, instead of concatenating a fraction's parts into nonsense.
+        assert!(glyphs("bold(frac(a, b))").is_err());
     }
 }
 

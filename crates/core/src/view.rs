@@ -21,6 +21,33 @@ pub struct View {
     pub active: bool,
     pub selected: bool,
     pub columns: usize,
+    // Which decoration this node is, for the view kinds whose drawing is chosen
+    // by a name rather than by the shape: `decorated` (radical, delimiter pair,
+    // accent, rule) and `root`. The vocabulary is a contract with the frontend,
+    // which dispatches on it, so a marker the frontend does not know is a
+    // frontend/backend mismatch rather than data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    // The font variant a `style` node is drawn in (`bold`, `upright`, …). The glyphs
+    // that variant produces are **not** on the wire: Typst applies a variant by
+    // substituting codepoints through a table the kernel cannot reach, so the frontend
+    // asks the engine for them and stamps the answer on (`_glyph`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style_name: Option<String>,
+    // A table's delimiters, spelled left-then-right (`"()"`, `"| |"` minus the
+    // space). The engine's `MatElem` defaults to a parenthesis pair, and the
+    // frontend used to draw square brackets for every table; carrying the pair
+    // is what lets the two agree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    // Whether the cells are grouped the way `mat` spells them (comma per column,
+    // semicolon per row) rather than one argument per row (`vec`, `cases`).
+    pub is_mat: bool,
+    // How many cells each row really has, before the flat list was padded to
+    // `columns`. `mat(a, b; c)` and `a & b \ c` both pad a short row, so without this
+    // the frontend would draw a cell the source does not have.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub row_lengths: Vec<usize>,
     pub edit: Option<Cursor>,
     pub attachment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,7 +63,16 @@ pub struct View {
 }
 impl View {
     fn new(kind: &str, text: impl Into<String>, children: Vec<View>) -> Self {
-        Self { kind: kind.into(), text: text.into(), role: None, display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None, origin: None, source_range: None }
+        Self { kind: kind.into(), text: text.into(), role: None, display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, marker: None, style_name: None, border: None, is_mat: false, row_lengths: vec![], edit: None, attachment: None, definitions: None, origin: None, source_range: None }
+    }
+    /// One `decorated` node: a single inner cell with a decoration whose drawing
+    /// the frontend chooses by `marker`. `sqrt`, a delimiter pair, an accent and
+    /// a rule share this kind because their *editing* is identical (one cell,
+    /// linear, entered at the edge, no vertical move) — only the drawing differs.
+    fn decorated(marker: impl Into<String>, text: impl Into<String>, children: Vec<View>) -> Self {
+        let mut view = Self::new("decorated", text, children);
+        view.marker = Some(marker.into());
+        view
     }
 }
 #[derive(Serialize)]
@@ -111,10 +147,16 @@ impl Editor {
     }
     fn view_atom(&self, atom: &MathAtom, path: Option<&[CursorSlice]>, pos: usize, occurrence: &str) -> View {
         let child_path = |idx| path.map(|p| { let mut p = p.to_vec(); p.push(CursorSlice { atom: pos, cell: idx }); p });
+        // A configured command call has no shape of its own: the command file says
+        // which shape it draws as, and the call's cells *are* that shape's slots. So
+        // the projection runs on the shape and reads the call's cells — the one place
+        // a `MacroCall` is not drawn as a call.
+        let shape = atom.command_shape();
+        let kind = shape.as_ref().unwrap_or(&atom.kind);
         // The layout strategy is declared per kind (`slots::Decl::view`); only
         // the fields that a strategy reads are filled in below.
-        let view_kind = atom.decl().view;
-        if let Kind::MacroCall { name, function } = &atom.kind {
+        let view_kind = kind.decl().view;
+        if shape.is_none() && let Kind::MacroCall { name, function } = &atom.kind {
             let registry = typst::macro_registry(&self.definitions);
             let definition = registry.get(name).filter(|d| d.expandable);
             // A call is only bound while its argument count still matches the
@@ -135,23 +177,32 @@ impl Editor {
             }
             // Bounded projection: retain editable call slots for very large
             // expansions and for calls that no longer match their definition.
-            let message = if definition.is_some() { "参数个数与定义不符，显示调用与参数" } else { "展开较大，显示调用与参数" };
+            //
+            // `text` is the **call's own spelling**, not a message. The document is what
+            // the engine typesets this call to, so the frontend asks for that fragment's
+            // image and draws it while the caret is *outside*; entering the node swaps to
+            // the name and argument slots below. The message that used to sit here
+            // ("展开较大" / "参数个数与定义不符") was read by nobody — the frontend only ever
+            // laid out the children — so the field was free to become the source, which is
+            // what `document::annotate` and the image pipeline need to find it by.
             let mut children = vec![View::new("symbol", format!("{name}{}", if *function { "(" } else { "" }), vec![])];
             for (i, arg) in atom.cells.iter().enumerate() {
                 if i > 0 { children.push(View::new("symbol", ", ", vec![])); }
                 children.push(self.view_cell(arg, child_path(i).as_deref(), &format!("{occurrence}.c{i}")));
             }
             if *function { children.push(View::new("symbol", ")", vec![])); }
-            return View::new(MACRO_COLLAPSED, message, children);
+            let mut view = View::new(MACRO_COLLAPSED, typst::write_atom(atom), children);
+            view.edit = path.map(|path| Cursor { slices: path.to_vec(), pos, occurrence: format!("{occurrence}.edit") });
+            return view;
         }
         // Every cell is a slot of this node, and its role comes from the node's
         // own declaration, so the frontend can place it without counting cells.
         let children: Vec<_> = atom.cells.iter().enumerate().map(|(idx, data)| {
             let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"));
-            child.role = atom.decl().role_at(idx).map(Role::name);
+            child.role = kind.decl().role_at(idx).map(Role::name);
             child
         }).collect();
-        match &atom.kind {
+        match kind {
             Kind::MacroCall { .. } => unreachable!(),
             Kind::TemplateCall { definition } => { let mut view = View::new(view_kind, "", children); view.columns = *definition; view }
             Kind::Parameter { index } => { let mut view = View::new(view_kind, "", vec![]); view.columns = *index; view }
@@ -187,7 +238,9 @@ impl Editor {
                 if *caret == name.len() { parts.push(View::new("draft-caret", "", vec![])); }
                 View::new(view_kind, "", parts)
             }
-            Kind::Fraction | Kind::Sqrt | Kind::Root => View::new(view_kind, "", children),
+            Kind::Fraction => { let mut v = View::new("fraction", "", children); v.marker = Some("-".into()); v }
+            Kind::Sqrt => View::decorated("radical", "", children),
+            Kind::Root => { let mut v = View::new("root", "", children); v.marker = Some("radical".into()); v }
             Kind::Scripts => {
                 let mut slots = vec![children[0].clone_view()];
                 for up in [true, false] {
@@ -198,7 +251,7 @@ impl Editor {
                     slot.role = atom.decl().role_at(index).map(Role::name);
                     slots.push(slot);
                 }
-                let mut view = View::new(view_kind, "", slots);
+                let mut view = View::new("scripts", "", slots);
                 fn has_draft(atom: &MathAtom) -> bool {
                     matches!(atom.kind, Kind::Unknown { .. }) || atom.cells.iter().flatten().any(has_draft)
                 }
@@ -209,14 +262,49 @@ impl Editor {
                 }
                 view
             }
-            Kind::Text => View::new(view_kind, "", children),
-            Kind::Fenced { left, right } => View::new(view_kind, format!("{left}\n{right}"), children),
-            Kind::Accent { name } => View::new(view_kind, name, children),
-            // `LineItem` stores the position and nothing else, so the wire carries
-            // the position rather than a name the frontend would have to decode.
-            Kind::Line { above } => View::new(view_kind, if *above { "above" } else { "below" }, children),
-            Kind::Table { columns } => { let mut v = View::new(view_kind, "", children); v.columns = *columns; v }
-            Kind::Multiline { columns, .. } => { let mut v = View::new(view_kind, "", children); v.columns = *columns; v }
+            Kind::Text => View::new("text", "", children),
+            // The delimiter characters stay in `text` (left, newline, right, as the
+            // frontend has always read them); `marker` says only *which* decoration
+            // this is, so the frontend dispatches on one name instead of on the shape.
+            Kind::Fenced { left, right } => View::decorated("delim", format!("{left}\n{right}"), children),
+            Kind::Accent { name } => View::decorated(name.clone(), "", children),
+            // `LineItem` stores the position and nothing else, so the marker is the
+            // position spelled the way the frontend draws it.
+            Kind::Line { above } => View::decorated(if *above { "overline" } else { "underline" }, "", children),
+            // A font variant. `style_name` is what the frontend asks the engine with, and
+            // `text` is the **call's spelling** (`bold(upright(a))`) — the expression whose
+            // substituted glyphs are wanted, so nothing has to be reassembled from the
+            // children. The glyphs themselves are not here: the kernel cannot reach the
+            // table that produces them, so the frontend stamps them on once it has them.
+            Kind::Style { name } => {
+                let mut v = View::new("style", typst::write_atom(atom), children);
+                v.style_name = Some(name.clone());
+                // A cursor, so `document::annotate` can locate this call in the document
+                // and give it a range: the *image* of the call is the drawing used until
+                // the substituted glyphs arrive, and it is the one drawing that is always
+                // right (the engine typesets the variant itself).
+                v.edit = path.map(|path| Cursor { slices: path.to_vec(), pos, occurrence: format!("{occurrence}.edit") });
+                v
+            }
+            Kind::Table { columns, row_lengths, name } => {
+                let mut v = View::new("table", "", children);
+                v.columns = *columns;
+                v.row_lengths = row_lengths.clone();
+                // The delimiters and the row convention belong to the *command*, not
+                // to the table it builds: `mat` is centred inside parentheses, `cases`
+                // is a left brace, `vec` is a column vector — three tables from one
+                // shape, told apart only by the name they were written with.
+                let spec = crate::slots::command_spec(name);
+                v.border = spec.and_then(|spec| spec.border).map(str::to_string);
+                v.is_mat = spec.and_then(|spec| spec.rows) == Some("mat");
+                v
+            }
+            Kind::Multiline { columns, row_lengths } => {
+                let mut v = View::new("multiline", "", children);
+                v.columns = *columns;
+                v.row_lengths = row_lengths.clone();
+                v
+            }
         }
     }
     fn bind_template(&self, view: &mut View, def: &typst::MacroDefinition, registry: &typst::MacroRegistry, args: &[View]) {

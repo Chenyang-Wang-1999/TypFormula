@@ -27,18 +27,82 @@ fn symbols() -> String {
     out
 }
 
-/// `config/commands.json`: a command name to the `Kind` it declares.
+/// One entry of `config/commands.json`.
 ///
-/// The viewer names are the same strings the wire uses (`slots::Decl::view`), so the
-/// file can be read against the tables in `docs/kind-inventory.md` without a lookup.
+/// A name may be written as a bare shape name when that says everything, or as an
+/// object when the drawing needs parameters. The object form exists because some
+/// shapes cannot be described by a name alone: `vec` and `cases` are tables all
+/// right, but a table whose *arguments* are its rows and whose delimiters are not
+/// the matrix default — and neither fact is visible in the string "grid".
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Spec {
+    /// A shape that needs no parameters.
+    Plain(String),
+    /// A shape plus the parameters its drawing needs.
+    Detailed {
+        shape: String,
+        /// How the argument list becomes rows. Absent for every shape but a table.
+        #[serde(default)]
+        rows: Option<String>,
+        /// The delimiters the frontend draws around a table, left then right
+        /// (`"()"`), or a single character for a one-sided pair (`"{ "`).
+        #[serde(default)]
+        border: Option<String>,
+    },
+}
+
+impl Spec {
+    fn shape(&self) -> &str {
+        match self {
+            Spec::Plain(shape) => shape,
+            Spec::Detailed { shape, .. } => shape,
+        }
+    }
+    fn rows(&self) -> Option<&str> {
+        match self {
+            Spec::Plain(_) => None,
+            Spec::Detailed { rows, .. } => rows.as_deref(),
+        }
+    }
+    fn border(&self) -> Option<&str> {
+        match self {
+            Spec::Plain(_) => None,
+            Spec::Detailed { border, .. } => border.as_deref(),
+        }
+    }
+}
+
+/// `config/commands.json`: a command name to the shape it declares.
+///
+/// The shape names are the same strings `slots::Decl::view` uses, so the file can be
+/// read against the tables in `docs/kind-inventory.md` without a lookup.
 fn commands() -> String {
-    let entries: BTreeMap<String, String> = serde_json::from_str(&read("commands.json"))
-        .expect("config/commands.json 必须是命令名到 Kind 视图名的 JSON 字典");
-    let mut out = String::from("pub const COMMANDS: &[(&str, &str)] = &[\n");
-    for (name, view) in entries {
-        assert!(!name.is_empty() && !view.is_empty(), "命令名和它的视图名不能为空");
-        assert!(view.chars().all(|c| c.is_ascii_lowercase() || c == '-'), "{view} 不是视图名");
-        out.push_str(&format!("    ({name:?}, {view:?}),\n"));
+    let entries: BTreeMap<String, Spec> = serde_json::from_str(&read("commands.json"))
+        .expect("config/commands.json 必须是命令名到形状名（或 {shape, rows} 对象）的 JSON 字典");
+    let mut out = String::from(
+        "pub struct Command { pub name: &'static str, pub shape: &'static str, \
+         pub rows: Option<&'static str>, pub border: Option<&'static str> }\n\
+         pub const COMMANDS: &[Command] = &[\n",
+    );
+    for (name, spec) in entries {
+        let shape = spec.shape();
+        assert!(!name.is_empty() && !shape.is_empty(), "命令名和它的形状名不能为空");
+        assert!(shape.chars().all(|c| c.is_ascii_lowercase() || c == '-'), "{shape} 不是形状名");
+        if let Some(rows) = spec.rows() {
+            assert!(matches!(rows, "mat" | "each"), "{rows} 不是切行方式（mat / each）");
+            assert_eq!(shape, "grid", "只有表格形状才谈得上怎么切行，{name} 却是 {shape}");
+        }
+        if let Some(border) = spec.border() {
+            assert!(!border.is_empty() && border.chars().count() <= 2,
+                    "{border:?} 不是定界符对（左+右，或单边一个）");
+            assert_eq!(shape, "grid", "只有表格形状才谈得上定界符，{name} 却是 {shape}");
+        }
+        out.push_str(&format!(
+            "    Command {{ name: {name:?}, shape: {shape:?}, rows: {:?}, border: {:?} }},\n",
+            spec.rows(),
+            spec.border()
+        ));
     }
     out.push_str("];\n");
     out

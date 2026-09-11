@@ -19,7 +19,7 @@
 //! 即"可往返的 Kind"共 15 个：Char, Symbol, Number, Raw, MacroCall, Text,
 //! Fraction, Sqrt, Root, Scripts, Fenced, Table, Multiline, Accent, Line。
 
-use visual_typst_core::{Action, Editor, typst};
+use visual_typst_core::{Action, Editor, math::{Kind, MathAtom}, typst};
 
 fn load(source: &str) -> Editor {
     let mut editor = Editor::default();
@@ -76,7 +76,7 @@ fn raw_atoms_round_trip() {
     // Raw 保留原文，所以往返必须是逐字节的：这正是"不建模就原样留着"的承诺。
     for source in [
         "dif", "sum", "integral", "arrow.r", "sin", "lr", "text",
-        "cancel( x/y  + dif x )",
+        "lr( x/y  + dif x, size: #100%)",
         "lr((x), size: #150%)",
         "text(\"hello\")",
     ] {
@@ -103,6 +103,27 @@ fn radical_atoms_round_trip() {
     for source in ["sqrt(x)", "sqrt(frac(a, b))", "sqrt(x + 1)"] {
         round_trips(source);
     }
+}
+
+#[test]
+fn the_radical_syntax_and_its_command_are_one_node() {
+    // `√x`/`∛x` are syntax, `sqrt(x)`/`root(3, x)` are calls, and both end up as the
+    // same `MacroCall` — because neither radical shape carries instance data of its
+    // own, so the name is the whole of what a node has to remember. Writing normalizes
+    // to the command form, which is what it already did: `√x` has always been written
+    // `sqrt(x)`.
+    for (source, written) in [("√x", "sqrt(x)"), ("∛x", "root(3, x)"), ("∜(a + b)", "root(4, a + b)")] {
+        let editor = load(source);
+        assert!(
+            matches!(&editor.root[0].kind, Kind::MacroCall { .. }),
+            "{source:?} 应当与它的命令写法是同一个节点，实际是 {:?}",
+            editor.root[0].kind
+        );
+        assert_eq!(typst::write_cell(&editor.root), written, "{source:?} 的写法");
+        round_trips(source);
+    }
+    // The two spellings really are the same tree, which is the point of folding them.
+    assert_eq!(load("√x").root, load("sqrt(x)").root);
 }
 
 #[test]
@@ -145,6 +166,41 @@ fn grid_atoms_round_trip() {
     }
 }
 
+/// A matrix's rows need not be the same width, and a deliberately blank cell has to
+/// survive that.
+///
+/// The editor used to refuse `mat(a, b; c)` outright, on the stated grounds that Typst
+/// cannot lay it out. That is untrue — measured against the engine it is two rows of two
+/// and one, `43.008pt` tall, the same as `mat(1, 2; 3, 4)` — and **no test covered the
+/// refusal**, so nothing failed when it went. `row_lengths` is what makes the second
+/// case safe: trimming trailing empty cells instead would rewrite `mat(a, ; c, d)` (two
+/// columns, one deliberately blank) as the ragged `mat(a; c, d)`, which means something
+/// else entirely.
+#[test]
+fn a_matrix_may_have_rows_of_different_widths() {
+    let editor = load("mat(a, b; c)");
+    assert!(
+        matches!(&editor.root[0].kind, Kind::Table { columns: 2, row_lengths, name }
+                 if row_lengths == &vec![2, 1] && name == "mat"),
+        "mat(a, b; c) 应当是两列、行宽 [2, 1] 的表，实际是 {:?}",
+        editor.root[0].kind
+    );
+    // A blank cell that is not trailing padding has to come back as a blank cell.
+    let blank = load("mat(a, ; c, d)");
+    assert!(
+        matches!(&blank.root[0].kind, Kind::Table { columns: 2, row_lengths, .. } if row_lengths == &vec![2, 2]),
+        "mat(a, ; c, d) 的两行都该是两格，实际是 {:?}",
+        blank.root[0].kind
+    );
+    assert_eq!(typst::write_cell(&blank.root), "mat(a, ; c, d)");
+    for source in [
+        "mat(a, b; c)", "mat(a; b, c)", "mat(a, ; c, d)", "mat(1, 2; 3, 4)",
+        "mat(a, b; c, d; e, f)", "mat(1; 2; 3)", "mat(1, 2, 3)",
+    ] {
+        round_trips(source);
+    }
+}
+
 #[test]
 fn aligned_atoms_round_trip() {
     // 对齐公式靠 `&` 分列、`\\` 换行；行宽信息 (`row_lengths`) 也要一起还原。
@@ -159,9 +215,35 @@ fn accent_atoms_round_trip() {
     // `vec(x)` is deliberately absent: `vec` is not an accent in Typst (it is a
     // column vector), so the editor no longer builds one for it and the source stays
     // a `Raw`. See `docs/kind-inventory.md`.
-    for source in ["hat(x)", "hat(a + b)", "hat(frac(a, b))"] {
+    //
+    // `cancel(x)` *is* here. The engine lays it out as `CancelItem` rather than
+    // `AccentItem`, but the editor's model is the same for both — one body with a
+    // mark drawn over it — so it is `Kind::Accent` reached by a name in
+    // `config/commands.json`. Only where the mark sits differs, which is the
+    // frontend's business.
+    for source in ["hat(x)", "hat(a + b)", "hat(frac(a, b))", "cancel(x)", "cancel(a + b)"] {
         round_trips(source);
     }
+}
+
+/// A command the editor structures *only* because `config/commands.json` names it.
+///
+/// Round-tripping cannot see this and must not be trusted for it: drop the entry and
+/// `cancel(x)` becomes a `Raw`, which writes itself back verbatim, so
+/// `accent_atoms_round_trip` would stay green while the formula quietly stopped being
+/// editable. The same blind spot as `math::is_number` — a rule whose source is outside
+/// the round trip needs its own assertion.
+#[test]
+fn a_mark_that_only_the_command_file_names_is_structured() {
+    let editor = load("cancel(x)");
+    assert!(
+        matches!(&editor.root[0].kind, Kind::MacroCall { name, .. } if name == "cancel"),
+        "cancel 应当由 commands.json 建成调用节点，实际是 {:?}",
+        editor.root[0].kind
+    );
+    assert_eq!(editor.root[0].decl().view, "decoration", "并且借到重音的形状");
+    assert_eq!(editor.root[0].cells.len(), 1, "cancel 的正文是一格");
+    assert_eq!(typst::write_cell(&editor.root), "cancel(x)");
 }
 
 #[test]
@@ -172,6 +254,43 @@ fn line_atoms_round_trip() {
     for source in ["overline(x)", "underline(x)", "overline(frac(a, b))", "underline(a + b)"] {
         round_trips(source);
     }
+}
+
+/// A `MacroCall` that names a configured command borrows *that command's* shape.
+///
+/// This is the mechanism stage 2 of the refactor rests on: the node stores only a
+/// name, and the shape — its slots, its view, its spelling — is looked up, never
+/// stored. The test builds the call by hand because the parser still produces the
+/// dedicated kinds; what is pinned here is the borrowing itself, so that flipping the
+/// parser later is a change of *which node is built*, not of what a node means.
+#[test]
+fn a_call_naming_a_command_borrows_that_shapes_slots_and_spelling() {
+    let call = |name: &str, cells: usize| MathAtom::nest(Kind::MacroCall { name: name.into(), function: true }, cells);
+    for (name, cells, shape, spelling) in [
+        ("sqrt", 1, "sqrt", "sqrt(x)"),
+        ("frac", 2, "fraction", "frac(x, y)"),
+        ("hat", 1, "decoration", "hat(x)"),
+        ("overline", 1, "line", "overline(x)"),
+        ("underline", 1, "line", "underline(x)"),
+        ("abs", 1, "delim", "abs(x)"),
+        ("norm", 1, "delim", "norm(x)"),
+        ("cancel", 1, "decoration", "cancel(x)"),
+    ] {
+        let mut atom = call(name, cells);
+        for cell in &mut atom.cells { cell.push(MathAtom::character('x')); }
+        if cells == 2 { atom.cells[1] = vec![MathAtom::character('y')]; }
+        assert_eq!(atom.decl().view, shape, "{name} 应当借用 {shape} 的槽位图式");
+        assert_eq!(atom.decl().slots.len(), cells, "{name} 的格子数应与形状一致");
+        assert_eq!(typst::write_atom(&atom), spelling, "{name} 的拼写应由形状给出");
+    }
+    // A name the command file does not know keeps the generic call schema: one
+    // linear cell per argument, and the call is what gets written.
+    let mut plain = MathAtom::nest(Kind::MacroCall { name: "f".into(), function: true }, 2);
+    plain.cells[0] = vec![MathAtom::character('x')];
+    plain.cells[1] = vec![MathAtom::character('y')];
+    assert_eq!(plain.decl().view, "macro");
+    assert_eq!(plain.decl().slots.len(), 1, "未配置的名字沿用参数格图式");
+    assert_eq!(typst::write_atom(&plain), "f(x, y)");
 }
 
 #[test]

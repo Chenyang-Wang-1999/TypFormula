@@ -225,7 +225,12 @@ fn step(text: &str, at: usize) -> usize { at + text[at..].chars().next().map_or(
 fn whitespace(text: &str, at: usize) -> bool { text[at..].chars().next().is_some_and(char::is_whitespace) }
 
 fn annotate(view: &mut Value, root: &MathData, locator: &Locator, raw: &mut Vec<Value>, counts: &mut HashMap<String,usize>) {
-    if view["kind"] == "raw" {
+    // Three kinds are drawn from a compiled image: `raw` (a fragment the editor does not
+    // model), `raw_macro` (a call it declines to expand) and `style` (a font variant,
+    // whose *substituted glyphs* come from the engine later — until they do, the image of
+    // the call is both correct and free). All three carry the source in `text` and a
+    // cursor in `edit`, so all three are located the same way.
+    if matches!(view["kind"].as_str(), Some("raw" | "raw_macro" | "style")) {
         let text = view["text"].as_str().unwrap_or_default().to_owned();
         let range = if let Ok(cursor) = serde_json::from_value::<Cursor>(view["edit"].clone()) {
             let mut copy = root.clone();

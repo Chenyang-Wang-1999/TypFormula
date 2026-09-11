@@ -19,6 +19,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BACKEND = ROOT / "target/server/release/visual-typst.exe"
 
+# A macro chain whose projection doubles per layer, far past `PROJECTION_LIMIT`
+# (4096): layer15 expands to 2**15 items, so the kernel keeps the call as the
+# `raw_macro` arrangement instead of instantiating it.
+DEEP_CHAIN = "#let layer0(x) = $#x$" + "".join(
+    f"\n#let layer{i}(x) = $layer{i-1}(#x) + layer{i-1}(#x)$" for i in range(1, 16)
+) + "\n$layer15(a)$"
+
 # One source per `Kind`, plus the actions that reach the two states no source can
 # express. `input` after the formula is active is how a command draft is typed.
 CASES = [
@@ -27,21 +34,61 @@ CASES = [
     ("Number", "$12.5$", []),
     ("Raw", "$arrow.r$", []),
     ("Unknown", "$x$", [("input", {"text": "\\"})]),
+    # A draft with a name in it, which is what draws `draft-text`; the bare backslash
+    # above only reaches the placeholder and the caret.
+    ("Unknown/typing", "$x$", [("input", {"text": "\\f"})]),
+    # An empty cell. Note the trailing comma in `frac(a, )` makes *no* argument, so a
+    # table spelled with an explicit gap is what actually reaches this: the padded cell
+    # of a short row is an empty cell too.
+    ("empty-cell", "$mat(, ; , )$", []),
     ("Text", '$"txt"$', []),
     ("MacroCall", "#let twice(a) = $ #a + 1 $\n$ twice(x) $", []),
+    # A call the kernel declines to expand. Note what does *not* reach here: a
+    # macro whose parameter sits in a Raw is stored as plain `Raw`, because the
+    # parser never builds a `MacroCall` for a name that cannot expand. This one
+    # is a real `MacroCall` -- the name and its arguments are known -- whose
+    # projection doubles per layer and passes `PROJECTION_LIMIT`.
+    ("RawMacro", DEEP_CHAIN, []),
+    # The ordinary case, which is most of them: a call whose name the command file does
+    # not know. Its arguments are positional, so the node keeps them, and the call's own
+    # source is what gets rendered -- the caret's position picks which of the two
+    # drawings is used.
+    ("RawMacro/unknown name", "$bb(A)$", []),
+    # ... unless an argument is not positional, in which case no cell list can spell the
+    # call back and it stays `Raw`.
+    ("Raw/named argument", "$lr(x, size: #100%)$", []),
+    # A macro whose body nests two style calls: the shape a `Style` node will have to
+    # survive, and today the nesting happens entirely inside `raw_macro` nodes.
+    ("RawMacro/nested in a macro",
+     "#let mathbf(x) = $bold(upright(#x))$\n$ mathbf(a) $", []),
     ("Fraction", "$frac(a, b)$", []),
     ("Sqrt", "$sqrt(x)$", []),
     ("Root", "$root(3, x)$", []),
     ("Scripts", "$x^2$", []),
     ("Fenced", "$(a)$", []),
     ("Table", "$mat(1, 2; 3, 4)$", []),
+    # The same `grid` shape from two other names: a table's rows and its delimiters
+    # belong to the command, so `vec` is one argument per row inside parentheses while
+    # `cases` is the same rows inside a single left brace. Both write back as
+    # themselves, not as `mat(…; …)`.
+    ("Table/vec", "$vec(1, 2, 3)$", []),
+    ("Table/cases", "$cases(1, 2)$", []),
     ("Multiline", "$a &= 1 \\ b &= 2$", []),
+    # A font variant. The kernel cannot produce the substituted glyphs (the table lives
+    # in a crate it cannot reach), so the node carries the **call's spelling** — which is
+    # what the engine is asked for, both for the image and for the glyphs.
     ("Accent", "$hat(x)$", []),
+    # A font variant. The kernel cannot produce the substituted glyphs (the table lives
+    # in a crate it cannot reach), so the node carries the **call's spelling** — which is
+    # what the engine is asked for, both for the image and for the glyphs.
+    ("Style", "$bold(A)$", []),
+    ("Style/nested", "$bold(upright(a))$", []),
     ("Line", "$overline(x)$", []),
     # The two kinds that exist only inside a macro template: neither is reachable
     # from source, so what this shows is their absence.
     ("TemplateCall/Parameter", "#let inner(x) = $ #x $\n#let outer(a) = $ frac(inner(#a), 2) $\n$ outer(y) $", []),
-    # Constructs the vocabulary alignment is about, none of which is its own Kind yet.
+    # Source text the editor keeps opaque, and the constructs the vocabulary
+    # alignment is about.
     ("a/b", "$a/b$", []),
     ("cancel", "$cancel(x)$", []),
     ("vec", "$vec(x)$", []),
@@ -50,12 +97,17 @@ CASES = [
 
 # The `View` fields the frontend can read (`src/view.rs`).
 WIRE = ["kind", "role", "text", "display_glyph", "columns", "attachment", "edit",
-        "definitions", "origin", "source_range", "active", "selected"]
+        "definitions", "origin", "source_range", "active", "selected",
+        "marker", "border", "is_mat", "row_lengths"]
 
-# Views that belong to a node kind (`slots::Decl::view`), for the summary.
-VIEW_KINDS = ["char", "symbol", "number", "raw", "unknown", "text", "macro", "macro-collapsed",
-              "macro-argument", "template-call", "parameter", "fraction", "sqrt", "root",
-              "script", "delim", "grid", "aligned", "decoration", "line", "absent"]
+# Views that belong to a node kind, for the summary. These are the *wire* names
+# `view_atom` emits, which is not always the shape name a `Kind` declares
+# (`slots::Decl::view`): `sqrt`, a delimiter pair, an accent and a rule all
+# travel as `decorated`, and `grid`/`aligned`/`script` travel as
+# `table`/`multiline`/`scripts`.
+VIEW_KINDS = ["char", "symbol", "number", "raw", "unknown", "text", "macro", "raw_macro",
+              "macro-argument", "template-call", "parameter", "fraction", "decorated",
+              "root", "scripts", "table", "multiline", "absent"]
 
 
 def call(child, payload):
@@ -116,6 +168,48 @@ def nodes_of(view, kind, out):
         nodes_of(child, kind, out)
 
 
+def emitted_kinds(view, out):
+    """Every wire kind this view tree actually uses."""
+    out.add(view["kind"])
+    for child in view.get("children") or []:
+        emitted_kinds(child, out)
+
+
+# Nodes the frontend builds for itself rather than receiving: a delimiter it draws as a
+# symbol, and the placeholder it substitutes for a missing child. They belong in
+# `ARRANGEMENTS` but no backend view ever carries them.
+FRONTEND_MADE = {"symbol", "absent"}
+
+# Arrangements that must exist and that *nothing* can emit, on purpose: they belong to
+# nodes that live only inside a macro template, which `bind_template_inner` replaces
+# before the view reaches the wire. `docs/kind-inventory.md` 第五节 measures this (zero
+# occurrences across every case). They still need a drawing because `view_atom` builds
+# them, and a `Decl` because `template_size` walks them.
+NEVER_ON_THE_WIRE = {"parameter", "template-call"}
+
+
+def frontend_arrangements():
+    """`Typesetter.ARRANGEMENTS`, read out of `mathview.py` without importing Qt."""
+    source = (ROOT / "desktop/mathview.py").read_text(encoding="utf-8")
+    at = source.index("ARRANGEMENTS = frozenset({")
+    body = source[at:source.index("})", at)]
+    return {name.strip().strip('"') for name in body[body.index("{") + 1:].split(",") if name.strip()}
+
+
+def audit_arrangements(emitted):
+    """Compare what the frontend can draw against what the backend really emits.
+
+    The direction that matters is the second one: a wire kind with no arrangement is
+    caught at runtime (`note_unknown` says so once), but an *arrangement nothing can
+    emit* is silent, and it is how nine dead name arms were found in `mathview.py`
+    before. That is why this is a check and not a comment.
+    """
+    declared = frontend_arrangements()
+    missing = sorted(emitted - declared)
+    extra = sorted(declared - emitted - FRONTEND_MADE - NEVER_ON_THE_WIRE)
+    return declared, missing, extra
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", metavar="PATH", help="also write the raw dump")
@@ -127,12 +221,14 @@ def main():
         raise SystemExit(f"缺少后端：{BACKEND}\n先运行 cargo build --offline --locked --release "
                          f"--bin visual-typst --target-dir target/server")
     dump = {}
+    emitted = set()
     for label, source, actions in CASES:
         reply = probe(source, actions)
         if "result" not in reply:
             print(f"== {label} | {source!r}\n   {reply}")
             continue
         response = reply["result"]
+        emitted_kinds(response["view"], emitted)
         tree = []
         walk(response["view"], 0, tree)
         found = {}
@@ -157,10 +253,23 @@ def main():
                 marker = '"kind": "' + name + '"'
                 print(f"   {name} on the wire: {marker in text}")
         print()
+    declared, missing, extra = audit_arrangements(emitted)
+    print("== 排布名双向对照 ==")
+    print(f"   后端在这 {len(CASES)} 个用例里真正发出的线名：{len(emitted)} 个")
+    print(f"   前端 ARRANGEMENTS 声明：{len(declared)} 个"
+          f"（{sorted(FRONTEND_MADE)} 前端自造，{sorted(NEVER_ON_THE_WIRE)} 不上线但必须有画法）")
+    if missing:
+        print(f"   ✗ 前端没有画法的线名：{missing}——会在运行时经 note_unknown 报告")
+    if extra:
+        print(f"   ✗ 后端发不出来的排布名：{extra}——这类分支永远不会执行")
+    if not missing and not extra:
+        print("   ✓ 两个方向都对齐：每个线名都有画法，每个画法都有线名")
+    print()
     if arguments.json:
         Path(arguments.json).write_text(json.dumps(dump, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"raw dump -> {arguments.json}", file=sys.stderr)
+    return 1 if (missing or extra) else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

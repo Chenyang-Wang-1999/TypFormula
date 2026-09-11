@@ -717,7 +717,15 @@ impl Editor {
         } else if let Some(owner) = self.owner() {
             let idx = self.cursor.slices.last().unwrap().cell;
             if !shift && let Some(next) = owner.idx_horizontal(idx, forward) {
-                let root_back = !forward && matches!(owner.kind, Kind::Root | Kind::Table { .. } | Kind::Multiline { .. });
+                // Which shapes land at the END of the cell they are entered backward
+                // into: a radical (its degree reads first, so the radicand is met from
+                // its right) and a grid (a row is met from its last column). The
+                // radical has to be asked through `command_shape`, because a
+                // `root(...)` call is stored as a `MacroCall` and only the command file
+                // says it is a radical at all — testing `Kind::Root` here silently
+                // changed where the caret landed.
+                let radical = matches!(owner.command_shape(), Some(Kind::Root));
+                let root_back = !forward && (radical || matches!(owner.kind, Kind::Table { .. } | Kind::Multiline { .. }));
                 self.cursor.slices.last_mut().unwrap().cell = next; self.cursor.pos = if root_back { self.data().len() } else { 0 };
             } else { self.pop(forward); }
         }
@@ -808,7 +816,7 @@ impl Editor {
         if self.erase_selection() { return; }
         if self.cursor.pos == 0 {
             if self.cursor.slices.is_empty() { return; }
-            if matches!(self.owner().map(|o| &o.kind), Some(Kind::MacroCall { .. })) {
+            if self.owner().is_some_and(MathAtom::is_macro) {
                 self.pop(false); self.anchor = Some(self.cursor.clone()); self.cursor.pos += 1; return;
             }
             let saved = self.data().clone();
@@ -825,7 +833,7 @@ impl Editor {
         let pos = self.cursor.pos;
         if pos == self.data().len() {
             if let Some(owner) = self.owner() {
-                if matches!(owner.kind, Kind::MacroCall { .. }) { return; }
+                if owner.is_macro() { return; }
                 if owner.cells.len() == 1 && pos == 0 { self.pop(false); let p = self.cursor.pos; self.data_mut().remove(p); }
                 else if let Kind::Scripts = owner.kind {
                     let idx = self.cursor.slices.last().unwrap().cell;
@@ -871,7 +879,7 @@ impl Editor {
                 else if let Some(owner) = self.owner() {
                     let idx = self.cursor.slices.last().unwrap().cell;
                     let last = owner.cells.len()-1;
-                    let columns = match owner.kind { Kind::Table {columns} | Kind::Multiline {columns,..} => columns, _ => 1 };
+                    let columns = match &owner.kind { Kind::Table {columns,..} | Kind::Multiline {columns,..} => *columns, _ => 1 };
                     let target = if !end && idx % columns != 0 { Some(idx - idx % columns) }
                         else if end && idx % columns + 1 != columns { Some(idx - idx % columns + columns - 1) }
                         else if !end && idx != 0 { Some(0) }
@@ -889,7 +897,7 @@ impl Editor {
     fn grow_grid(&mut self, column: bool) {
         if self.pending().is_some() { self.message = "请先按 Enter 确认命令".into(); return; }
         let columns = match self.owner().map(|a| &a.kind) {
-            Some(Kind::Table {columns} | Kind::Multiline {columns,..}) => *columns,
+            Some(Kind::Table {columns,..} | Kind::Multiline {columns,..}) => *columns,
             _ => { self.message = "请先进入矩阵或对齐公式的一个格子".into(); return; }
         };
         let old_idx = self.cursor.slices.last().unwrap().cell;
@@ -899,11 +907,21 @@ impl Editor {
             for row in (0..rows).rev() { grid.cells.insert((row+1)*columns, vec![]); }
             if let Kind::Multiline {columns:count,row_lengths} = &mut grid.kind {
                 *count=columns+1; row_lengths.fill(columns+1);
-            } else { grid.kind = Kind::Table { columns: columns+1 }; }
+            } else if let Kind::Table { columns: count, row_lengths, name } = &mut grid.kind {
+                // Growing a table's columns has to keep the command that built it — a
+                // widened `vec` is still written `vec(…)` — and it fills every row, the
+                // way it already did for an alignment: asking for a column asks for it
+                // in all of them.
+                let _ = name;
+                *count = columns+1; row_lengths.fill(columns+1);
+            }
             self.cursor.slices.last_mut().unwrap().cell = old_idx / columns * (columns+1) + old_idx % columns;
         } else {
             grid.cells.extend(vec![vec![]; columns]);
-            if let Kind::Multiline {row_lengths,..} = &mut grid.kind { row_lengths.push(columns); }
+            match &mut grid.kind {
+                Kind::Multiline { row_lengths, .. } | Kind::Table { row_lengths, .. } => row_lengths.push(columns),
+                _ => {}
+            }
         }
     }
 }

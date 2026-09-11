@@ -14,7 +14,7 @@ fn run(a:&MathAtom)->String{
 #[test]
 fn nested_raw_keeps_its_editable_fraction_and_source() {
     let mut e=command("frac(dif x, 2 pi)");
-    assert!(matches!(e.root[0].kind,Kind::Fraction));raw(&e.root[0].cells[0][0],"dif");
+    assert_eq!(e.root[0].decl().view,"fraction","命令写法借用分式的形状");raw(&e.root[0].cells[0][0],"dif");
     assert!(matches!(e.root[0].cells[1][1].kind,Kind::Symbol{..}));
     assert_eq!(e.root,load("frac(dif x, 2 pi)").root);
     key(&mut e,"Home");key(&mut e,"ArrowRight");key(&mut e,"ArrowRight");
@@ -39,9 +39,19 @@ fn compiler_owns_symbols_operators_shorthands_and_escapes() {
     // the lexer and the engine treat it: one token, one `NumberItem`.
     assert_eq!(command("123").root.len(),1);
     assert_eq!(run(&command("123").root[0]),"123");
-    for s in ["cancel( x/y  + dif x )", "lr((x), size: #150%)", "text(\"hello\")"] {
+    // A call stays source only when its arguments are **not all positional** — that is
+    // the one thing a cell list cannot hold. `lr(x, size: #100%)` has a named argument,
+    // so no cell list can spell it back and it stays `Raw`.
+    for s in ["lr( x/y  + dif x , size: #100%)", "lr((x), size: #150%)"] {
         raw(&command(s).root[0],s);raw(&load(s).root[0],s);
     }
+    // `text("hello")` has a single positional argument, so it is a `MacroCall` now: the
+    // node keeps the name and the argument, the call's own source is what gets rendered,
+    // and the written form is unchanged.
+    let text_call=command("text(\"hello\")");
+    assert!(matches!(&text_call.root[0].kind,Kind::MacroCall{name,..} if name=="text"),"{:?}",text_call.root[0].kind);
+    assert_eq!(typst::write_cell(&text_call.root),"text(\"hello\")");
+    assert_eq!(text_call.root,load("text(\"hello\")").root);
     let mut e=Editor::default();input(&mut e,">=");assert_eq!(e.root.len(),2);assert!(e.root.iter().all(|a|matches!(a.kind,Kind::Char{..})));
     // One separator: joined, `>=` would lex as a single shorthand token.
     assert_eq!(typst::write_cell(&e.root),"> =");
@@ -214,9 +224,13 @@ fn definitions_keep_source_and_supported_calls_expand_only_in_view() {
 
 #[test]
 fn fraction_slash_uses_typst_precedence_and_keeps_nested_fallbacks() {
+    // Two ways to one shape, and two different nodes on purpose: `/` in the source is
+    // *syntax*, so the parser wraps it in a `Kind::Fraction` of its own, while
+    // `command("/")` arrives as the command name `frac` and is stored as the call.
+    // Both project as a fraction and both write `frac(…)`.
     let e=command("(dif x)/ (2 pi)");assert!(matches!(e.root[0].kind,Kind::Fraction));
     assert_eq!(typst::write_cell(&e.root),"frac(dif x, 2 pi)");
-    assert!(matches!(command("/").root[0].kind,Kind::Fraction));
+    assert_eq!(command("/").root[0].decl().view,"fraction");
     let mut e=Editor::default();input(&mut e,"x/2");
     assert_eq!(typst::write_cell(&e.root),"frac(x, 2)");
     assert_eq!(e.cursor.slices[0].cell,1);
@@ -241,7 +255,7 @@ fn alignment_preserves_empty_columns_ragged_rows_and_linebreaks() {
 #[test]
 fn markers_only_split_their_own_math_level() {
     let e=command("frac(a & b \\ c & d, 2)");
-    assert!(matches!(e.root[0].kind,Kind::Fraction));
+    assert_eq!(e.root[0].decl().view,"fraction","命令写法借用分式的形状");
     assert!(matches!(e.root[0].cells[0][0].kind,Kind::Multiline{columns:2,..}));
     let e=command(r#""a & b \\ c" + \&"#);
     assert!(matches!(e.root[0].kind,Kind::Text));raw(e.root.last().unwrap(),r"\&");

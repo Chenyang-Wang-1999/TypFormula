@@ -43,11 +43,11 @@ fn pending_command_blocks_session_switch() {
 }
 #[test]
 fn raw_mapping_is_in_full_document_utf8_coordinates() {
-    let mut doc=load("中文😀 $cancel(x)$ 后文");
+    let mut doc=load("中文😀 $lr(x, size: #100%)$ 后文");
     doc.apply(json!({"action":"activate_formula","start":"中文😀 ".len()})).unwrap();
     let reply=doc.response();
     for range in reply["render"]["raw"].as_array().unwrap() {
-        assert_eq!(&doc.source[range["start"].as_u64().unwrap() as usize..range["end"].as_u64().unwrap() as usize],"cancel(x)");
+        assert_eq!(&doc.source[range["start"].as_u64().unwrap() as usize..range["end"].as_u64().unwrap() as usize],"lr(x, size: #100%)");
     }
 }
 fn fragments(doc:&mut Document)->Vec<(String,String)> {
@@ -90,16 +90,16 @@ fn repeated_fragments_of_one_formula_take_their_own_occurrences() {
 }
 #[test]
 fn repairing_a_fragment_writes_the_edited_source_back() {
-    let mut doc=load("$ undefinedfunc(α) $");
+    let mut doc=load("$ undefinedname $");
     doc.apply(json!({"action":"activate_formula","start":0})).unwrap();
     // The desktop reports the fragments of one render pass as a set.
-    doc.apply(json!({"action":"preview_results","sources":["undefinedfunc(α)"],"definitions":doc.editor.definitions.clone(),"display":doc.editor.display,"failed":true})).unwrap();
+    doc.apply(json!({"action":"preview_results","sources":["undefinedname"],"definitions":doc.editor.definitions.clone(),"display":doc.editor.display,"failed":true})).unwrap();
     // Entering is the only repair path left for a fragment with no image at all.
     doc.apply(json!({"action":"key","key":"ArrowRight"})).unwrap();
-    assert_eq!(doc.editor.pending(),Some("undefinedfunc(α)"));
+    assert_eq!(doc.editor.pending(),Some("undefinedname"));
     doc.apply(json!({"action":"key","key":"a","ctrl":true})).unwrap();
     doc.apply(json!({"action":"input","text":"undef(β)"})).unwrap();
-    assert_eq!(doc.source(),"$ undefinedfunc(α) $","a draft stays inside the session");
+    assert_eq!(doc.source(),"$ undefinedname $","a draft stays inside the session");
     doc.apply(json!({"action":"key","key":"Enter"})).unwrap();
     assert_eq!(doc.source(),"$ undef(β) $");
     let start=doc.source.find("undef(β)").unwrap();

@@ -116,8 +116,9 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 ```
 "frac(1, 2)"
-   ├─ typst-syntax : MathCall{callee:"frac", args:[1, 2]}   ← 调用结构与参数范围
-   └─ parse_atom   : 查表 → Kind::Fraction，两个参数各自 parse_cell  ← 名字表给的答案
+   ├─ typst-syntax : MathCall{callee:"frac", args:[1, 2]}      ← 调用结构与参数范围
+   └─ parse_atom   : 表里有 frac → 存成 MacroCall{name:"frac"}，两个参数各自 parse_cell
+                        ↑ 名字表只回答"这名字认不认"，形状（分式的两格）是后面查出来的
 ```
 
 ### 由此得到的三条判断
@@ -130,12 +131,107 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 | 名字 | 引擎里有对应元素 | 表里有名字 | 结果 |
 | --- | --- | --- | --- |
-| `frac`（调用写法） | `FracElem` | 是 | `Kind::Fraction` |
-| `mat`、`hat`、`overline` | `MatElem`/`AccentElem`/`OverlineElem` | 是 | 结构节点 |
-| `cancel`、`strike` | `CancelElem` | **否** | `Raw`，引擎自己画（`MathKind::Cancel` 未建模） |
-| `vec` | `VecElem` | **否** | `Raw`。**注意 `VecElem` 是 define 过的**（`math/mod.rs:68`），所以引擎确实把它解析成列向量；内核不认它只是因为表里没有 |
+| `frac`、`sqrt`、`root`、`hat`、`overline`、`underline`、`abs`、`norm`、`cancel` | `FracElem`/`RootElem`/`AccentElem`/`CancelElem` 等 | 是 | **存成 `MacroCall`，形状查表得到**（见下节） |
+| `mat`、`vec`、`cases` | `MatElem`/`VecElem`/`CasesElem` | 是 | `Kind::Table`，但**行方式与定界符来自配置**（见下节） |
+| `a/b`、`√x`、`(a+b)`、`x^2` | `Fraction`/`Radical`/`Fenced`/`Scripts` | 不适用 | 语法节点，与名字无关 |
+| `bb(A)`、`lr(x, size: #100%)` | `TextElem` 变体 / `LrElem` | **否** | `Raw`，引擎自己画 |
 
-最后一行的细节值得留一句：`VecElem::resolve_vec`（`resolve.rs:1018`）把**每个参数各包成一行**（`map(|child| vec![child])`）再交给 `resolve_cells`，所以 `vec(1,2,3)` 与 `mat(1;2;3)` 排版逐字节相同。这是元素自己的固定行为，与逗号/分号的分列语义无关——前一版文档若把它解释成"逗号分隔却要换行"，那是错的。
+`vec` 曾经是这里"引擎认得、表里没有"的例子，现在进表了。**注意 `VecElem` 一直是 define 过的**（`math/mod.rs:68`），所以引擎从来就把它解析成列向量；内核当初不认它只是因为表里没有——两者是两回事。
+
+`resolve_vec`（`resolve.rs:1018`）把**每个参数各包成一行**（`map(|child| vec![child])`）再交给 `resolve_cells`，所以 `vec(1,2,3)` 与 `mat(1;2;3)` 排版逐字节相同。这是元素自己的固定行为，与逗号/分号的分列语义无关——前一版文档若把它解释成"逗号分隔却要换行"，那是错的。
+
+### 表格的行方式与定界符在配置里
+
+`vec`/`cases`/`mat` 是**同一个 `grid` 形状的三个名字**，差别只有两件，都写在名字旁边：
+
+```json
+"mat":   { "shape": "grid", "rows": "mat",  "border": "()" },
+"vec":   { "shape": "grid", "rows": "each", "border": "()" },
+"cases": { "shape": "grid", "rows": "each", "border": "{ " }
+```
+
+`rows` 说参数列表怎么变成行（`mat` 按分号，其余一个参数一行），`border` 说画什么定界符（左+右，或单边一个字符）。实测三条路都成立，而且**写回的是各自的名字**：
+
+| 源码 | `columns` | `border` | `is_mat` | 写回 |
+| --- | --- | --- | --- | --- |
+| `mat(1, 2; 3, 4)` | 2 | `()` | true | `mat(1, 2; 3, 4)` |
+| `vec(1, 2, 3)` | 1 | `()` | false | `vec(1, 2, 3)`（**不是** `mat(1; 2; 3)`） |
+| `cases(1, 2)` | 1 | `{ ` | false | `cases(1, 2)` |
+| `mat(a, b; c)` | 2 | `()` | true | `mat(a, b; c)`（**行宽不等**，见下） |
+
+这就是为什么 `Kind::Table` 存了一个 `name`：**形状不蕴含拼写**。`vec(a, b)` 与 `mat(a; b)` 排出同一张表，节点不记住名字就写不回原样。
+
+配置值因此有两种写法：只写形状名（`"frac": "fraction"`），或者写带参数的对象。对象形式是这一次加的——`grid` 这个名字单独一个字符串说不清"这个表怎么切行、外面画什么"。
+
+### 行宽可以不等——旧的那条拒绝是错的
+
+`Kind::Table` 里还有 `row_lengths`，和 `Multiline` 一模一样。它存在的直接原因是**编辑器原先拒绝建这个表**：
+
+> 「只有各行等宽的矩阵才是矩阵：`mat(a, b; c)` 不是 Typst 能排的表，所以留作源码。」
+
+**这句话是错的。** 实测 24pt：`mat(a, b; c)` 高 `43.008pt`，与 `mat(1, 2; 3, 4)` **完全相同**——引擎照排，短行按缺格处理。所以那是一条**既错误又没人守**的规则：`round_trip.rs`、`structured_input.rs`、`desktop` 里都没有 `mat(a, b; c)` 的用例，删掉它时**一个测试都没红**。现在它有用例了（`a_matrix_may_have_rows_of_different_widths`）。
+
+`row_lengths` 记的是**补齐前**每行真正有几格。两个地方靠它：
+
+* **写回**要按它把补齐的格子去掉，否则 `mat(a, b; c)` 会被写成 `mat(a, b; c, )`；
+* **不能改用"删掉行尾空格子"这个更简单的办法**：`mat(a, ; c, d)`（两列、第二格是**有意留空**）会被改写成 `mat(a; c, d)`——那变成一行两格加一行一格，意思完全不同。这正是 `Multiline` 早就有 `row_lengths` 的原因。
+
+行的补齐是**逐行**做再摊平的（`Multiline` 也是），不是最后一次性补齐：否则 `mat(a; b, c)`（行宽 `[1, 2]`）会摊成 `[a, b, c, _]`，被 `chunks(2)` 读回成 `[a, b]` 与 `[c, _]` 两行。这个是**新加的用例抓出来的**。
+
+还有一个空格的坑：空格子写回时**什么都不写**（`write_cell` 对空格子回答的是 `""`，那是文本单元里空串的拼法，而 `mat(a, ; c, d)` 不是 `mat(a, "", c, d)`），**唯一的例外是最后一行的最后一格**——它后面没有分隔符了，裸写会留下一个尾逗号而没有实参，于是 `mat(, ; , )` 会读回"两格 + 一格"。所以那一格写成 `""`，而解析器会把空文本还原成空格子。这条也是**旧用例抓出来的**（`a_command_written_with_empty_parentheses_is_writable`）。
+
+`Kind::Table` 现在与 `Kind::Multiline` 的数据形状完全一致（`columns` + `row_lengths` + 扁平格子），差别只在写回（`; ` vs `&`/`\`）与视图（有无定界符、是否居中）。**没有拆成"稠密/稀疏"两个视图**：按"一条独立的编辑或显示逻辑"这条判据，两者的画法与编辑完全相同，只是**实例**参差与否，所以是 `row_lengths` 这个数据，不是第二个视图 kind。
+
+### 配置好的名字存成 `MacroCall`，形状是查出来的
+
+`config/commands.json` 里的名字**不再各自有一个 `Kind`**：节点存的是**调用**（`MacroCall { name, cells }`），而**槽位、视图、拼写**都在画或写的那一刻由名字查表得到（`math::MathAtom::command_shape` → `slots::configured_kind`）。所以 `Kind::Fraction`/`Sqrt`/`Root`/`Accent`/`Line` 这些变体**仍然存在，但不再是树里的节点**——它们是**形状描述符**，被 `configured_kind` 按名字返回。`Kind::Fenced` 与 `Kind::Table` 例外，它们仍然真的被存下来（前者是 `(a+b)` 的语法节点，后者见上表）。
+
+这样做换来一件事：**配置文件决定什么被结构化，而且改了文件不会留下持有旧形状的节点**。代价是两类**按 `Kind` 写死的规则会静默失效**，实测在两处发生过，都记在这里：
+
+| 规则 | 原写法 | 为什么失效 | 修法 |
+| --- | --- | --- | --- |
+| 退格在格首"只拉出当前实参" | `matches!(owner.kind, Kind::MacroCall { .. })` | 借了形状的 `frac(a, b)` 也是 `MacroCall`，于是它继承了**宏实参**的语义，退格再也拉不出实参（`lyx_traces.rs` 抓到） | `MathAtom::is_macro()`：`MacroCall` **且**没有配置形状，即"实参是 `#let` 的形参" |
+| 向左跨格进入根式时落在格尾 | `matches!(owner.kind, Kind::Root)` | `root(...)` 存成 `MacroCall`，这个判断恒为假，光标落到了格首 | 改问 `owner.command_shape()`（`caret_navigation.rs` 新增用例抓到） |
+
+第二条尤其值得记：**当时没有任何测试覆盖它**，是翻完之后逐条审 `Kind::` 判断才发现的，而补的第一版用例又走的是 `entry_cell` 而不是 `move_horizontal` 那条路，加了变异检查才发现它照样通过。同一个理由让 `is_macro()` 必须存在：`Kind::MacroCall` 现在是一个**过载**的标记，既表示"宏调用"也表示"借了形状的命令"，凡是按它分派的规则都要重新问一遍。
+
+### 哪些 `Kind` 必须留下
+
+一个构造要是自己的 `Kind`，只有两个理由：
+
+1. **它带着名字和配置都给不出的实例数据**——`Table{columns}`、`Fenced{left,right}`、`Multiline{columns,row_lengths}`、`Raw{source}`、`MacroCall{name}`、`TemplateCall{definition}`、`Parameter{index}`、`Unknown{…}`、`Char{text}`、`Symbol{name,glyph}`；
+2. **它要保住书写形式**——`SkewedFraction`（若采纳）记的是"源码写的是 `a/b`"，这是出处而不是数据，但同样只有节点能记住。
+
+按这条，`Fraction`/`Sqrt`/`Root`/`Accent`/`Line` 都**不该是节点**：它们没有自己的数据，名字加上配置已经说全了。`√x`/`∛x` 也因此与 `sqrt(x)`/`root(3, x)` 折成同一个 `MacroCall`——radical 的形状不带数据，`√x` 该记的只有"它是 sqrt"这一个名字。
+
+**`Table` 则必须留下，这是原计划里唯一算错的一项。** `mat` 的列数既不在名字里也不在配置里，只在参数列表的分号里：`mat(a, b; c, d)` 存成一个扁平格子表之后就再也分不出行界，写不回 `mat(a, b; c, d)`。所以 `mat` 不能变成普通 `MacroCall`——除非 `MacroCall` 自己长出一个列数字段，而那只是把同一个问题换了个地方放。
+
+这条判据**有测试守着**：`tests/stored_kinds.rs` 解析一份覆盖"命令写法 + 语法写法"的语料，收集**真正进过树**的 `Kind`，断言集合恰好是 `Char`/`Symbol`/`Number`/`Raw`/`MacroCall`/`Text`/`Fraction`/`Scripts`/`Fenced`/`Table`/`Multiline`/`Unknown` 十二个。多一个就说明有人把某个**形状描述符**重新变成了会存的节点——那种回归能编译、能往返，此前没人会说。实测把 radical 那一支改回 `Kind::Sqrt`，它会报「多出来的：["Sqrt"]」。
+
+`Sqrt`/`Root`/`Accent`/`Line` 四个变体因此**只在形状表里活着**：`configured_kind` 拿它们当形状返回、`Decl` 描述它们的槽位、`view_atom` 按它们画，但没有源码能存它们。这不是"该删没删"，而是**一个变体身兼两职**——`command_shape()` 与 `is_macro()` 之所以必须存在，就是因为 `Kind::MacroCall` 同时也是"借了形状的命令"。
+
+### `Style` 的渲染不在内核这一侧
+
+`Style{text, style_name}`（`bb`/`cal`/`frak`…）的**机制**很便宜：形状不带数据（`style_name` 就是命令名，和 `Accent` 一样），所以只要一个形状描述符 + 配置里几行。**贵的是前端那一步"渲染"**，也就是"让前端负责渲染"这句话实际要求什么。查证结果：
+
+| 事实 | 证据 |
+| --- | --- |
+| 变体是**码位替换**，不是字体特性 | `resolve.rs:311` 把每个字符过一遍 `to_style(c, MathStyle::select(c, variant, bold, italic))`，替换后的文本才去整形 |
+| 但那张表**不在 vendor 里** | `resolve.rs:4` 是 `use codex::styling::{MathStyle, to_style}`，来自外部 crate `codex 0.3.0` |
+| 它**不是偏移表**：一个字符可能变成**两个**（基字 + 变体选择符） | `to_style('Q', Chancery) == "𝒬\u{fe00}"`（`codex/src/styling.rs:362`）；`mathfont.glyph` 目前只处理**单字符** |
+| 它覆盖**非拉丁**字母表 | 同一份文档的例子：`ظ → 𞺚`、`ذ → 𞺸`（阿拉伯数学字母） |
+| 规模 | `codex/src/styling.rs` 共 942 行 |
+| `cal` 与 `scr` 是**两种**变体，Unicode 只有一套 script 区 | 实测 24pt：`cal(A)` 19.152 ≠ `scr(A)` 20.52 |
+
+字体本身没问题，这一点也量过了：随附的 `NewComputerModern Math` **覆盖全部变体区**，各区的"缺口"正是 Unicode 自己的设计（script 大写 18/26、fraktur 21/26、double-struck 19/26），而 Letterlike 那几个替代码位（`ℂℍℕℙℚℝℤ`）**全部存在**。
+
+所以 `Style` 卡在一个选择上，而不是卡在难度上：
+
+1. **把 942 行的表转写进 Python**——风险是与 `codex` 悄悄分歧，而且非拉丁部分基本不可能只靠抽查保证；
+2. **让适配器给内核送已经替换好的文本**——复用引擎自己的表，必然一致，但这正是 `Accent` 几何量缺失的那个**引擎数据通道**，现在还不存在；
+3. **先不做**——今天 `bb(A)` 是 `Raw`，由引擎渲染，**画得是准的**，只是不可编辑。`Style` 换到的是"可编辑"，代价是"除非表是对的，否则画错"。
+
+**注意这一条的现状**：`bb(A)` 是 `Raw` 不只是因为表不在手边，也是因为 `bb` 根本不在 `config/commands.json` 里——**它现在是三层名字处理里的第三层**（纯源码文本、引擎自己画），而且这一层的渲染是**正确的**。
 
 ### `MathIdent` 查的是两张表，不是一张
 
@@ -213,7 +309,7 @@ View:      macro
 
 `math::MathAtom` 只保存实例数据（几列、有哪个脚标）；一个节点的**格子含义、视图名、Typst 拼写、所对应的 Typst 构造与导航规则**集中在 `crates/core/src/slots.rs` 的唯一一张表里，由穷尽 `match` 的 `Kind::decl()` 声明 9 项：`view`、`typst`、`slots`、`arity`、`entry`、`horizontal`、`vertical`、`class`、`write`。`entry_cell` / `math_class` / `idx_horizontal` / `cursor::vertical` / `view_atom` / `write_atom` 全部读这张表，不再各自 `match Kind`——加一个 `Kind` 时编译器会要求把这几件事一次说清。
 
-`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个 `decl` 可以认领 0 个（编辑器专有：`MacroCall`/`TemplateCall`/`Parameter`/`Unknown`）、1 个或多个（`Raw` 认领 `Box`/`Mathml`/`External`；`Sqrt` 与 `Root` 都认领 `Radical`；`Char` 与 `Symbol` 都认领 `Glyph`）。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何 `Kind` 认领的变体"恰好等于 `slots::UNMODELLED`——即 `Cancel`、`Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一个就必然要改那张表，并在那里写下为什么其余几个还没做。这四个未建模项与上一节的"名字表"是**两件事**：`Cancel` 已经在引擎里被解析成元素（`resolve.rs:222`），只是编辑器没有它的结构；而 `VecElem` 连这一步都还没走到表里。`view` 名与变体名**故意不同**（`Kind::Fenced` 的排布名仍是 `delim`）：排布名是给前端的绘图契约，只在画法变化时才需要改。
+`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个 `decl` 可以认领 0 个（编辑器专有：`MacroCall`/`TemplateCall`/`Parameter`/`Unknown`）、1 个或多个（`Raw` 认领 `Box`/`Mathml`/`External`；`Sqrt` 与 `Root` 都认领 `Radical`；`Char` 与 `Symbol` 都认领 `Glyph`）。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何 `Kind` 认领的变体"恰好等于 `slots::UNMODELLED`——现在只剩 `Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一项就必然要改那张表，并在那里写下为什么其余几项还没做。这三项与上一节的"名字表"是**两件事**：`VecElem` 连名字都没进表，而 `Group` 是"编辑器的一个格子就是一个 group"、根本不需要谁去代表它。`cancel` 则是第三类——它靠 `commands.json` 里的一行把 `Accent` 的形状借过来用，`MathKind::Cancel` 因此由 `Kind::Accent` 一并认领（见下节）。`view` 名与变体名**故意不同**（`Kind::Fenced` 的排布名仍是 `delim`）：排布名是给前端的绘图契约，只在画法变化时才需要改。
 
 `Char` 的载荷是**一个字形簇**（`String`，不是一个 `char`），因为"字符"与"Unicode 标量"不是一回事：`é` 可能是一个标量也可能是两个，emoji 常是好几个。词法本来就把一个字形簇收进一个节点，`GlyphItem` 也装一个簇——按标量拆会让回写在簇中间插入分隔符，把 `é` 写成 `e ́`。`Kind::Number` 同理是"一个格"，串内字符由 `Write::Run` 连成一个记号。
 
@@ -221,7 +317,7 @@ View:      macro
 
 这条配置只回答一个问题：**"这个名字，编辑器有没有对应的结构"**。它不回答参数个数（那是 `Decl::write` 的拼写里数出来的：`frac({0}, {1})` 是两格）、不回答拼写（也是 `write`）。所以它不是第二张表，而是"编辑器认识哪些命令"这**一个**事实的存放处——`slots.rs` 的两条单元测试把它钉在这里：每个名字必须指向一个真实存在、且视图名与声明一致的 `Kind`，反之每个"命令能建的 `Kind`"也必须有名字。
 
-一处不能从配置到达：**`grid` 不在 `kind_for_view` 的可达视图里。** 表格的形状来自它的参数列表（几格一行），只有 `parse_atom` 里 `mat` 自己那条分支知道，所以 `grid` 是**按命令名**豁免的，而不是按视图名。区别有实测意义：按视图名豁免时 `"cases": "grid"` 能通过检查，而这个名字既查不到、也没有解析分支，写回时会带着一个从未被填过的 `columns` 走到 `chunks()` 上。检查因此改成按名字（`slots.rs` 的 `source_built_commands` 白名单，目前只有 `mat`）。
+一处不能从配置到达：**`grid` 不在 `kind_for_view` 的可达视图里。** 表格的 `columns` 来自它的参数列表（几格一行），而这件事只有 `parse_atom` 里那条建表的**分支**知道，所以 `grid` 是**按命令名**走的，不是按形状名。区别有实测意义：按形状名放行时 `"cases": "grid"` 能通过检查，而那时这个名字既查不到、也没有解析分支，写回时会带着一个从未被填过的 `columns` 走到 `chunks()` 上。检查因此按名字做（`slots.rs` 的 `source_built_commands` 白名单，现在是 **`mat`、`vec`、`cases`** —— 三个名字共用 `grid` 形状，差别只有"怎么切行"和"外面画什么"，两件都写在名字旁边）。
 
 「实测改一行配置（`"cancel": "line"`）就能让 `cancel(x)` 从 `Raw` 变成 `line` 节点」这句要连同上面第三节一起读：**只有调用写法**会被这条路接住，而且把一个名字指向 `line` 是类型上合法、语义上错误的——它会得到一条位置取自 `name == "overline"` 判定的规则线。这正是"配置能改什么"的边界。
 
@@ -234,7 +330,89 @@ View:      macro
 - `Write::Template("root({1}, {0})")` 把"内部 `[被开方式, 根指数]` 与 Typst 的 `root(index, radicand)` 相反"写成一行声明，取代过去分散在解析（`args.swap`）与回写（`c(1), c(0)`）两处的隐式约定。模板必须单遍展开，否则格子源码里的花括号会被当成占位符。
 - `Kind::Scripts` 的存储固定为 `[base, upper, lower]` 三格（`math::script_cell` 是唯一的格索引来源），空格子表示没有该脚标；视图因此不再需要合成缺格。Typst 的 `ScriptsItem` 有六个附件字段，因为它区分"居中极限"与"侧挂脚标"、并且保留左侧附件；一个格子属于哪一种由编译器决定、单独去问（`native-adapter`），不存在这里。
 
-视图节点还带一个 `role`：父节点声明的**槽位角色**（`numerator`/`denominator`/`base`/`upper`/`lower`/`radicand`/`index`/`inner`/`cell`/`arg`）。前端 `mathview.py` 按角色取子节点，位置只作回退，所以一个复用已有排布与角色的新 `Kind` 不需要改前端。前端另有一张 `ARRANGEMENTS` 白名单：遇到不认识的排布**报告一次**（经 `Typesetter.warn` 到状态栏），而不是静默按横排画错。
+视图节点还带一个 `role`：父节点声明的**槽位角色**（`numerator`/`denominator`/`base`/`upper`/`lower`/`radicand`/`index`/`inner`/`cell`/`arg`）。前端 `mathview.py` 按角色取子节点，位置只作回退，所以一个复用已有排布与角色的新 `Kind` 不需要改前端。
+
+### 两个名字：形状名与线名
+
+`Decl::view` 是**形状名**，不是线名，两者可以不同：
+
+* 形状名要**每个 `Kind` 唯一且稳定**，因为 `config/commands.json` 写的是它（`slots.rs` 的测试就钉着这条），所以 `Kind` 变体改名不该动它（`Frac` → `Fraction` 之后仍是 `fraction`）。
+* 线名由 `view_atom` 算出来，因此**可以把几个形状合并到一个线上 kind**，而它就合并了：`Sqrt`、`Fenced`、`Accent`、`Line` 一律以 `decorated` 上线，靠 `marker` 区分画法。
+
+这不是审美问题，是四者的**编辑声明逐项相同**（1 格、`Arity::Exact`、`Entry::Edge`、`Horiz::Linear`、`Vertical::None`、`class` 0），只有 `write` 与画法不同。线名按"一条独立的编辑或显示逻辑"划，形状名按"配置能指向什么"划，两者各自成立。
+
+| 形状名（`Decl::view`） | 线名（`view_atom`） | 额外字段 |
+| --- | --- | --- |
+| `fraction` | `fraction` | `marker: "-"` |
+| `sqrt` | **`decorated`** | `marker: "radical"` |
+| `delim` | **`decorated`** | `marker: "delim"`（字符仍在 `text`，左、换行、右） |
+| `decoration` | **`decorated`** | `marker`: 重音名，如 `"hat"` |
+| `line` | **`decorated`** | `marker: "overline"` / `"underline"` |
+| `root` | `root` | `marker: "radical"` |
+| `script` | **`scripts`** | |
+| `grid` | **`table`** | `border: "()"`、`is_mat: true` |
+| `aligned` | **`multiline`** | |
+| `macro`（折叠时） | **`raw_macro`** | |
+
+`marker` 的词汇表是**与前端约定的封闭集**（`mathview.py` 的 `MARKERS`）：前端按它选画法，遇到不认识的值报告一次而不是静默画错——与 `ARRANGEMENTS` 同一套约定。`border` 同理：`mat` 在引擎里的默认定界符是一对圆括号，而前端过去**给每张表都画方括号**，正是因为线上一律不带定界符；现在带上了，两边才对得上。
+
+### `raw_macro` 覆盖什么：**所有非结构调用**
+
+判据只有一条，而且它是语法层面的：**一个调用的实参是否**全部是位置实参**。
+
+| 情况 | 节点 | 例子 |
+| --- | --- | --- |
+| 名字在配置里 | `MacroCall`，**借用那个形状** | `frac(a, b)`、`sqrt(x)`、`vec(1, 2, 3)` |
+| 名字**不在**配置里，实参全是位置实参 | `MacroCall`，**形状未知 → `raw_macro`** | `bb(A)`、`binom(n, k)`、`text("hello")` |
+| 有具名实参 / 展开 / 尾分号 | `Raw`（一个格子表拼不回原样） | `lr(x, size: #100%)`、`mat(x, delim: #none)` |
+| 名字是个绑定宏 | 宏的那条路（可展 → `macro`，否则 `raw_macro`） | `#let f(a) = …` 之后 `f(x)` |
+
+最后一项是**放宽之后的行为变化**：从前"实参落在 `Raw` 里"是让宏不可展的判据（`#f` 在 `Raw` 里 ⇒ 没有槽位可给参数），而未知调用**就是** `Raw`，所以一个内部有未知调用的宏整体不可展。现在那个内部调用是 `MacroCall`（画成 `raw_macro`、参数仍可编辑），参数进了格子，于是**展开是安全的**——`source_modes.rs` 里 `jac`（内部调未定义的 `pd`）从"不可展"变成"可展，展开结果里 `pd(…)` 是 `raw_macro`"。
+
+这一条也是为什么 `Raw` 仍然存在：**它不是"没有形状的调用"，而是"格子表表达不了的源码"**。`lr(x, size: #100%)` 永远是 `Raw`，因此仓库里"一个没有图像的片段"的范例从 `undefinedfunc(α)`（现在可解析、成了结构节点）换成了**裸标识符** `undefinedname`——标识符永远不会变成调用，所以它是最稳的那个范例。
+
+`raw_macro` 本来只覆盖"投影超限"，见 `tools/kind_inventory.py` 的 `RawMacro` 用例（15 层翻倍链）；放宽之后那条路径仍在，只是不再是它唯一的来源。
+
+### `raw_macro` 有两种画法，取决于光标在哪
+
+它是唯一一个**画法随光标位置变**的节点，而这是它可以做到的原因：两种画法来自**同一棵树**，区别只在用不用孩子。
+
+| 光标位置 | 画法 | 用什么 |
+| --- | --- | --- |
+| 在节点**外** | 调用**本身的一张图**（就是文档里那一块） | `text` = 调用的拼写，交给引擎编译 |
+| 在节点**内** | 宏名 + 若干个参数槽 | 视图里的 children（`symbol` 与各实参格） |
+
+后端为此做两件事：`view.rs` 把 `text` 从**文案**换成**调用的拼写**，并挂上 `edit` 光标；`document.rs` 的 `annotate` 因此把它和 `raw` 一样对待，算出它在文档里的区间并给一个 `render_id`。实测：
+
+```
+raw_macro: text="layer15(a)"  render_id="684:694:0:0"  edit={slices:[],pos:0}
+render.raw: [{start:684, end:694}]
+```
+
+那句被换掉的文案（`"展开较大，显示调用与参数"` / `"参数个数与定义不符"`）**此前没有任何读者**——前端只排 children，从不读 `text`，所以这个字段本来就是空的，正好让给源码。
+
+前端一侧有两处配套：`mathview.image_box` 抽出来给两种 kind 共用，`raw_macro` 在**未激活**时直接返回那张图；`window.raw_fragments` 做一次**带祖先的**遍历，**跳过塌缩调用内部的片段**——整段调用是一张图，它的实参槽里的片段在光标进入之前不单独取图（否则会白编译一遍，而且和那张整图重复）。
+
+`_active` 不是新机制：`MathCanvas.refresh` 早就把光标路径上的节点标出来了，所以"光标在不在里面"这个问题前端本来就有答案。
+
+### `cancel` 只加了一行配置，代价全在夹具上
+
+`cancel(x)` 的形状就是 `hat(x)` 的形状——一个正文格 + 一个画在它上面的记号——所以它**不需要新的 `Kind`**，只需要在 `config/commands.json` 里加一行 `"cancel": "decoration"`（`Kind::Accent` 已经会把命令名存进 `name`，拼写也已经是 `{name}({0})`）。实测：`cancel(x)` 变成 `decorated`/`marker="cancel"`、一格、写回 `cancel(x)`，往返成立。
+
+引擎侧量到的两件事决定了前端怎么画：默认记号是**内容框的上升对角线**（`CancelItem` 的 `length` = 对角线 + 0.3em），而且 **`cancel(x)` 与 `x` 的盒子完全相同**（24pt 下都是 13.728×10.872），而 `hat(x)` 是 16.92、`overline(x)` 是 16.056——所以记号是**盖在**正文上、盒子不长高，这与 `hat`/`overline` 那两条"抬起身子腾地方"的分支相反。
+
+**真正的工作量在测试夹具上，而且不在配置一侧。** `cancel` 曾经是仓库里"编辑器不建模的片段"的**规范示例**，同时承担两种用途，落地时红了 **21 个测试**（13 个 Rust + 8 个桌面）：
+
+| 用途 | 曾经的写法 |
+| --- | --- |
+| Raw/SVG 管道的片段示例（取图、缓存、`_raw_key`、`definition_raw_ranges`、源码区间） | `document.rs`、`macro_scope.rs`、`desktop.rs`、`test_desktop.py` |
+| **让宏变成不可展的惯用写法**：把形参放进 `Raw` | `#let f(x) = $cancel(#x)$` → `参数引用位于 Raw 中，无法在原位编辑` |
+
+第二种最要紧：`cancel(#x)` 是"造一个不可展宏"的手段，它结构化之后那些用例就失去了构造方式。替代范例换成 **`lr(x, size: #100%)`**（共 64 处引用）：`lr` 带具名实参，而解析器对**非位置实参一律退回原文**，所以它保持 `Raw` 是由语法保证的，不只是"暂时没进配置"。`rawcache.contains_call` 也仍然认它（`标识符` 紧跟 `(`）。
+
+两类容易漏的坑：一是**硬编码的长度**——`test_desktop.py` 里 `definition+9` 是照着 `cancel(a)` 的 9 个字符写的，换范例后静默变成错的偏移（现在改为从字符串本身取长度）。二是**不会变红而是静默失去被测对象**：`round_trip.rs` 与 `structured_input.rs` 的 Raw 清单里也躺着 `cancel(...)`，它们会继续通过，但已经不在测 Raw 了。所以 `tests/round_trip.rs` 另加了一条直接断言——`cancel` 之所以是结构节点**只因为配置文件写了它**，而往返测试看不见这件事（删掉配置项后它变成 `Raw`，照样逐字节往返），与 `math::is_number` 是同一类盲区。
+
+前端另有一张 `ARRANGEMENTS` 白名单：遇到不认识的排布**报告一次**（经 `Typesetter.warn` 到状态栏），而不是静默按横排画错。
 
 回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 **15** 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符。
 

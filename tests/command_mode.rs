@@ -19,7 +19,7 @@ fn only_enter_parses_spaces_and_parentheses() {
     }
     key(&mut e, "Enter");
     assert!(e.pending().is_none());
-    assert!(matches!(e.root[0].kind, Kind::Fraction));
+    assert_eq!(e.root[0].decl().view, "fraction", "草稿应当成为一个分式形状的节点");
     assert_eq!(typst::write_cell(&e.root), "frac(a, b) + alpha beta");
 }
 
@@ -85,7 +85,7 @@ fn completion_buttons_and_toolbar_fill_without_confirming() {
     assert_eq!(e.pending(), Some("frac"));
     key(&mut e, " "); assert_eq!(e.pending(), Some("frac "));
     key(&mut e, "Enter");
-    assert!(matches!(e.root[0].kind, Kind::Fraction));
+    assert_eq!(e.root[0].decl().view, "fraction", "草稿应当成为一个分式形状的节点");
     assert_eq!(e.cursor.slices[0].cell, 0);
 }
 
@@ -134,7 +134,11 @@ fn lsp_replaces_only_the_token_and_keeps_command_mode() {
     e.apply(Action::LspCompletions {draft:context.draft,caret:context.draft_caret,items:vec![CommandCompletion {label:"alpha".into(),replacement:"cases(alpha".into(),caret:11}]}).unwrap();
     key(&mut e,"Tab");assert_eq!(e.pending(),Some("cases(alpha"));
     input(&mut e,", beta)");key(&mut e,"Enter");
-    assert!(matches!(e.root[0].kind,Kind::Raw {..}));
+    // `cases` is a structured name now, so what this asserts is that the completion
+    // left a single table node rather than loose text. (The node is asserted directly
+    // because `cases`'s *shape* name is the drawn arrangement, `grid`, and its *wire*
+    // name is `table` — neither of which is the command name.)
+    assert!(matches!(e.root[0].kind,Kind::Table { .. }),"cases 应当建出表格节点");
     assert_eq!(typst::write_cell(&e.root),"cases(alpha, beta)");
 }
 
@@ -149,12 +153,12 @@ fn late_lsp_response_cannot_overwrite_a_new_draft() {
 
 #[test]
 fn rendered_fallback_is_one_atom_for_navigation_delete_and_undo() {
-    let mut e=Editor::default();input(&mut e,"\\cancel(x)");key(&mut e,"Enter");
+    let mut e=Editor::default();input(&mut e,"\\lr(x, size: #100%)");key(&mut e,"Enter");
     assert_eq!(e.root.len(),1);assert!(e.root[0].cells.is_empty());
     key(&mut e,"ArrowLeft");assert_eq!(e.cursor.pos,0);assert!(e.cursor.slices.is_empty());
     key(&mut e,"ArrowRight");assert_eq!(e.cursor.pos,1);
     key(&mut e,"Backspace");assert!(e.root.is_empty());
-    e.apply(Action::Undo).unwrap();assert_eq!(typst::write_cell(&e.root),"cancel(x)");
+    e.apply(Action::Undo).unwrap();assert_eq!(typst::write_cell(&e.root),"lr(x, size: #100%)");
     key(&mut e,"Home");key(&mut e,"Delete");assert!(e.root.is_empty());
 }
 

@@ -178,6 +178,16 @@ pub struct Decl {
     /// contract with the frontend, and it only has to change when the drawing
     /// changes. The variant names are the contract with Typst's vocabulary and
     /// are recorded in `typst` below.
+    ///
+    /// It is also the name `config/commands.json` writes, which is what the
+    /// `slots.rs` test holds it to — so it has to stay unique per kind and stable
+    /// across renames of the variant.
+    ///
+    /// That makes it the *shape* name, not necessarily the wire name: `view_atom`
+    /// is free to merge several shapes under one wire kind, and does — `Sqrt`,
+    /// `Fenced`, `Accent` and `Line` all travel as `decorated`, because their
+    /// editing is identical and only their drawing differs. The two names agree
+    /// for every other kind.
     pub view: &'static str,
     /// The Typst `MathKind` variants this kind stands for, by name. Empty for
     /// the editor-only kinds. Several names mean the editor either keeps those
@@ -215,15 +225,41 @@ impl Decl {
 // is generated into the same file and read by `math`.
 use crate::math::configured;
 
+/// The entry `config/commands.json` has for a name.
+pub fn command_spec(name: &str) -> Option<&'static configured::Command> {
+    configured::COMMANDS.iter().find(|command| command.name == name)
+}
+
 /// The kind a Typst call means, from `config/commands.json`.
 pub fn command_kind(name: &str) -> Option<Kind> {
-    let view = configured::COMMANDS.iter().find(|(command, _)| *command == name)?.1;
-    kind_for_view(view)
+    kind_for_view(command_spec(name)?.shape)
+}
+
+/// The kind a command name means, **with the data its own name supplies**.
+///
+/// This is the one place a name becomes a complete shape. Three kinds carry data in
+/// their variant that only the name can say — `abs` is the `|` pair, `hat` the accent
+/// called `hat`, `overline` the line above — so `kind_for_view` answers them blank and
+/// someone has to fill them in. That used to be `parse_atom`, which meant anything
+/// *else* asking "what shape is `hat`?" (the view projection, the writer) got the blank
+/// and drew an accent with no name. Consolidating it here is what lets a `MacroCall`
+/// borrow a shape without the call site having to know how the shape is spelled.
+pub fn configured_kind(name: &str) -> Option<Kind> {
+    Some(match command_kind(name)? {
+        Kind::Accent { .. } => Kind::Accent { name: name.to_string() },
+        Kind::Style { .. } => Kind::Style { name: name.to_string() },
+        Kind::Line { .. } => Kind::Line { above: name == "overline" },
+        Kind::Fenced { .. } => match name {
+            "abs" => Kind::Fenced { left: "|".into(), right: "|".into() },
+            _ => Kind::Fenced { left: "‖".into(), right: "‖".into() },
+        },
+        other => other,
+    })
 }
 
 /// Every command name the editor knows, for a completion list.
 pub fn command_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = configured::COMMANDS.iter().map(|(name, _)| *name).collect();
+    let mut names: Vec<&'static str> = configured::COMMANDS.iter().map(|command| command.name).collect();
     names.sort_unstable(); names.dedup(); names
 }
 
@@ -258,26 +294,31 @@ fn kind_for_view(view: &str) -> Option<Kind> {
         "delim" => Kind::Fenced { left: String::new(), right: String::new() },
         "line" => Kind::Line { above: false },
         "decoration" => Kind::Accent { name: String::new() },
+        "style" => Kind::Style { name: String::new() },
         _ => return None,
     })
 }
 
 /// Command names whose kind the parser builds from the source, not from a name.
 ///
-/// `mat` is the only one: a table's shape is its argument list's, and `parse_atom`
-/// has a branch for exactly that name. Nothing else may claim `grid` — a name with no
-/// such branch would be handed `kind_for_view`'s answer, and the `Table { columns: 0 }`
-/// that used to be there reached `cells.chunks(0)` and panicked.
+/// A table's shape is its argument list's, so these names get a branch in `parse_atom`
+/// rather than an answer from `kind_for_view` — which is why `kind_for_view` refuses
+/// `grid` outright: a name with no such branch would be handed a placeholder table and
+/// write it with a column count nobody filled in.
+///
+/// `mat`, `vec` and `cases` are all three of these names. They differ only in how their
+/// arguments become rows and what is drawn around them, and both facts live in
+/// `config/commands.json` beside the name.
 #[cfg(test)]
 fn source_built_commands() -> Vec<&'static str> {
-    ["mat"].to_vec()
+    ["mat", "vec", "cases"].to_vec()
 }
 
 /// The view name of every kind a command can build, for the test that holds
 /// `config/commands.json` to this list.
 #[cfg(test)]
 fn command_views() -> Vec<&'static str> {
-    ["fraction", "sqrt", "root", "delim", "line", "decoration"].to_vec()
+    ["fraction", "sqrt", "root", "delim", "line", "decoration", "style"].to_vec()
 }
 
 // The slot arrays are named constants because `&[…]` written inline in the
@@ -314,10 +355,11 @@ const K_MULTILINE: &[&str] = &["Multiline"];
 /// `overline` is Typst's `Line` above the base and `underline` its `Line` below;
 /// the editor stores the position and writes whichever command spells it.
 const K_LINE: &[&str] = &["Line"];
-/// The marks `hat`/`vec` are Typst's `Accent`. `overbrace`/`underbrace` and the
-/// other spreaders resolve to `Accent` too (with a stretched mark), but they are
-/// not commands the editor accepts, so they arrive as `Raw`.
-const K_ACCENT: &[&str] = &["Accent"];
+/// The marks `hat` and `cancel` are Typst's `Accent` and `Cancel` — one body with
+/// a mark drawn over it, which is the same shape for both. `overbrace`/
+/// `underbrace` and the other spreaders resolve to `Accent` too (with a stretched
+/// mark), but they are not commands the editor accepts, so they arrive as `Raw`.
+const K_ACCENT: &[&str] = &["Accent", "Cancel"];
 const K_NONE: &[&str] = &[];
 
 /// The Typst `MathKind` variants no `Kind` stands for.
@@ -325,23 +367,28 @@ const K_NONE: &[&str] = &[];
 /// This is the state of the vocabulary alignment, and a test asserts that the
 /// set of unclaimed variants is exactly this — so aligning one of them means
 /// editing this list, which is where the reason for the rest stays written down.
-/// The four entries are three different decisions:
+/// The three entries are three different decisions:
 ///
 /// * `Group` is not missing: a cell of the editor *is* a group of items, so no
 ///   kind has to stand for it.
 /// * `SkewedFraction` is deliberately not modelled. Typst keeps `a/b` and
 ///   `frac(a, b)` apart; the editor writes both as `frac(a, b)`, and typing `/`
 ///   opening a fraction directly is the handier behaviour of the two.
-/// * `Cancel` and `Primes` are real gaps: `cancel(x)`/`strike(x)` and `x'` are
-///   kept as `Raw` source text today. `Primes` would only cover the five-and-up
-///   case anyway — `PrimesItem`'s own comment says so, and one to four primes
-///   are plain glyphs.
+/// * `Primes` is the remaining real gap: `x'` is kept as `Raw` source text today.
+///   It would only cover the five-and-up case anyway — `PrimesItem`'s own comment
+///   says so, and one to four primes are plain glyphs.
+///
+/// `Cancel` used to be listed here. It is closed by a name in
+/// `config/commands.json` rather than by a new `Kind`, because the shape it needs
+/// is `Accent`'s own: one body with a mark drawn over it. The engine's stroke,
+/// angle and `inverted` parameters are not modelled, exactly as `Accent`'s
+/// geometry is not — the node keeps the body and the command name.
 ///
 /// `Sqrt` and `Root` both claiming `Radical` is the opposite decision and is
 /// deliberate too: Typst models a square and an nth root as one item with an
 /// optional index, the editor keeps two kinds because their slots differ, and
 /// merging them would make the caret reach an empty index cell in a square root.
-pub const UNMODELLED: &[&str] = &["Cancel", "Group", "Primes", "SkewedFraction"];
+pub const UNMODELLED: &[&str] = &["Group", "Primes", "SkewedFraction"];
 
 /// The spacing class of a single character, in the ported LyX numbering.
 ///
@@ -491,16 +538,28 @@ impl Kind {
                 horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
                 write: Write::Positioned { above: "overline({0})", below: "underline({0})" },
             },
+            // A base drawn in a font variant. Its slots are a decoration's — one inner
+            // cell, entered at the edge, linear, no vertical move — because the variant
+            // changes how the body is *drawn*, not how it is edited. What it does not
+            // have is a glyph: Typst substitutes codepoints, and that table is out of the
+            // kernel's reach, so the frontend asks the engine (`Decl::typst` records the
+            // `Glyph`s it stands for, once the substitution has happened).
+            Kind::Style { .. } => Decl {
+                view: "style", typst: K_GLYPH, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
+                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+                write: Write::Template("{name}({0})"),
+            },
         }
     }
 }
 
 /// Views that are not the whole story for their kind.
 pub mod view {
-    /// A macro call that cannot be expanded: the call is shown together with its
-    /// arguments instead of the expanded template. `Kind::MacroCall`'s
-    /// declaration names the expandable form.
-    pub const MACRO_COLLAPSED: &str = "macro-collapsed";
+    /// A macro call the editor cannot expand. It is the `RawMacro` arrangement: a
+    /// known callee whose arguments are shown as slots, drawn as *source* rather
+    /// than as a compiled image, because the kernel has no template to instantiate.
+    /// `Kind::MacroCall`'s declaration names the expandable form.
+    pub const MACRO_COLLAPSED: &str = "raw_macro";
 }
 
 #[cfg(test)]
@@ -525,10 +584,11 @@ mod tests {
             ("Root", Kind::Root, 2),
             ("Scripts", Kind::Scripts, 3),
             ("Fenced", Kind::Fenced { left: "(".into(), right: ")".into() }, 1),
-            ("Table", Kind::Table { columns: 2 }, 4),
+            ("Table", Kind::Table { columns: 2, row_lengths: vec![2, 2], name: "mat".into() }, 4),
             ("Multiline", Kind::Multiline { columns: 2, row_lengths: vec![2, 2] }, 4),
             ("Accent", Kind::Accent { name: "hat".into() }, 1),
             ("Line", Kind::Line { above: true }, 1),
+            ("Style", Kind::Style { name: "bold".into() }, 1),
         ]
     }
 
@@ -536,7 +596,7 @@ mod tests {
     fn every_kind_has_a_representative_here() {
         // `Kind::decl` makes a new kind fail to compile; this count is what
         // makes a new kind fail to be *covered* by this file.
-        assert_eq!(representatives().len(), 18, "新增 Kind 后请在这里补一条代表实例");
+        assert_eq!(representatives().len(), 19, "新增 Kind 后请在这里补一条代表实例");
     }
 
     #[test]
@@ -613,7 +673,7 @@ mod tests {
         assert_eq!(MathAtom::character(' ').math_class(), 0);
         // A fixed class comes from the table, not from the contents.
         assert_eq!(MathAtom::nest(Kind::Fraction, 2).math_class(), 7);
-        assert_eq!(MathAtom::nest(Kind::Table { columns: 2 }, 4).math_class(), 7);
+        assert_eq!(MathAtom::nest(Kind::Table { columns: 2, row_lengths: vec![2, 2], name: "mat".into() }, 4).math_class(), 7);
         assert_eq!(MathAtom::nest(Kind::Multiline { columns: 2, row_lengths: vec![2, 2] }, 4).math_class(), 0);
         assert_eq!(MathAtom::nest(Kind::Sqrt, 1).math_class(), 0);
     }
@@ -628,7 +688,8 @@ mod tests {
     #[test]
     fn the_command_file_names_kinds_that_exist_and_are_commands() {
         assert!(!configured::COMMANDS.is_empty(), "config/commands.json 是空的");
-        for (name, view) in configured::COMMANDS {
+        for command in configured::COMMANDS {
+            let (name, view) = (command.name, command.shape);
             // Every name must mean *something* to the parser: either this table answers
             // it, or a branch of `parse_atom` builds this **specific name** from the
             // source. The check is on the name, not on the view: `mat` builds a table
@@ -636,10 +697,10 @@ mod tests {
             // whether some other name may claim `grid` — a name that did would reach the
             // writer with a `Table { columns: 0 }` and panic.
             if let Some(kind) = command_kind(name) {
-                assert_eq!(kind.decl().view, *view, "{name} 指向 {view}，但建出来的是 {}", kind.decl().view);
-                assert!(command_views().contains(view), "{view} 不是一个命令能建出来的 Kind");
+                assert_eq!(kind.decl().view, view, "{name} 指向 {view}，但建出来的是 {}", kind.decl().view);
+                assert!(command_views().contains(&view), "{view} 不是一个命令能建出来的 Kind");
             } else {
-                assert!(source_built_commands().contains(name),
+                assert!(source_built_commands().contains(&name),
                         "config/commands.json 里的 {name} 指向 {view}，但解析器既查不到这个名字、也没有从源码建它的分支");
             }
         }
@@ -647,7 +708,7 @@ mod tests {
         // other way. `Sqrt` and `Root` share a view family but not a view, and both
         // are named, so the only unnamed ones are the kinds no command declares.
         for view in command_views() {
-            assert!(configured::COMMANDS.iter().any(|(_, named)| *named == view),
+            assert!(configured::COMMANDS.iter().any(|command| command.shape == view),
                     "{view} 是命令能建的 Kind，却没有命令名");
         }
     }
@@ -669,7 +730,7 @@ mod tests {
                 Write::Matrix => matches!(kind, Kind::Table { .. }),
                 Write::Rows => matches!(kind, Kind::Multiline { .. }),
                 Write::Named => matches!(kind, Kind::MacroCall { .. }),
-                Write::Template(_) => matches!(kind, Kind::Fraction | Kind::Sqrt | Kind::Root | Kind::Accent { .. }),
+                Write::Template(_) => matches!(kind, Kind::Fraction | Kind::Sqrt | Kind::Root | Kind::Accent { .. } | Kind::Style { .. }),
                 Write::Positioned { .. } => matches!(kind, Kind::Line { .. }),
             };
             assert!(agrees, "{label}：write 声明与 Kind 不符，写回会走到 unreachable");
@@ -687,7 +748,7 @@ mod tests {
                 let close = rest[open..].find('}').unwrap_or_else(|| panic!("{label}：模板占位符没有闭合：{template}"));
                 let key = &rest[open + 1..open + close];
                 if key == "name" {
-                    assert!(matches!(kind, Kind::MacroCall { .. } | Kind::Accent { .. }), "{label}：模板用了 {{name}}，但这个 Kind 没有名字");
+                    assert!(matches!(kind, Kind::MacroCall { .. } | Kind::Accent { .. } | Kind::Style { .. }), "{label}：模板用了 {{name}}，但这个 Kind 没有名字");
                 } else {
                     let index = key.parse::<usize>().unwrap_or_else(|_| panic!("{label}：无法解析的占位符 {{{key}}}"));
                     assert!(index < cells, "{label}：占位符 {{{key}}} 超出 {cells} 个格子");

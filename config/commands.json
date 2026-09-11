@@ -2,10 +2,15 @@
   "frac": "fraction",
   "sqrt": "sqrt",
   "root": "root",
-  "mat": "grid",
   "abs": "delim",
   "norm": "delim",
   "overline": "line",
   "underline": "line",
-  "hat": "decoration"
+  "hat": "decoration",
+  "cancel": "decoration",
+  "bold": "style",
+  "upright": "style",
+  "mat": { "shape": "grid", "rows": "mat", "border": "()" },
+  "vec": { "shape": "grid", "rows": "each", "border": "()" },
+  "cases": { "shape": "grid", "rows": "each", "border": "{ " }
 }
