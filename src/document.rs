@@ -143,7 +143,7 @@ impl Document {
             // with fewer spaces than the writer emits never rendered its fragments.
             let canonical = typst::write_document_mode(&self.editor.root, "", self.editor.display);
             let locator = Locator::new(&self.source, range.start, equation, &canonical);
-            annotate(&mut response["view"], &self.editor.root, &locator, &mut raw, &mut HashMap::new());
+            annotate(&mut response["view"], &self.editor.root, &locator, &mut raw, &mut HashMap::new(), false);
             formulas.push(json!({"id":"0","start":range.start,"end":range.end}));
             if let Some(command) = response["command"].as_object_mut() {
                 if let Some(s) = command.get_mut("source") { if let Some(text) = s.as_str() { *s = json!(format!("{text}{}", &self.source[range.end..])); } }
@@ -224,13 +224,19 @@ fn align(canonical: &str, source: &str) -> Vec<usize> {
 fn step(text: &str, at: usize) -> usize { at + text[at..].chars().next().map_or(0, char::len_utf8) }
 fn whitespace(text: &str, at: usize) -> bool { text[at..].chars().next().is_some_and(char::is_whitespace) }
 
-fn annotate(view: &mut Value, root: &MathData, locator: &Locator, raw: &mut Vec<Value>, counts: &mut HashMap<String,usize>) {
-    // Three kinds are drawn from a compiled image: `raw` (a fragment the editor does not
-    // model), `raw_macro` (a call it declines to expand) and `style` (a font variant,
-    // whose *substituted glyphs* come from the engine later — until they do, the image of
-    // the call is both correct and free). All three carry the source in `text` and a
-    // cursor in `edit`, so all three are located the same way.
-    if matches!(view["kind"].as_str(), Some("raw" | "raw_macro" | "style")) {
+fn annotate(view: &mut Value, root: &MathData, locator: &Locator, raw: &mut Vec<Value>, counts: &mut HashMap<String,usize>, inside: bool) {
+    // Two kinds are drawn from a compiled image: `raw` (a fragment the editor does not
+    // model) and `raw_macro` (a call it declines to expand — which includes a font variant
+    // whose body has no glyph run). Both carry the source in `text` and a cursor in `edit`,
+    // so both are located the same way. A `style` node is *not* here: it is drawn from the
+    // glyphs the engine substituted, which need no source range and never overlap.
+    //
+    // One image per **outermost** such node, and none for one nested inside another: the
+    // outer node's range already covers the inner one's, and the adapter rejects
+    // overlapping ranges outright ("Raw 源码区间无效或重叠"), which costs *every* fragment
+    // of the batch its image.
+    let drawn = matches!(view["kind"].as_str(), Some("raw" | "raw_macro"));
+    if drawn && !inside {
         let text = view["text"].as_str().unwrap_or_default().to_owned();
         let range = if let Ok(cursor) = serde_json::from_value::<Cursor>(view["edit"].clone()) {
             let mut copy = root.clone();
@@ -254,7 +260,8 @@ fn annotate(view: &mut Value, root: &MathData, locator: &Locator, raw: &mut Vec<
             if !raw.iter().any(|r| r["id"] == id) { raw.push(json!({"id":id,"start":start,"end":end})); }
         }
     }
-    if let Some(children) = view["children"].as_array_mut() { for child in children { annotate(child,root,locator,raw,counts); } }
+    let inside = inside || drawn;
+    if let Some(children) = view["children"].as_array_mut() { for child in children { annotate(child,root,locator,raw,counts,inside); } }
 }
 
 #[cfg(test)]

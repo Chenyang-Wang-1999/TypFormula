@@ -402,48 +402,237 @@ class NativeTest(unittest.TestCase):
             if route=='/api/render':
                 calls.append(body)
                 callback({'items':[{'id':r['id']+':0:0','svg':'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>','base_font_size_pt':1,'base_font_height_pt':1,'base_font_baseline_pt':.8} for r in body['raw']]},None)
+            elif route=='/api/glyphs':
+                calls.append(body)
+                answers={'bold(A)':'\U0001D468','upright(A)':'A','bold(upright(a))':'\U0001D41A',
+                         'bold(x)':'\U0001D499','upright(x)':'x','bold(upright(x))':'\U0001D431',
+                         'bold(a)':'\U0001D482'}
+                callback({'glyphs':answers.get(body['expression'],'')},None)
             elif route=='/api/preview':callback({'pages':[]},None)
             else:callback({},None)
         return calls,request
 
-    def test_a_font_variant_draws_the_calls_image_until_its_glyphs_arrive(self):
-        """`bold(A)` has three drawings, and the order between them is the point.
+    def test_a_font_variant_draws_the_glyphs_the_engine_substituted(self):
+        """`bold(A)` has two drawings, and its glyphs come from the analysis.
 
-        Typst applies a font variant by *substituting codepoints* through a table the
-        kernel cannot reach, so the glyphs are fetched separately. Until they arrive the
-        engine's **image of the call** is drawn -- the one drawing that is always right,
-        because the engine typesets the variant itself. Once they arrive the substituted
-        glyphs are drawn instead. An empty answer is an anomaly (the glyphs of a variant
-        should never be empty unless the body is), so it is reported and the source shown.
+        Typst applies a variant by *substituting codepoints* through a table the kernel
+        cannot reach, so the kernel puts the **spellings to ask about** in the analysis and
+        the window turns them into glyphs. Nothing here is asynchronous any more: a `style`
+        node always has its glyphs by the time it is drawn, because the kernel only builds
+        one for a body that has a glyph run (`has_glyph_run`) — a body that has none is
+        drawn as the call instead, which `test_a_variant_without_a_glyph_run_*` pins.
+        """
+        self.load('$bold(A)$');window=self.window
+        style=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n['kind']=='style')
+        self.assertEqual(style['style_name'],'bold')
+        self.assertEqual(style['text'],'bold(A)','分析里带的是要问引擎的拼写')
+        self.assertIn('bold(A)',window.analysis['glyphs'],'分析列出了要取的字形簇拼写')
+        # The glyphs are asked for by `load` itself (see
+        # `test_loading_a_document_renders_its_variants_without_help`), so this only checks
+        # that the answer reached the node and the drawing.
+        calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.load_glyphs();window.load_raw()
+        # Laid out the way the page lays it out, because that is where a view is stamped:
+        # `FormulaObject.box` reads the caches as they stand, so a test that calls the
+        # typesetter directly would be testing a path the window does not have.
+        box=window.editor.handler.box(window.analysis['formulas'][0])
+        style=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n['kind']=='style')
+        self.assertEqual(style.get('_glyph'),'\U0001D468','字形簇盖上节点')
+        drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
+        self.assertIn('\U0001D468',drawn,'画的是引擎替换后的字形簇')
+        self.assertFalse(any(op[0]=='svg' for op in box.operations),'样式不取图')
+        # Entering the node shows the variant's *name* and the body: a variant around one
+        # glyph looks exactly like the glyph, so editing one would be editing something
+        # invisible.
+        window.activate(window.analysis['formulas'][0]['start'])
+        window.math_action('key',key='ArrowRight')
+        drawn=[value[0] for kind,_,_,value in window.math_canvas.box.operations if kind=='text']
+        self.assertIn('bold(',drawn,'进入后显示样式名，否则不知道在编辑什么')
+
+    def test_upright_draws_the_plain_letter_the_engine_asked_for(self):
+        """A substituted run is drawn **as the engine spelled it**, not through the editor's
+        own letter mapping.
+
+        The editor draws a math variable as an italic letter by mapping `A` to `𝐴`, because
+        that is Typst's default. A font variant is a *substitution the engine already made*,
+        so applying that mapping again undoes it exactly: `upright(A)` comes back from
+        `/api/glyphs` as a plain `A` — u pright is the answer — and the mapping put the
+        italic one back. `bold(A)` hid the bug because `𝐀` is not ASCII.
+        """
+        self.load('$upright(A) + bold(A)$');window=self.window
+        calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.load_glyphs();window.load_raw()
+        box=window.editor.handler.box(window.analysis['formulas'][0])
+        drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
+        self.assertIn('A',drawn,f'引擎说的直体要原样画出来：{drawn}')
+        self.assertIn('\U0001D468',drawn,f'加粗仍然画 𝐀：{drawn}')
+        self.assertNotIn('\U0001D434',drawn,f'不能把直体的 A 又映射回数学斜体：{drawn}')
+
+    def test_loading_a_document_renders_its_variants_without_help(self):
+        """The whole path, driven the way the window drives it: `replace` -> `load` -> paint.
+
+        This is the case that was broken and that the hand-called tests missed: the glyphs
+        are requested when the document is loaded, the answer arrives *later*, and the node
+        draws `_glyph`, which `stamp_formula` reads out of the cache when the view is laid
+        out. Nothing runs between the answer arriving and the paint other than the repaint
+        itself, so the answer callback has nothing to stamp: what the reader sees is whatever
+        the caches hold at layout time.
         """
         from unittest.mock import patch
-        self.load('$bold(A)$');window=self.window
-        node=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n['kind']=='style')
-        self.assertEqual(node['style_name'],'bold')
-        self.assertEqual(node['text'],'bold(A)','样式节点带着整段调用拼写：取图与取字形簇都用它')
+        window=self.window
+        calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request):
+            window.replace(0,len(window.source),'$bold(x)$')
+            window.compile_timer.stop()
+            # Nothing else: no `load_glyphs`, no `load_raw`. The window must do it all.
+            window.load_raw()
+        self.assertIn('bold(x)',[body.get('expression') for body in calls],'加载后自己去取字形簇')
+        box=window.editor.handler.box(window.analysis['formulas'][0])
+        style=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n['kind']=='style')
+        self.assertEqual(style.get('_glyph'),'\U0001D499','取到的字形簇要盖上节点')
+        drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
+        self.assertIn('\U0001D499',drawn,'画出来的是替换后的字形簇，不是空白')
+
+    def test_a_variant_renders_inside_the_formula_box_too(self):
+        """The box and the page are **two different views**, and both have to be stamped.
+
+        The page draws the view `analyze` projected; the box draws the one `activate_formula`
+        returns. They are separate objects, so stamping only the analysis renders a variant
+        on the page and leaves it blank the moment the reader enters the formula — which is
+        exactly the complaint this pins. The drawing is the same on both sides, so both need
+        the glyphs.
+        """
+        from unittest.mock import patch
+        window=self.window;calls,request=self.fake_render()
+        # The glyphs are asked for by `load` itself, so the service has to be faked before
+        # it runs — otherwise the request goes to a service that is not up and the cache
+        # keeps a `None` (asked, nothing came back) for the rest of the test.
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.replace(0,len(window.source),'$x + bold(x)$')
+            window.compile_timer.stop()
+            window.activate(window.analysis['formulas'][0]['start'])
+            # No key is pressed: entering the box must already draw the variant. The box
+            # gets its own view from `activate_formula`, so *this* call is what fills it.
+            box=window.math_canvas.box
+            drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
+            self.assertIn('\U0001D499',drawn,f'进入公式框就应当画出替换后的字形簇：{drawn}')
+            self.assertEqual(sum(1 for op in box.operations if op[0]=='svg'),0,'公式框里不该出现取图')
+            window.math_action('key',key='End')
+        drawn=[value[0] for kind,_,_,value in window.math_canvas.box.operations if kind=='text']
+        self.assertIn('\U0001D499',drawn,f'移动光标后仍然画出字形簇：{drawn}')
+
+    def test_committing_a_variant_command_draws_it_once_the_answer_arrives(self):
+        """Typing `bold(x)` in the box and confirming it must render the variant.
+
+        The glyphs of a spelling are asked for the moment it appears, and the answer comes
+        back **later** — the same as a fragment's image. Confirming the command changes the
+        source, so the spelling is new at that instant and the box is laid out before the
+        answer is in: whatever draws the answer has to reach the box's own view, which is a
+        different object from the page's.
+        """
+        window=self.window;asked=[]
+        def request(route,body,callback,key=None):
+            if route=='/api/glyphs':asked.append((body,callback))
+            else:callback({},None)
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.replace(0,len(window.source),'$x$')
+            window.compile_timer.stop()
+            window.activate(window.analysis['formulas'][0]['start'])
+            window.math_action('input',text='\\')
+            window.math_action('input',text='bold(x)')
+            window.math_action('key',key='Enter')
+            self.assertIn('bold(x)',[body['expression'] for body,_ in asked],
+                          '确认命令后要问引擎取字形簇')
+            # The service answers out of band, so the fake one must too: answering
+            # inline would drive a path the window never takes.
+            for body,callback in asked:
+                callback({'glyphs':'\U0001D499' if body['expression']=='bold(x)' else ''},None)
+        drawn=[value[0] for kind,_,_,value in window.math_canvas.box.operations if kind=='text']
+        self.assertIn('\U0001D499',drawn,f'答案到达后公式框要画出替换后的字形簇：{drawn}')
+
+    def test_the_page_renders_a_variant_whose_glyphs_arrive_late(self):
+        """The page's own view, stamped at layout time, is the half the box does not cover.
+
+        Both draws stamp the view they are about to lay out (`FormulaObject.box` for the
+        page, `MathCanvas.refresh` for the box). The page's view is not rebuilt when an
+        answer lands -- only the caches change -- so the stamp has to be read then, and the
+        memoized box is dropped by `typesetter.version`. A window that stamped a view when
+        it was built draws the *call* here instead of the variant.
+        """
+        window=self.window;asked=[]
+        def request(route,body,callback,key=None):
+            if route=='/api/glyphs':asked.append((body,callback))
+            else:callback({},None)
+        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.replace(0,len(window.source),'$x + bold(x)$')
+            window.compile_timer.stop()
+            self.assertIn('bold(x)',[body['expression'] for body,_ in asked],'新拼写要问引擎')
+            # Out of band, like the real service: answering inline would test the order the
+            # fake happens to have, not the one the window has.
+            for body,callback in asked:callback({'glyphs':'\U0001D499'},None)
+            box=window.editor.handler.box(window.analysis['formulas'][0])
+        drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
+        self.assertIn('\U0001D499',drawn,f'晚到的答案要画在页面上：{drawn}')
+
+    def test_a_variant_without_a_glyph_run_is_drawn_as_the_call(self):
+        """A body that is not a run of characters makes the call a `raw_macro`.
+
+        `bold(frac(a, b))` and `bold(hat(a))` have no single glyph run — measured, the
+        engine refuses both — so they take the path that already works (one image, or the
+        name and its slots once the caret enters) instead of a variant that would have to
+        report "no glyphs" every time it is drawn.
+        """
+        for source in ['$bold(frac(a, b))$','$bold(hat(a))$','$upright(a/b)$']:
+            self.load(source);window=self.window
+            view=window.analysis['formulas'][0]['view']
+            self.assertFalse(any(n['kind']=='style' for n in window.view_nodes(view)),
+                             f'{source} 的结构化主体不该建样式节点')
+            self.assertTrue(any(n['kind']=='raw_macro' for n in window.view_nodes(view)),
+                            f'{source} 应当改画成调用')
+            self.assertEqual(window.analysis['glyphs'],[],f'{source} 没有要取的字形簇')
+
+    def test_every_variant_layer_gets_its_own_glyphs(self):
+        """Each layer is asked for its own glyph run, and **no** layer is asked for an image.
+
+        The engine collapses `bold(upright(x))` to one glyph `𝐱`, but each layer has a glyph
+        run of its own (`upright(x)` is the upright `x`), and the reader needs it: stepping
+        into `bold` would otherwise show the *italic* `x` of the bare cell, which is not what
+        that layer means.
+
+        No images at all is the part that matters here. When `style` was image-drawn as well,
+        the nested pair produced the ranges `(1,17)` and `(6,16)` — the inner *inside* the
+        outer — which the adapter rejects as overlapping and which cost the whole batch its
+        images. A variant over a glyph run never needs an image, so the conflict is gone
+        rather than special-cased.
+        """
+        from unittest.mock import patch
+        self.load('$bold(upright(x))$');window=self.window
+        self.assertEqual(sorted(window.analysis['glyphs']),['bold(upright(x))','upright(x)'],
+                         '两层各要自己的字形簇')
         calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
             window.load_raw()
-        self.assertIsInstance(window.typesetter.raw(node),dict,'调用本身被当成一个片段取图')
-        view=window.analysis['formulas'][0]['view']
-        outside=window.typesetter.layout(view)
-        self.assertTrue(any(op[0]=='svg' for op in outside.operations),'字形簇未到：画引擎给的整张图')
-        # The glyphs arrive: they replace the image.
-        node['_glyph']='\U0001D400'   # 𝐀
-        drawn=[value[0] for kind,_,_,value in window.typesetter.layout(view).operations if kind=='text']
-        self.assertIn('\U0001D400',drawn,'取到字形簇后改画字形簇')
-        self.assertFalse(any(op[0]=='svg' for op in window.typesetter.layout(view).operations),'有字形簇就不再画图')
-        # An empty answer for a non-empty body is an anomaly, not a blank.
-        node['_glyph']=''
-        box=window.typesetter.layout(view)
-        self.assertTrue(any(op[0]=='failed' for op in box.operations),'空字形簇要报错（暖色底+虚线）')
-        drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
-        self.assertIn('bold(A)',drawn,'并且退回源码')
-        # Entering the node shows the cells, so the body stays editable.
+        raws=[item for body in calls if 'raw' in body for item in body['raw']]
+        self.assertEqual(raws,[],f'样式一律不取图：{raws}')
+
+    def test_entering_a_nested_variant_shows_each_name(self):
+        """Inside `bold(upright(a))` the reader has to see *both* names, not just the body.
+
+        One variant around a single glyph is drawn identically to the glyph, so entering
+        it would otherwise mean editing something invisible — and with a nested pair there
+        is nothing on screen that says which levels are in play.
+        """
+        self.load('$bold(upright(a))$');window=self.window
         window.activate(window.analysis['formulas'][0]['start'])
         window.math_action('key',key='ArrowRight')
-        self.assertFalse(any(op[0]=='svg' for op in window.math_canvas.box.operations),
-                         '光标进入后画格子，不再画图')
+        outer=[value[0] for kind,_,_,value in window.math_canvas.box.operations if kind=='text' and 'bold(' in str(value[0])]
+        self.assertTrue(outer,'进入外层后要显示 bold(')
+        # Step into the inner variant: it names itself too.
+        window.math_action('key',key='ArrowRight')
+        inner=[value[0] for kind,_,_,value in window.math_canvas.box.operations if kind=='text' and 'upright(' in str(value[0])]
+        self.assertTrue(inner,'进入内层后要显示 upright(')
 
     def test_a_collapsed_call_is_drawn_as_the_document_has_it_until_the_caret_enters(self):
         """A call the kernel will not expand is one image -- until the caret goes in.
@@ -814,17 +1003,25 @@ class NativeTest(unittest.TestCase):
         self.assertEqual(old['render']['raw'][0]['id'],'10:13:0')
 
     def test_the_math_font_covers_every_glyph_the_core_can_draw(self):
-        """A missing glyph is drawn from another font, so coverage is a test."""
+        """A missing glyph is drawn from another font, so coverage is a test.
+
+        The letters are taken **through `mathfont.glyph`** rather than written out here, so
+        the mapping and the coverage have to agree with each other. There is exactly one
+        place where they can disagree, and it is `h`: U+1D455 (mathematical italic small h)
+        is **unassigned in Unicode**, so no font has a glyph for it, and the engine typesets
+        the italic h as Planck's constant `ℎ` U+210E instead — measured against the real
+        adapter for all 52 letters, `h` is the only one that differs from the plain mapping
+        (`native-adapter/src/main.rs::the_italic_default_has_one_hole_and_it_is_h`).
+        """
         from PyQt5.QtGui import QFont,QRawFont
         from . import mathfont
         family=mathfont.resolve('','Consolas')
         font=QFont(family);font.setStyleStrategy(QFont.NoFontMerging)
         raw=QRawFont.fromFont(font)
-        # Letters as the math alphabet, operators and Greek as the symbol table
-        # writes them, the box glyphs the display tree adds, and the digits the
-        # editor puts in text cells.
-        # U+1D455 is unassigned; glyph() maps h to ℎ, which is required below.
-        needed=[chr(0x1D44E+i) for i in range(26) if i!=7]+[chr(0x1D434+i) for i in range(26)]
+        # Letters as the math alphabet (through the mapping itself), operators and Greek
+        # as the symbol table writes them, the box glyphs the display tree adds, and the
+        # digits the editor puts in text cells.
+        needed=[mathfont.glyph(family,chr(code))[1] for code in (*range(0x61,0x7B),*range(0x41,0x5B))]
         needed+=list('0123456789+-=()[]{}|/,.:;!?<>^_')+['ℎ','−','∗','≤','≥','≠','±','∓','×','⋅','÷','𝛼','𝛽','𝛾','𝛿','𝜀','𝜃','𝜆','𝜇','𝜋','𝜌','𝜎','𝜏','𝜑','𝜓','𝜔','Γ','Δ','Θ','Σ','Ω','□','│','⌘','·','‖']
         missing=[ch for ch in needed if raw.glyphIndexesForString(ch)[0]==0]
         self.assertEqual(missing,[],f'{family} cannot draw {missing}')

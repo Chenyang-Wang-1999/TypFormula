@@ -258,6 +258,22 @@ mod tests {
         // correctly, instead of concatenating a fraction's parts into nonsense.
         assert!(glyphs("bold(frac(a, b))").is_err());
     }
+    /// The editor draws a math variable by mapping `a` to `𝑎`, and it needs to know the
+    /// **one** letter where that is not what the engine does: U+1D455 (mathematical italic
+    /// small h) is unassigned in Unicode, so the engine typesets the italic h as Planck's
+    /// constant `ℎ` U+210E instead. Asked for all 52 letters, the engine agrees with that
+    /// mapping everywhere except here — and a font has no glyph for U+1D455 to draw.
+    #[test]
+    fn the_italic_default_has_one_hole_and_it_is_h() {
+        assert_eq!(glyphs("h").unwrap(), "\u{210E}");
+        assert_eq!(glyphs("italic(h)").unwrap(), "\u{210E}");
+        assert_eq!(glyphs("upright(h)").unwrap(), "h");
+        assert_eq!(glyphs("H").unwrap(), "\u{1D43B}");
+        // The neighbouring letters of the same range are ordinary, so this is the hole
+        // rather than a rule about the mapping.
+        assert_eq!(glyphs("g").unwrap(), "\u{1D454}");
+        assert_eq!(glyphs("i").unwrap(), "\u{1D456}");
+    }
 }
 
 fn default_path() -> String { "main.typ".into() }

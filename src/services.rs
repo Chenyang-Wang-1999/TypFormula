@@ -207,6 +207,13 @@ impl RenderAdapter {
 #[derive(Deserialize, Serialize)]
 pub struct AttachmentRequest { #[serde(default="default_path")] pub path: String, pub expression: String, #[serde(default)] pub definitions: String, pub display: bool }
 
+/// The substituted glyphs of one font variant (`bold(A)` → `𝑨`).
+///
+/// Same shape as `AttachmentRequest` on purpose: both ask the adapter one question about
+/// one expression and get a value back, and neither may touch the document.
+#[derive(Deserialize, Serialize)]
+pub struct GlyphRequest { #[serde(default="default_path")] pub path: String, pub expression: String, #[serde(default)] pub definitions: String, pub display: bool }
+
 pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, document_lsp: Mutex<Option<DocumentLsp>>, pub workspace: PathBuf, render_adapter: Mutex<Option<RenderAdapter>> }
 impl Services {
     pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("VISUAL_TYPST_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None) } }
@@ -217,9 +224,24 @@ impl Services {
         self.root.join("target/adapter").join(if cfg!(debug_assertions) { "debug" } else { "release" }).join(if cfg!(windows) { "visual-typst-layout.exe" } else { "visual-typst-layout" }) }
     pub fn status(&self) -> Value { match &self.bin { Ok(path) => json!({"available":true,"attachments":self.adapter_bin().is_file(),"engine":"Tinymist LSP + Typst","path":path}), Err(error) => json!({"available":false,"attachments":self.adapter_bin().is_file(),"error":error}) } }
     pub fn attachments(&self, req: AttachmentRequest) -> Result<Value, String> {
-        crate::workspace::resolve(&self.workspace, &req.path)?;
+        self.ask_adapter(serde_json::to_value(&req).map_err(|e| e.to_string())?, "Typst 附件布局超时；保留原编辑结构")
+    }
+    /// The substituted glyphs of a font variant: `bold(upright(a))` → `𝐚`.
+    ///
+    /// The adapter reads them back out of the math IR, where the substitution has already
+    /// happened, so this asks the engine rather than reproducing its table. One query per
+    /// expression is enough even for a nested call — the engine collapses the nesting.
+    pub fn glyphs(&self, req: GlyphRequest) -> Result<Value, String> {
+        let mut body = serde_json::to_value(&req).map_err(|e| e.to_string())?;
+        body["glyphs"] = Value::Bool(true);
+        self.ask_adapter(body, "取字形簇超时；先按整段调用的图显示")
+    }
+    /// Run the layout adapter once, with one request on stdin and one reply on stdout.
+    fn ask_adapter(&self, body: Value, timeout: &str) -> Result<Value, String> {
+        let path = body["path"].as_str().unwrap_or_default().to_string();
+        crate::workspace::resolve(&self.workspace, &path)?;
         if !self.adapter_bin().is_file() { return Err("请运行 build-desktop.cmd 并重启服务，以启用 Typst limits/stretch 适配器".into()); }
-        let body = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        let body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
         let mut child = hidden(&mut Command::new(self.adapter_bin())).current_dir(&self.workspace)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
         let mut input = child.stdin.take().unwrap();
@@ -237,7 +259,7 @@ impl Services {
                 result => {
                     let _ = child.kill(); let _ = child.wait();
                     let _ = writer.join(); let _ = output.join(); let _ = errors.join();
-                    return Err(match result { Err(e) => e.to_string(), _ => "Typst 附件布局超时；保留原编辑结构".into() });
+                    return Err(match result { Err(e) => e.to_string(), _ => timeout.to_string() });
                 }
             }
         };

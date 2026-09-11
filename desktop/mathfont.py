@@ -83,18 +83,27 @@ def has_math_alphabet(family):
     return _math_alphabet[family]
 
 
-def glyph(family, text, text_mode=False):
+def glyph(family, text, text_mode=False, substituted=False):
     """The characters to draw for one atom, in the family that has them.
 
     A math variable is an italic letter, and a math font's italic alphabet is the
     Unicode range Typst typesets with, so the editor and the compiled preview
     agree. A text cell is upright, and a family without the range is asked for the
     plain letter.
+
+    `substituted` is a third case, and it is not a style choice: the run came from the
+    **engine** (`/api/glyphs`), which has already replaced the codepoints it wants —
+    `upright(A)` is a plain `A`, `bold(A)` is `𝐀`. Mapping the plain letters here again
+    would undo exactly what was asked for, which is how `upright` came out italic.
     """
-    if len(text) != 1 or text_mode or not has_math_alphabet(family):
+    if substituted or len(text) != 1 or text_mode or not has_math_alphabet(family):
         return family, text
     if "a" <= text <= "z":
-        # U+1D455 (italic h) is unassigned; Planck's constant stands in for it.
+        # U+1D455 (mathematical italic small h) is **unassigned in Unicode**, so no font
+        # can draw it; the engine typesets the italic h as Planck's constant `ℎ` U+210E
+        # instead, and this is the one letter where its choice differs from the plain
+        # mapping above — measured against the real adapter for all 52 letters, and pinned
+        # on both sides (`native-adapter/src/main.rs::the_italic_default_has_one_hole_*`).
         return family, "ℎ" if text == "h" else chr(0x1D44E + ord(text) - ord("a"))
     if "A" <= text <= "Z":
         return family, chr(0x1D434 + ord(text) - ord("A"))

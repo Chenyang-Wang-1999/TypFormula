@@ -44,6 +44,7 @@
 | `Multiline` | `columns`, `row_lengths` | `cell`，可重复 | 边界 | 列内 | 列运算 | `aligned` | 行用 `&`、`\` | 线名是 **`multiline`**；`columns` + `row_lengths` + N×`cell@cell`（`row_lengths` 两个 kind 都会上线，前端据此跳过补齐格） |
 | `Accent` | `name` | `inner`(100%) | 边界 | 线性 | 无 | `decoration` | `{name}({0})` | 线上是 `decorated`，`marker`=命令名，`text` 为空 + children 1×`cell@inner` |
 | `Line` | `above: bool` | `inner`(100%) | 边界 | 线性 | 无 | `line` | `overline({0})` / `underline({0})`（`Write::Positioned`） | 线上是 `decorated`，`marker`=`overline`/`underline`，`text` 为空 + children 1×`cell@inner` |
+| `Style` | `name` | `inner`(100%) | 边界 | 线性 | 无 | `style` | `{name}({0})` | 线名就是 `style`；`style_name`=命令名（`bold`/`upright`），`text`=**整段调用拼写**（`bold(upright(a))`，`/api/glyphs` 按这个拼写取字），`_glyph`=引擎替换后的字形串（前端在**布局那一刻**从缓存盖上去，见 `docs/architecture.md`）。主体不是字形串时**不建这个节点**，改走 `raw_macro`（`bold(frac(a, b))`） |
 
 ## 二、线上 `View` 的字段，谁填了什么
 
@@ -61,6 +62,7 @@
 | `columns` | `Table`(列数)、`Multiline`(列数)、`TemplateCall`(定义序号)、`Parameter`(参数序号)、`macro-argument`(参数序号) | `2` |
 | `row_lengths` | `Table` 与 `Multiline`：**补齐前**每行真正有几格。前端据此**跳过补齐格**，否则会画出源码里没有的空槽 | `mat(a, b; c)` → `[2, 1]` |
 | `marker` | 画法靠名字而不是靠形状的节点：`decorated`（`radical`/`delim`/`hat`/`overline`/`underline`/`cancel`）与 `root` | `radical` |
+| `style_name` | **只有 `style`**：命令名。前端画"光标进入后显示的名字"用它，而**取字用的是 `text`**（整段调用拼写），两者不是一回事 | `bold` |
 | `border` | 表格的定界符，左+右或单边一个 | `mat`/`vec` → `()`；`cases` → `{ ` |
 | `is_mat` | 表格按 `mat` 的方式切行（而不是一个参数一行） | `mat` true，`vec`/`cases` false |
 | `edit` | **`Raw` 与 `raw_macro`**（两者都靠"源码 + 光标"在文档里定位），值是一个 `Cursor` | `{slices:[], pos:0, occurrence:"root.a0.edit"}` |
@@ -84,6 +86,7 @@
 | `Multiline` | `Multiline` | `MultilineItem`：`rows: Vec<AlignedRow>`、`centered`；`AlignedRow` 是一行的各对齐列 |
 | `Accent` | `Accent` | `AccentItem`：`base`、`accent: MathItem`、`position`、`dotless`、`exact_frame_width` |
 | `Line` | `Line` | `LineItem`：`base`、`position`（没有记号，只有位置，所以编辑器也只存位置） |
+| `Style` | `Glyph` | 同 `Char`：变体在 `resolve` 里就替换成码位了，引擎这一侧**没有"变体"这个 item**——`GlyphItem.text` 直接是 `𝐚`，适配器读回来的就是它 |
 | `MacroCall`/`TemplateCall`/`Parameter`/`Unknown` | — | 编辑器专有，没有对应 item |
 
 另外每个 item 还都挂着一份 `MathProperties`：`class`、`size`、`cramped`、`limits`、`lspace`/`rspace`、`ignorant`、`spaced`、`align_form_infix`、`editor_label`、`span`。编辑器这边只搬了 `class`（进 `Decl`）；`limits`（居中极限还是侧挂脚标）是**单独去问**的（`native-adapter` 的 attachments 服务），其余都没有对应物。

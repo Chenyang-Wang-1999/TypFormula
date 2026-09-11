@@ -65,6 +65,8 @@ Raw SVG 按可见公式/活动公式按需加载。**取图的节点有两种**�
 
 公式内的字形分两类，字体也随之分两类：识别出的数学原子用数学字体（`math_font`），而**命令草稿和 Raw 源码用编辑器正文字体**（`mathview.py::source_run`）。草稿是正在输入的 Typst 源码，跟编译出来的字形不是一回事，用正文字体读起来才像在打字；字符串模式共用同一条绘制路径。空的可编辑槽（新建 `\frac` 的分子分母、矩阵空格、空公式本身）不再画 `□` 字符，而是画**虚线方框**（`empty-cell` → `("slot", …)`），宽度约 .45 em、高度一行。方框**保留该槽自己的 stop**：光标画在方框里，点击/上下键也能靠这个位置进入它——位置丢失的话，核心的 `move_vertical` 找不到落点，光标就会停在公式外层（`desktop/test_desktop.py::test_the_caret_survives_inside_an_empty_slot`）。
 
+**字体变体（`bold`/`upright`）不取图**：它画的是引擎替换后的字形串（`/api/glyphs`），光标进入时改画这个调用（名字 + 主体 + 右括），答案还没到也画这个调用。取字与画的分离方式（在**布局那一刻**读缓存）见 [architecture.md](architecture.md) 的 `Style` 一节。
+
 上下标位置取自 Typst 自己：从编译出的 SVG 里读出 `x^2`、`x_1` 的基线差，得到上标 `.36 em`、下标 `.25 em`（相对基底基线，基底字号为 em）。基底是**组合对象**（分式、根式、定界符、片段图）时还有真实的高度/基线，于是按 Typst 的 `max(shift, ascent − drop)` 让脚标躲开它；基底是**单个字符**时只有行盒度量（带 leading），就用固定移位。改动前下标是按"脚标自身的上伸部"放的，实测落到基线下约 .6 em，看起来偏右下；现在与编译结果一致（`desktop/test_desktop.py::test_side_scripts_follow_the_shifts_the_compiler_uses` 断言 .25 em / .36 em，误差 1px 内）。
 
 源码栏与编辑器**逐行对齐**：两边用同一份文本，但编辑器把每个公式换成一个占位字符，于是带高公式的行更高。`Window.sync_source_lines` 让源码栏使用与编辑器相同的文档默认字体、相同的顶部偏移（`documentMargin` 补上编辑器样式表的 16px 内边距），并把编辑器**实测**的每行高度按 `MinimumHeight` 写进源码栏（编辑器尚未布局时退回"公式盒高 + 6"的估算）。因为行高逐一相等，两栏的滚动值可以直接对应，`Window.mirror_scroll` 让滚动任意一栏另一栏跟随。源码栏因此是 `QTextEdit` 而不是 `QPlainTextEdit`：后者的文档布局忽略块行高。

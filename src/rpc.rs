@@ -36,6 +36,7 @@ pub fn dispatch(services: &Services, request: &Value) -> Result<Value,String> {
         "/api/status"=>Ok(services.status()),
         "/api/render"|"/api/preview"|"/api/pdf"=>services.render(serde_json::from_value(body).map_err(|e|e.to_string())?),
         "/api/attachments"=>services.attachments(serde_json::from_value(body).map_err(|e|e.to_string())?),
+        "/api/glyphs"=>services.glyphs(serde_json::from_value(body).map_err(|e|e.to_string())?),
         "/api/completion"=>serde_json::to_value(services.complete(serde_json::from_value(body).map_err(|e|e.to_string())?)?).map_err(|e|e.to_string()),
         "/api/lsp"=>services.language(body),
         "/api/packages"=>packages::handle(body),

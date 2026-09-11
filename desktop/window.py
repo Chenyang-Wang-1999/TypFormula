@@ -165,9 +165,9 @@ class Window(QMainWindow):
             self.newline="\r\n" if "\r\n" in text else "\n";text=text.replace("\r\n","\n")
         else:text="";self.newline="\n"
         self.path=path;self.source=text;self.saved=text;self.history=[];self.future=[];self.semantic_spans=[];self.engine_spans=[]
-        self.typesetter.cache.clear();self.typesetter.svg.clear();self.typesetter.placements.clear();self.ensure_services()
+        self.typesetter.cache.clear();self.typesetter.svg.clear();self.typesetter.placements.clear();self.typesetter.glyphs.clear();self.ensure_services()
         self.core.call("set_source",source=text)
-        self.analysis=self.core.call("analyze");self.bind_formula_ids({},self.analysis);self.raw_cache.edits.clear();self.raw_cache.rebind({},self.analysis);self.raw_pending.clear();self.revision+=1
+        self.analysis=self.core.call("analyze");self.bind_formula_ids({},self.analysis);self.raw_cache.edits.clear();self.load_glyphs();self.raw_cache.rebind({},self.analysis);self.raw_pending.clear();self.revision+=1
         for editor in self.editors:editor.expanded.clear()
         self.project((0,0));self.compile_timer.start()
 
@@ -283,17 +283,27 @@ class Window(QMainWindow):
         for target in rebuild:
             formula=self.core.call("analyze_formula",start=target)
             if formula is None:
-                result=self.core.call("analyze");self.bind_formula_ids(self.analysis,result);self.last_reparsed={'start':0,'end':len(self.source.encode('utf-8'))};return result
+                result=self.core.call("analyze");self.bind_formula_ids(self.analysis,result);self.load_glyphs();self.last_reparsed={'start':0,'end':len(self.source.encode('utf-8'))};return result
             index=next((i for i,item in enumerate(candidate['formulas']) if item['start']==target),None)
             if index is None:
-                result=self.core.call("analyze");self.bind_formula_ids(self.analysis,result);self.last_reparsed={'start':0,'end':len(self.source.encode('utf-8'))};return result
+                result=self.core.call("analyze");self.bind_formula_ids(self.analysis,result);self.load_glyphs();self.last_reparsed={'start':0,'end':len(self.source.encode('utf-8'))};return result
             if '_object_id' in candidate['formulas'][index]:formula['_object_id']=candidate['formulas'][index]['_object_id']
             candidate['formulas'][index]=formula
         candidate['styles']=[style for style in candidate.get('styles',[]) if style.get('kind')!='formula_error']
         candidate['styles'].extend({'kind':'formula_error','start':formula['start'],'end':formula['end'],'text':formula.get('reason','公式保留源码模式')} for formula in candidate['formulas'] if formula.get('editable') is False)
+        # The spellings to ask glyphs about are a property of the **views**, so they are
+        # recomputed from the merged ones rather than carried over: an edit can add, remove
+        # or change a variant without any formula being rebuilt from scratch, and a stale
+        # list would leave a new variant without glyphs and an old one asked for forever.
+        candidate['glyphs']=Window.glyph_expressions(candidate['formulas'])
         self.bind_formula_ids(self.analysis,candidate)
+        # Ask for the glyphs of any spelling this edit introduced. The list is a property of
+        # the **views**, so it is recomputed rather than carried over: an edit can add,
+        # remove or change a variant without any formula being rebuilt from scratch, and a
+        # stale list would leave a new variant without glyphs and an old one asked forever.
+        self.analysis=candidate
+        self.load_glyphs()
         return candidate
-
     def bind_formula_ids(self,old,new):
         existing={(formula.get('start'),formula.get('end')):formula.get('_object_id') for formula in old.get('formulas',[]) if formula.get('_object_id')}
         for formula in new.get('formulas',[]):
@@ -369,7 +379,8 @@ class Window(QMainWindow):
             old=self.analysis;a,b,text=difference(before,self.source)
             self.analysis=self.update_analysis(before,a,b,text,core_current=True);self.raw_cache.rebind(old,self.analysis)
             self.project(incremental=True);self.compile_timer.start()
-        self.stamp_contexts(state['view']);self.math_canvas.refresh(state);self.reposition_math()
+        self.stamp_contexts(state['view'])
+        self.math_canvas.refresh(state);self.reposition_math()
         self.report_raw_fragments(state)
         invalidated=self.raw_cache.track(state,self.typesetter.cache)
         if invalidated:self.invalidate_raw(invalidated);self.raw_timer.start()
@@ -489,8 +500,6 @@ class Window(QMainWindow):
                     if revision!=self.revision:return
                     self.typesetter.placements[key]=value if not error else {}
                     self.typesetter.touch()
-                    for formula in self.analysis.get('formulas',[]):
-                        if 'view' in formula:self.remember_attachments(formula,self.prepare_view(formula['view'],self.source[:from_byte(self.source,formula['start'])],formula['display']))
                     self.repaint_formulas()
                 self.services.request("/api/attachments",{"path":body["path"],"expression":expression,"definitions":definitions,"display":display},attached,key="attachment:"+str(key))
         self.semantic_highlight()
@@ -500,14 +509,102 @@ class Window(QMainWindow):
         yield view
         for child in view.get("children",[]):yield from Window.view_nodes(child)
 
-    def prepare_view(self,view,definitions,display):
+    @staticmethod
+    def glyph_expressions(formulas):
+        """Every `style` call spelling in a list of formulas, deduplicated.
+
+        Mirrors `desktop::style_expressions` in the core, which fills the same field on a
+        full analysis; the incremental path merges views instead of re-analysing, so it has
+        to compute the list itself.
+        """
+        out=set()
+        def walk(view):
+            if view.get("kind")=="style" and isinstance(view.get("text"),str): out.add(view["text"])
+            for child in view.get("children",[]): walk(child)
+        for formula in formulas:
+            if formula.get("editable") is False: continue
+            walk(formula.get("view",{}))
+        return sorted(out)
+
+    def load_glyphs(self):
+        """Ask the layout service for the substituted glyphs the analysis asks about.
+
+        The kernel cannot produce them (Typst substitutes codepoints through a table
+        outside its reach), so the analysis carries the **spellings to ask about** and this
+        turns them into answers. Cached across edits by the key `stamp_draw` looks up --
+        the spelling together with the definitions in force and the display mode, because a
+        variant's glyphs depend on all three and on nothing else.
+        """
+        want={}
+        for formula in self.analysis.get("formulas",[]):
+            if formula.get("editable") is False or "view" not in formula: continue
+            definitions=self.source[:from_byte(self.source,formula['start'])]
+            display=bool(formula.get("display"))
+            for text in Window.glyph_expressions([formula]):
+                want[(definitions,text,display)]=text
+        for key,text in want.items():
+            # Only a **real answer** counts as cached. A `None` means "asked, nothing came
+            # back" — a service that was not up yet, a core that restarted — and treating it
+            # as cached would leave that variant blank for the rest of the session.
+            if self.typesetter.glyphs.get(key) is not None: continue
+            definitions,_,display=key
+            self.typesetter.glyphs[key]=None
+            def arrived(value,error,key=key):
+                # A failure clears the entry so the next analysis asks again; recording an
+                # empty answer would draw a blank where a variant should be.
+                self.typesetter.glyphs.pop(key,None) if error else self.typesetter.glyphs.__setitem__(key,(value or {}).get("glyphs",""))
+                self.typesetter.touch()
+                # The views read the cache when they are laid out (see `stamp_formula`),
+                # so dropping the memoized boxes and repainting is the whole of it: the
+                # next layout picks the answer up. Stamping here would have to reach both
+                # projections of every formula, which is what let the box stay blank.
+                self.repaint_formulas()
+            self.services.request("/api/glyphs",{"path":"main.typ","expression":text,"definitions":definitions,"display":display},
+                                  arrived,key="glyphs:"+str(key))
+
+    def stamp_formula(self,formula):
+        """Stamp one formula's view, the way every draw of it does.
+
+        Both ways into the typesetter stamp before laying the view out: the page's is
+        `FormulaObject.box`, the box's is `MathCanvas.refresh`. This is the page's form of
+        that call, where the context is the formula's own (`source[:start]` and its display
+        mode) rather than the active session's.
+        """
+        return self.stamp_draw(formula['view'],self.source[:from_byte(self.source,formula['start'])],bool(formula.get('display')))
+
+    def stamp_draw(self,view,definitions,display):
+        """Stamp what a draw reads out of the caches; answer which attachments it holds.
+
+        Two caches are read here -- the glyphs a font variant was substituted to, and the
+        placement an attachment sits in -- and both are filled by requests that answer out of
+        band. That is why this runs when the view is **laid out** and not when it is built: a
+        stamp copied into a view at build time is stale the moment an answer lands, and a
+        formula has two views (the page's and the box's), so "stamp it wherever it is built"
+        is a rule with more than one place to get wrong. Reading the caches at layout time is
+        what leaves the answer callback with nothing to do but repaint.
+        """
         attachments=[]
-        self.stamp_contexts(view)
         for node in self.view_nodes(view):
+            if node.get("kind")=="style":
+                # A missing answer is written rather than skipped: changing the definitions
+                # changes the key, and the previous variant's glyphs must not survive that.
+                node["_glyph"]=self.typesetter.glyphs.get((definitions,node.get("text",""),display))
             if node.get("attachment"):
                 node["_placement"]=self.typesetter.placements.get((definitions,node["attachment"],display),{})
                 attachments.append((definitions,node["attachment"],display))
         return attachments
+
+    def prepare_view(self,view,definitions,display):
+        """Give one view the context of the formula it is drawn in, for a pass that asks.
+
+        `stamp_draw` is the half a draw needs. This adds the half the **render pass** needs:
+        `_context` says which script a fragment's box follows, and it is part of the key the
+        pass records its verdicts under (`raw_key`), so it is written by the pass that asks
+        for the views rather than by the draw, or a recording and a lookup could disagree
+        about it.
+        """
+        self.stamp_contexts(view)
+        return self.stamp_draw(view,definitions,display)
 
     def context_index(self):
         """The attachment every fragment is drawn in, by the range it is asked from.
@@ -535,17 +632,20 @@ class Window(QMainWindow):
     def raw_fragments(self, view):
         """Every node that is drawn from a compiled image, outermost first.
 
-        Three kinds are: `raw` (a fragment the editor does not model), `raw_macro` (a call
-        it declines to expand, drawn as the document has it until the caret enters) and
-        `style` (a font variant, drawn from the call's image until the substituted glyphs
-        arrive). A fragment *inside* one of them is skipped: the outer node is one image of
-        its own source, so its slots are not asked for until the caret enters it.
+        Two kinds are: `raw` (a fragment the editor does not model) and `raw_macro` (a call
+        it declines to expand, drawn as the document has it until the caret enters). A node
+        *inside* one of them is skipped: the outer node is one image of its own source, so
+        its contents are not asked for until the caret enters it.
+
+        A `style` node is **not** here: it is drawn from the glyphs the engine substituted,
+        which are asked for by spelling rather than by range, so a variant never competes
+        for a source range and the overlapping-range conflict cannot arise.
         """
         out = []
         def walk(node, inside):
             kind = node.get('kind')
-            if kind in ('raw_macro','style'):
-                out.append(node)
+            if kind == 'raw_macro':
+                if not inside: out.append(node)
                 inside = True
             elif kind == 'raw' and not inside:
                 out.append(node)
@@ -556,7 +656,7 @@ class Window(QMainWindow):
     def index_fragment_contexts(self,view,script,formula,index):
         """Walk one view, remembering the script each of the formula's own fragments sits in."""
         if script is None and view.get('kind')=='scripts':script=view
-        if view.get('kind') in ('raw','raw_macro','style'):
+        if view.get('kind') in ('raw','raw_macro'):
             start=self.fragment_start(view)
             if start is None or not formula['start']<=start<formula['end']:return
             if script is not None:
@@ -576,7 +676,7 @@ class Window(QMainWindow):
         """Give every fragment of a view the attachment it is drawn in, if any."""
         index=self.context_index()
         for node in self.view_nodes(view):
-            if node.get('kind') not in ('raw','raw_macro','style'):continue
+            if node.get('kind') not in ('raw','raw_macro'):continue
             node['_context']=index.get(':'.join((node.get('render_id') or '').split(':')[:2]))
         return view
 

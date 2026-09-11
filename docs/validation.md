@@ -1486,6 +1486,122 @@ thread '…is_writable' panicked at crates\core\src\typst.rs:730:27:
 
 改动文件：`crates/core/src/cursor.rs`、`crates/core/src/slots.rs`（`command_views` 补 `#[cfg(test)]`）、`tests/command_mode.rs`、`docs/validation.md`。
 
+## 命令模式敲出 `bold(x)` 后公式框不画变体 · 2026-09-11
+
+### 现象
+
+读者的原话："进入命令模式后，输入 `bold(x)` 再回车，此时是不渲染的。"
+
+复现（离屏窗口 + 假服务，**答案故意延后**）：`activate` → `input('\')` → `input('bold(x)')` → `key('Enter')`，公式框里画出来的文字运行是 **`['', '𝑥']`**——变体那一格是**空串**，其余正常。也就是说不是"整条公式没渲染"，而是 `style` 节点画了一个空运行（`Box` 宽度退到下限 2px，等于看不见）。
+
+### 根因：答案晚到，而盖章发生在建视图那一刻
+
+字形不是前端算的，是 `/api/glyphs` 问回来的（见 [architecture.md](architecture.md) 的 `Style` 一节），**必然晚于**布局：
+
+1. 回车提交草稿 → 源码变化 → `update_analysis` 推出新视图 → `load_glyphs` 发出请求（缓存里先记 `None` = "问了还没答"）；
+2. `math_action` 随即 `stamp_view(state['view'])` —— 此刻缓存里只有 `None`，于是**什么都没盖上**；
+3. 答案到达时，回调只对 `self.analysis` 的公式补盖并重画**页面**。公式框画的是 `activate_formula` 返回的**另一个视图对象**（`state['view']`），补盖够不着它。
+
+所以"进入公式框就不显示"和"刚敲完命令不显示"是同一件事的两面：`_glyph` 是**建视图那一刻**抄进节点的一份**值**，而值是晚到的。我上一轮的修法（在 `activate`/`math_action` 里补一次盖章）只覆盖了"答案已经在缓存里"的情况，正好漏掉"刚产生的新拼写"，而这两条路径的差别只在**时序**上——手工调用的测试全走的是前者。
+
+### 改法：不在建视图时盖章，在**布局那一刻**读缓存
+
+把"盖章"从每个投影各自的义务变成两个入口各做一次的事：
+
+| 位置 | 做什么 |
+| --- | --- |
+| `Window.stamp_draw(view, definitions, display)` | 从两个缓存读：变体的字形串、附件的 placement。**没有答案也写 `None`**，否则改了定义（键变了）旧字形会留着 |
+| `FormulaObject.box(formula)` | 页面的唯一入口：`stamp_formula(formula)` → `typesetter.layout(view)`，布局结果仍按 `typesetter.version` 记忆 |
+| `MathCanvas.refresh(state)` | 公式框的唯一入口：`prepare_view(...)` → `layout` |
+| 答案回调（`arrived`/`attached`） | 只做 `touch()`（作废记忆的盒子）+ `repaint_formulas()`，不再盖任何东西 |
+| `prepare_view(view, …)` | = `stamp_contexts` + `stamp_draw`。`_context` 留在这一侧：它是**渲染轮记录 `False` 时用的键**（`raw_key`），记录方和查表方必须同时写，不能交给画的那一刻 |
+
+顺带删掉三处上一轮的临时机制：`Window.stamp_view`、`Window.stamp_glyphs`、`Window.style_nodes`，以及 `load_raw` 里那一遍补盖和 `activate`/`math_action` 里的两次调用。
+
+**画法也从四种收敛成两种**：有字形画字形，否则画这个调用（名字 + 主体 + 右括）。第二种不只是"光标在里面"那一种——答案在路上、或请求失败时，画调用正是源码说的东西，画空串则什么都不说。`cal(A)` 那类"取了字但字不对"的异常态因此也不需要单独分支。
+
+### 实测
+
+| 时刻 | `style` 节点画的运行 |
+| --- | --- |
+| 回车之后、答案到达之前 | `bold(` + 主体 + `)` |
+| 答案到达并重画之后 | `𝐱`（U+1D499） |
+
+### 新用例的牙齿（两条，各钉一个入口）
+
+- `test_committing_a_variant_command_draws_it_once_the_answer_arrives`：命令模式整条路径，答案延后发放，断言公式框画的是 `𝐱`。删掉 `FormulaObject.box` 里的盖章 → 失败；删掉 `MathCanvas.refresh` 里的 `prepare_view` → 失败。
+- `test_the_page_renders_a_variant_whose_glyphs_arrive_late`：只钉页面那一侧（答案晚到后**不重建视图**，只有缓存变了）。删掉 `FormulaObject.box` 里的盖章 → 失败（画成 `bold(` `)`）。这条是必要的，因为"只写公式框能过"的测试**盖不住**页面：公式框每次 `refresh` 都会重新盖章。
+
+两条都用**延后发放**的假服务：此前的假服务是**同步**回话的，答案在 `stamp` 之前就已经在缓存里，于是整类时序缺陷在测试里根本不存在——这正是上一轮"手工调用全绿"的原因。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **136 通过 / 5 忽略** |
+| `python -m unittest desktop.test_desktop` | **84 通过**（新增 2 条） |
+| `python tools/kind_inventory.py` | 退出码 0，32 个用例、23 个线名两个方向都对上 |
+
+改动文件：`desktop/window.py`、`desktop/mathview.py`、`desktop/test_desktop.py`、`docs/architecture.md`、`docs/desktop.md`、`docs/kind-inventory.md`、`docs/validation.md`。
+
+## `upright` 画成了斜体：引擎给的码位又被映射了一遍 · 2026-09-11
+
+### 现象
+
+读者："现在 upright 不显示直体了。"
+
+复现（离屏窗口，`$upright(A) + bold(A)$`）：画出来的三个运行是 **`['𝐴', '+', '𝐀']`**——`bold(A)` 是对的，`upright(A)` 是**斜体** `𝐴`。
+
+### 根因：同一个映射做了两遍
+
+编辑器画"数学变量"时把 ASCII 字母映射到 Unicode 数学斜体区（`a→𝑎`），因为那是 Typst 的默认。而**字体变体是引擎已经做过的替换**：`/api/glyphs` 给的 `upright(A)` 就是普通 `A`，`bold(A)` 就是 `𝐀`。于是 `mathfont.glyph` 又映射一次：
+
+| 节点 | 引擎给的 | 编辑器又映射成 | 结果 |
+| --- | --- | --- | --- |
+| `bold(A)` | `𝐀`（不是 ASCII） | 原样 | 对 |
+| `upright(A)` | `A`（ASCII） | `𝐴` | **直体被改回斜体** |
+
+`bold` 一直是好的，只是因为 `𝐀` 不是 ASCII、恰好躲过那个映射——这就是缺陷能藏住的原因。
+
+改法：`mathfont.glyph(..., substituted=True)` 这一个开关，`mathview` 只在画 `style` 节点的字形串时传它。引擎的替换结果原样画，别的路径（变量、文本格、符号）照旧映射。
+
+### 顺带查清的一处"特殊处理"：`h`
+
+`mathfont.glyph` 里那一行 `"ℎ" if text == "h"` 曾被删掉。它不是给字体打的补丁：**U+1D455（mathematical italic small h）在 Unicode 里未分配**（`unicodedata.category == 'Cn'`），没有任何字体能画出它；引擎把默认斜体 h 排成 **Planck 常数 `ℎ` U+210E**。用真适配器把 52 个字母逐个问过：
+
+| 公式 | 引擎（`/api/glyphs`） |
+| --- | --- |
+| `h`（默认斜体） | U+210E `ℎ` |
+| `italic(h)` | U+210E |
+| `upright(h)` | U+0068（直体 h） |
+| `bold(h)` | U+1D489 |
+| `bold(upright(h))` | U+1D421 |
+
+52 个字母里**只有 `h` 一处**与"朴素映射"不同。删掉那一行的后果是编辑器向 Qt 要 U+1D455 → 字体没有 → Qt 逐字回退到别的家族（正是本项目一直在防的"一个公式里混进多种设计"），而且对**任何公式里的默认斜体 `h`** 都会发生。已加回。
+
+### 新用例的牙齿（两边各一条）
+
+- `native-adapter`：`the_italic_default_has_one_hole_and_it_is_h` —— 断言 `h`/`italic(h)`/`upright(h)`/`bold(upright(h))` 四种写法的字形串，并断言相邻的 `g`/`i` 是普通码位（说明这是 Unicode 的洞，不是映射规则）。
+- `desktop`：`test_the_math_font_covers_every_glyph_the_core_can_draw` 改成**从 `mathfont.glyph()` 取那 52 个字母**再查字体覆盖。此前它手写字母表，所以删掉 `h` 的特例它**照样绿**——测的是我写的那条路径，不是用户走的那条。现在删掉特例会红，报 `NewComputerModern Math cannot draw ['\U0001D455']`。
+- `desktop`：`test_upright_draws_the_plain_letter_the_engine_asked_for` —— 断言同一份公式里 `A`（直体）与 `𝐀`（加粗）同时在，且**不能**出现 `𝐴`。把 `substituted=True` 去掉即失败。
+
+### 一次误判，记下来
+
+我先把 `mathfont.py` 里那两行的缺失当成了"工具/编辑器意外删除"，其实**它在本人编辑这个文件之前就已经不在**（字体用例在我动手之前就是红的），是读者有意删掉的；我看 `git diff` 时把三处改动混成一个 hunk，才读成"工具删了我的行"。教训是：**diff 的 hunk 不是因果**——判断"谁改的"要看**改动发生的时间点**（用例何时变红、文件何时被写），不是看改动挨不挨着。
+
+### 验证（本轮收尾时实测）
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **136 通过 / 5 忽略** |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过**（新增 1 条） |
+| `python -m unittest desktop.test_desktop` | **85 通过**（新增 1 条，另 1 条改成从映射取字母） |
+| `python tools/kind_inventory.py` | 退出码 0 |
+
+改动文件：`desktop/mathfont.py`、`desktop/mathview.py`、`desktop/test_desktop.py`、`native-adapter/src/main.rs`、`docs/validation.md`。
+
+
+
 
 
 

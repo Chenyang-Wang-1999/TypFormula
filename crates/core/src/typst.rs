@@ -682,6 +682,10 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             // looked up from `config/commands.json` when it is drawn or written, and
             // never kept in it. That is what lets the file decide what is structured —
             // and what keeps a node from holding a shape the file no longer declares.
+            //
+            // Which shape that is, and whether it still applies, is asked in
+            // `MathAtom::command_shape` rather than decided here: a font variant depends on
+            // its *body*, and the body changes as the node is edited.
             MathAtom { kind: Kind::MacroCall { name, function: true }, cells: args }
         }
         Some(ast::Expr::MathShorthand(_)) | Some(ast::Expr::Escape(_)) => MathAtom::from_source(node.full_text()),
@@ -724,6 +728,28 @@ fn positional_args(call: ast::MathCall, ctx: &ParseContext) -> Option<Vec<MathDa
         args.push(arg);
     }
     Some(args)
+}
+
+/// Whether a body is a run of characters, which is the only shape a font variant has.
+///
+/// A variant is applied by substituting codepoints, so it needs characters to substitute.
+/// Everything else — a fraction, a radical, an attachment, an accent, a table, a picture
+/// (`Raw`) or another call the editor cannot shape (`raw_macro`) — has no single glyph run,
+/// and the engine refuses to answer for it (measured).
+///
+/// A **nested variant** does qualify: `bold(upright(a))` resolves to one glyph (`𝐚`). Such
+/// a body is a `MacroCall` whose shape is a `Style`, so it has to be asked through
+/// `command_shape` rather than matched on `Kind` — both a variant and an unshapeable call
+/// are `MacroCall` in the tree, and matching on the kind would reject the nested variant
+/// along with the rest.
+pub fn has_glyph_run(data: &[MathData]) -> bool {
+    !data.is_empty() && data.iter().all(|cell| cell.iter().all(|atom| match &atom.kind {
+        Kind::Char { .. } | Kind::Symbol { .. } | Kind::Number | Kind::Text => true,
+        Kind::MacroCall { .. } => {
+            matches!(atom.command_shape(), Some(Kind::Style { .. })) && has_glyph_run(&atom.cells)
+        }
+        _ => false,
+    }))
 }
 
 /// The command names the parser may meet as an ordinary call.

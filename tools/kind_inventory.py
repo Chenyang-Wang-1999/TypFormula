@@ -83,6 +83,10 @@ CASES = [
     # what the engine is asked for, both for the image and for the glyphs.
     ("Style", "$bold(A)$", []),
     ("Style/nested", "$bold(upright(a))$", []),
+    # A variant whose body has no glyph run: a fraction, an accent, a picture. It is drawn
+    # as the call instead (see `has_glyph_run`), which is a path that already works rather
+    # than a variant that would have to report "no glyphs" every time it is drawn.
+    ("Style/structured body", "$bold(frac(a, b))$", []),
     ("Line", "$overline(x)$", []),
     # The two kinds that exist only inside a macro template: neither is reachable
     # from source, so what this shows is their absence.

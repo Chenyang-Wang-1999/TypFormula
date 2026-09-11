@@ -12,7 +12,31 @@ pub fn analyze(document: &mut Document) -> Value {
     let formulas:Vec<_>=document.equation_nodes().into_iter().map(|(equation,node)|project(document,equation,&node,&blocked)).collect();
     for formula in &formulas {if formula["editable"]==false {styles.push(json!({"kind":"formula_error","start":formula["start"],"end":formula["end"],"text":formula["reason"]}));}}
     document.editor=saved_editor; document.active=saved_active;
-    json!({"formulas":formulas,"styles":styles})
+    // A font variant is applied by substituting codepoints, and the table that does it is
+    // outside the kernel's reach. The **spellings to ask about** travel with the analysis,
+    // so the window can ask the layout service once instead of the core asking the adapter
+    // from inside its own request loop (the desktop protocol is one request at a time).
+    let glyphs = style_expressions(&formulas);
+    json!({"formulas":formulas,"styles":styles,"glyphs":glyphs})
+}
+
+/// Every `style` call spelling in the analysis, for the glyph lookup.
+///
+/// Deduplicated: two formulas that both say `bold(a)` need one answer, and nesting is
+/// included because each layer is drawn on its own once the caret is inside it.
+pub fn style_expressions(formulas: &[Value]) -> Vec<String> {
+    fn walk(view: &Value, out: &mut Vec<String>) {
+        if view["kind"] == "style" {
+            if let Some(text) = view["text"].as_str() { out.push(text.to_string()); }
+        }
+        if let Some(children) = view["children"].as_array() { for child in children { walk(child, out); } }
+    }
+    let mut out = vec![];
+    for formula in formulas {
+        if formula["editable"] == false { continue; }
+        walk(&formula["view"], &mut out);
+    }
+    out.sort(); out.dedup(); out
 }
 
 fn scan_syntax(document:&Document,classify:bool)->(Vec<(usize,usize)>,Vec<Value>) {

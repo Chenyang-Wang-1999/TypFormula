@@ -177,7 +177,25 @@ impl MathAtom {
     /// up, never stored, so changing the file cannot leave a node holding a stale one.
     pub fn command_shape(&self) -> Option<Kind> {
         match &self.kind {
-            Kind::MacroCall { name, .. } => slots::configured_kind(name),
+            Kind::MacroCall { name, .. } => {
+                let shape = slots::configured_kind(name)?;
+                // A font variant is the one shape whose applicability depends on the
+                // **body**: it is applied by substituting codepoints, so it only exists
+                // while its body is a run of characters. `bold(a)` qualifies; a fraction,
+                // an accent or a picture in the body does not (measured: the engine refuses
+                // to answer for those), and such a call is then drawn as a call — which is
+                // a path that already works rather than a variant that would have to report
+                // "no glyphs" every time it is drawn.
+                //
+                // This is asked here rather than at parse time because a node's cells change
+                // as it is edited: emptying a body, or typing a fraction into one, has to be
+                // able to move the node between the two drawings. `Kind` is what is stored,
+                // and it stays `MacroCall` either way.
+                if matches!(shape, Kind::Style { .. }) && !crate::typst::has_glyph_run(&self.cells) {
+                    return None;
+                }
+                Some(shape)
+            }
             _ => None,
         }
     }

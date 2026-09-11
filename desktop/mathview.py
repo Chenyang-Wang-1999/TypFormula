@@ -104,8 +104,8 @@ class Typesetter:
     # differs -- the `marker` field says which drawing. `table` and `multiline`
     # are the two column-major arrangements (a dense matrix and a ragged
     # alignment); `raw_macro` is a known callee the kernel cannot expand; `style`
-    # is a font variant, drawn from the engine's image of the call until the
-    # substituted glyphs arrive.
+    # is a font variant over a run of characters, drawn from the glyphs the engine
+    # supplied — or as the call, until they arrive.
     ARRANGEMENTS = frozenset({
         "char", "symbol", "number", "raw", "text", "unknown", "parameter",
         "draft-text", "draft-placeholder", "draft-caret", "absent", "stop",
@@ -119,6 +119,10 @@ class Typesetter:
         self.cache = cache if cache is not None else {}
         self.svg = BitmapCache()
         self.placements = {}
+        # Substituted glyphs per `(definitions, call spelling, display)`, filled from
+        # `/api/glyphs`. A `None` value marks "asked, answer not here yet": the window
+        # stamps that as a missing `_glyph`, and the drawing falls back to the call.
+        self.glyphs = {}
         # Structural metrics: baseline and line height, from the editor text font.
         # A math font's own ascent is TeX sized (the bundled New Computer Modern
         # Math reports more than three em, for four-line delimiters), so taking the
@@ -188,9 +192,13 @@ class Typesetter:
             self.fonts[(family, size)] = entry
         return entry
 
-    def run(self, text, factor, text_mode=False):
-        """(characters, font, advance) for one text run of the display tree."""
-        family, glyph = mathfont.glyph(self.family(), text, text_mode)
+    def run(self, text, factor, text_mode=False, substituted=False):
+        """(characters, font, advance) for one text run of the display tree.
+
+        `substituted` says the text is what the **engine** spelled for a font variant, so
+        the editor's own letter mapping must not touch it again (`mathfont.glyph`).
+        """
+        family, glyph = mathfont.glyph(self.family(), text, text_mode, substituted)
         font, metrics = self.font(family, factor)
         return glyph, font, max(2, metrics.horizontalAdvance(glyph))
 
@@ -385,29 +393,39 @@ class Typesetter:
                 box.add(up,(core_width-up.width)/2 if centered_up else core_width,0)
                 box.add(down,(core_width-down.width)/2 if centered_down else core_width,down_y)
         elif kind == "style":
-            # A font variant. Typst applies one by *substituting codepoints* through a
-            # table the kernel cannot reach, so the glyphs are asked for separately and
-            # stamped on as `_glyph`. Four cases, and the order between them is the point:
+            # A font variant over a body that is a run of characters — the kernel only
+            # builds this node when that holds (`has_glyph_run`); a body that is a fraction,
+            # an accent or a picture is drawn as the call instead (`raw_macro`).
             #
-            #   caret inside                    -> the cells, so the body stays editable
-            #   `_glyph` present and non-empty  -> the substituted glyphs
-            #   `_glyph` present but empty      -> an anomaly: report it, show the source
-            #   `_glyph` absent (not asked yet) -> the engine's image of the call, which is
-            #                                      the one drawing that is always right
+            # So there are two drawings, not four:
+            #
+            #   glyphs here -> the **substituted** glyphs, the ones the engine laid out
+            #   otherwise   -> the call: the name, the body, the closing bracket
+            #
+            # The second covers two cases, and it is the better drawing in both. A variant
+            # around one glyph looks exactly like the glyph, so with the caret inside the
+            # name is the only thing on screen that says which variant is being edited; and
+            # the glyphs are asked for when the formula is analyzed and arrive out of band,
+            # so between the request and the answer — or after one that could not be
+            # answered — the call is what the source says, where an empty run says nothing.
             glyph = node.get("_glyph")
-            inner = lambda: self.layout(self.slot(children, "inner", 0), factor)
-            if node.get("_active"):
-                box = inner()
-            elif glyph:
-                text, draw_font, width = self.run(glyph, factor)
-                box = Box(width, em, ascent, [("text", 0, ascent, (text, draw_font, kind))])
-            elif "_glyph" in node:
-                self.note_unknown_marker("style:" + (node.get("style_name") or ""))
-                text, draw_font, width = self.source_run(node.get("text", ""), factor)
-                box = Box(width, em, ascent, [("text", 0, ascent, (text, draw_font, kind))])
-                box.operations.insert(0, ("failed", 0, 0, (width, em)))
+            if node.get("_active") or not glyph:
+                # The name is drawn in the source font, the way `raw_macro` draws its
+                # callee: a command name is Typst source, not a compiled glyph.
+                body = self.layout(self.slot(children, "inner", 0), factor)
+                name, draw_font, name_width = self.source_run(node.get("style_name", "") + "(", factor)
+                closing, _, close_width = self.source_run(")", factor)
+                width = name_width + body.width + close_width
+                baseline = max(body.baseline, ascent)
+                box = Box(width, max(body.height, em), baseline)
+                box.add(body, name_width, baseline - body.baseline)
+                box.operations.append(("text", 0, ascent, (name, draw_font, kind)))
+                box.operations.append(("text", name_width + body.width, ascent, (closing, draw_font, kind)))
             else:
-                box = self.image_box(node, metrics, factor) or inner()
+                # The engine's own run, drawn as it spelled it: `upright(A)` is a plain `A`
+                # and must stay one (see `Typesetter.run`).
+                text, draw_font, width = self.run(glyph, factor, substituted=True)
+                box = Box(width, em, ascent, [("text", 0, ascent, (text, draw_font, kind))])
         elif kind in ("table","multiline"):
             # A ragged row is padded to `columns` for the flat cell list, so the
             # padding has to be dropped here or the source would appear to have cells it
@@ -606,6 +624,12 @@ class FormulaObject(QObject,QTextObjectInterface):
         Qt asks for the same object from intrinsicSize and drawObject, and a
         click asks again before activating. One entry per live view is all this
         needs, and holding the view keeps its id() unique.
+
+        The view is stamped here because this is the page's one way into the typesetter
+        (`MathCanvas.refresh` is the box's). What a variant draws and where an attachment
+        sits are answered out of band, so they are read at layout time rather than copied
+        into the view when it was built; the memo is dropped whenever an answer lands
+        (`typesetter.version`).
         """
         typesetter=self.editor.owner.typesetter
         signature=(typesetter.version,typesetter.settings_signature())
@@ -613,6 +637,7 @@ class FormulaObject(QObject,QTextObjectInterface):
         view=formula["view"]
         entry=self.boxes.get(id(view))
         if entry is not None and entry[0] is view:return entry[1]
+        self.editor.owner.stamp_formula(formula)
         box=typesetter.layout(view)
         self.boxes[id(view)]=(view,box)
         return box

@@ -14,7 +14,7 @@ Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`�
 
 源码栏（`SourceDock`）与编辑器**逐行对齐**：同一个文档默认字体、同一个顶部偏移，并把编辑器实测的每行高度以 `MinimumHeight` 写进源码栏的块（带高公式的行比纯文本行高）。行高逐一相等之后两栏的滚动值可以直接对应，`Window.mirror_scroll` 双向跟随。跟随只发生于**用户滚动**：重投影会重建两栏并各放回自己的滚动值，源码栏的光标同步也会让源码栏滚到自己的光标处，这两种都不算"要跟随的滚动"（`Window.loading` 期间 `mirror_scroll` 直接返回，`Window.project` 设完光标把源码栏滚回原位），否则停在一处的源码栏光标会把编辑器一起拽走。源码栏是 `QTextEdit` 而非 `QPlainTextEdit`：后者的文档布局忽略块行高。
 
-公式字体分两件事：**结构行度量**（em、基线、下降部）取编辑器正文字体，**字形**取数学字体。`desktop/mathfont.py` 注册随附字体并读回 Qt 报告的真实家族名，只在已安装的家族里解析设置里的 `math_font`；名字不存在时退回随附数学字体而不是交给 `QFont`，因为 Qt 的替换是静默的，随后逐字回退又会把多个设计混进同一个公式。数学字体本身不能提供行度量：`NewComputerModern Math` 必须容纳四层高的定界符，12pt 下报告 `ascent=99`、`height=185`，直接当行高会得到几乎空白的巨框。数学变量的字形来自 Unicode 数学斜体区间（`a→𝑎`、`h→ℎ`），与编译结果同一套字形；文本单元保持直立。随附字体位于 `fonts/`，`native-adapter` 也把数学字体编进自己的二进制。
+公式字体分两件事：**结构行度量**（em、基线、下降部）取编辑器正文字体，**字形**取数学字体。`desktop/mathfont.py` 注册随附字体并读回 Qt 报告的真实家族名，只在已安装的家族里解析设置里的 `math_font`；名字不存在时退回随附数学字体而不是交给 `QFont`，因为 Qt 的替换是静默的，随后逐字回退又会把多个设计混进同一个公式。数学字体本身不能提供行度量：`NewComputerModern Math` 必须容纳四层高的定界符，12pt 下报告 `ascent=99`、`height=185`，直接当行高会得到几乎空白的巨框。数学变量的字形来自 Unicode 数学斜体区间（`a→𝑎`、`h→ℎ`），与编译结果同一套字形；文本单元保持直立。这里有一个必须分清的分界：**那个映射只适用于编辑器自己认出来的变量**。字体变体（`style` 节点）画的是**引擎已经替换好的**串，再映射一遍就把 `upright(A)` 的直体 `A` 改回斜体 `𝐴`——所以 `mathfont.glyph(..., substituted=True)` 让引擎给的串原样画（`bold` 只是因为 `𝐀` 不是 ASCII 才一直没露馅）。`h` 是这条映射唯一的例外，而且例外来自 **Unicode 的洞**而不是映射规则：U+1D455（mathematical italic small h）**未分配**，引擎把默认斜体 h 排成 Planck 常数 `ℎ` U+210E；52 个字母逐个问过真适配器，只有它一处不同。随附字体位于 `fonts/`，`native-adapter` 也把数学字体编进自己的二进制。
 
 每个 Raw 片段的源码区间由 `Document::annotate` 给出，它是"片段图像"与"源码"之间唯一的连接：窗口用 `render.raw` 的区间请求 Typst。规范序列化只用于估算位置——它补空格、把 `a/b` 写成 `frac(a, b)`——最终以"该区间里恰好是这段文本"为准，所以按自己习惯书写的公式同样出图。区间无法确定的片段退回源码显示并标出，核心允许左右键进入它的源码（`failed_previews` + `Action::PreviewResults`），这是它唯一的修复入口。
 
@@ -78,6 +78,8 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 `/api/packages` 从官方索引查版本，安装精确版本到标准缓存。下载有超时与大小限制；包解压仅接收普通文件和目录，拒绝链接、越界和过大归档。先解压到临时目录并校验 manifest 存在，再重命名发布缓存，避免半安装状态。
 
 `/api/render` 和 `/api/attachments` 使用正式版自己的 native-adapter。数学 IR 标签桥接保存在 `vendor/typst`；构建不再准备原型引擎或修改其他目录。源码、资源与缓存失败不影响代码区继续输入。
+
+`/api/glyphs` 走同一个适配器，回答"这段调用被引擎替换成了哪些字符"（下一节的 `Style`）：请求体带 `definitions` 与 `display`，适配器把这段拼写编译成数学 IR 再把字形串读回来。同一个片段可以既取图又取字，两者互不影响。
 
 ## 一个公式怎么变成可编辑的树
 
@@ -210,28 +212,31 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 `Sqrt`/`Root`/`Accent`/`Line` 四个变体因此**只在形状表里活着**：`configured_kind` 拿它们当形状返回、`Decl` 描述它们的槽位、`view_atom` 按它们画，但没有源码能存它们。这不是"该删没删"，而是**一个变体身兼两职**——`command_shape()` 与 `is_macro()` 之所以必须存在，就是因为 `Kind::MacroCall` 同时也是"借了形状的命令"。
 
-### `Style` 的渲染不在内核这一侧
+### `Style` 的替换表在适配器那一侧，不在前端也不在内核
 
-`Style{text, style_name}`（`bb`/`cal`/`frak`…）的**机制**很便宜：形状不带数据（`style_name` 就是命令名，和 `Accent` 一样），所以只要一个形状描述符 + 配置里几行。**贵的是前端那一步"渲染"**，也就是"让前端负责渲染"这句话实际要求什么。查证结果：
+`Style{text, style_name}`（`bold`/`upright`…）的**机制**很便宜：形状不带数据（`style_name` 就是命令名，和 `Accent` 一样），所以只要一个形状描述符 + 配置里几行。**贵的是那一步"替换"**，也就是"让前端负责渲染"实际要求什么。查证结果：
 
 | 事实 | 证据 |
 | --- | --- |
 | 变体是**码位替换**，不是字体特性 | `resolve.rs:311` 把每个字符过一遍 `to_style(c, MathStyle::select(c, variant, bold, italic))`，替换后的文本才去整形 |
-| 但那张表**不在 vendor 里** | `resolve.rs:4` 是 `use codex::styling::{MathStyle, to_style}`，来自外部 crate `codex 0.3.0` |
+| 但那张表**不在 vendor 里** | `resolve.rs:4` 是 `use codex::styling::{MathStyle, to_style}`。`codex` 是 **Typst 自己的符号数据库**（`github.com/typst/codex`，Apache-2.0，作者是 The Typst Project Developers），`vendor/typst` 里的 `typst-library/src/symbols.rs:8,14` 用的就是它的 `ROOT`/`SYM`——它不在 `vendor/` 下，作为普通依赖随 `typst-library`/`typst-layout` 进构建（编辑器内核只依赖 `typst-syntax`，所以内核与前端都碰不到它） |
 | 它**不是偏移表**：一个字符可能变成**两个**（基字 + 变体选择符） | `to_style('Q', Chancery) == "𝒬\u{fe00}"`（`codex/src/styling.rs:362`）；`mathfont.glyph` 目前只处理**单字符** |
 | 它覆盖**非拉丁**字母表 | 同一份文档的例子：`ظ → 𞺚`、`ذ → 𞺸`（阿拉伯数学字母） |
-| 规模 | `codex/src/styling.rs` 共 942 行 |
 | `cal` 与 `scr` 是**两种**变体，Unicode 只有一套 script 区 | 实测 24pt：`cal(A)` 19.152 ≠ `scr(A)` 20.52 |
 
 字体本身没问题，这一点也量过了：随附的 `NewComputerModern Math` **覆盖全部变体区**，各区的"缺口"正是 Unicode 自己的设计（script 大写 18/26、fraktur 21/26、double-struck 19/26），而 Letterlike 那几个替代码位（`ℂℍℕℙℚℝℤ`）**全部存在**。
 
-所以 `Style` 卡在一个选择上，而不是卡在难度上：
+所以这不是"把 `codex/src/styling.rs` 那张表转写进 Python"还是"先不做"的选择，而是**不要在前端复述那张表**：`to_style` 的输出早已在数学 IR 里（`resolve.rs:309-317` 把 `styled_text` 交给 `TextItem::create`），适配器只是把它**读回来**——`/api/glyphs` 带 `glyphs:true` 编译这段拼写，递归取 `Glyph`/`Text`/`Number` 的 `text`。前端因此不依赖 codex，"表抄错了就画错"这个风险不存在：编辑器画的字形与引擎排的字形是同一份数据。
 
-1. **把 942 行的表转写进 Python**——风险是与 `codex` 悄悄分歧，而且非拉丁部分基本不可能只靠抽查保证；
-2. **让适配器给内核送已经替换好的文本**——复用引擎自己的表，必然一致，但这正是 `Accent` 几何量缺失的那个**引擎数据通道**，现在还不存在；
-3. **先不做**——今天 `bb(A)` 是 `Raw`，由引擎渲染，**画得是准的**，只是不可编辑。`Style` 换到的是"可编辑"，代价是"除非表是对的，否则画错"。
+键是 `(definitions, 调用拼写, display)`，**按层**各问一次：`bold(upright(a))` 的引擎结果是 `𝐚`，但 `upright(a)` 这一层自己的字形是 `a`，光标进去要看到的正是后者。
 
-**注意这一条的现状**：`bb(A)` 是 `Raw` 不只是因为表不在手边，也是因为 `bb` 根本不在 `config/commands.json` 里——**它现在是三层名字处理里的第三层**（纯源码文本、引擎自己画），而且这一层的渲染是**正确的**。
+内核只在主体**真的有字形串**时才建 `Style` 节点（`has_glyph_run`：`Char`/`Symbol`/`Number`/`Text`，以及形状是 `style` 的嵌套调用；`Raw`、分数、重音都不算）。`bold(frac(a, b))`、`bold(hat(a))`、`upright(a/b)` 因此走 `raw_macro` 那条老路（一张图，光标进入画名字与参数槽），不需要字形，也就不存在"取不到字"的状态。
+
+前端只有两种画法：**有字形画字形，否则画这个调用**（名字 + 主体 + 右括）。第二种不只是"光标在里面"那一种——变体套一个字形时，画出来与那个字形一模一样，宏名是唯一说明在编辑什么的东西；而字形是**异步**到的，答案到达之前画调用也正是源码说的东西，画空串则什么都不说。
+
+**取字与画分离**，这一条是踩过一次才定下来的：盖章发生在**布局那一刻**（页面的入口是 `FormulaObject.box`，公式框的入口是 `MathCanvas.refresh`），从缓存里读，所以答案回调只需要 `touch()` + 重画。此前盖章写在"视图建好时"，于是答案晚到时要么补盖、要么不盖——而一个公式恰好有**两个投影**（页面一份、公式框一份），"补盖"就变成每个投影各自的义务，漏掉一个的表现正是一个空白变体。
+
+未做：`bb`/`cal`/`frak`/`scr` 还没进 `config/commands.json`，所以 `bb(A)` 仍是 `Raw`（引擎自己画，正确但不可编辑）。加它们是配置里几行——表不再是障碍。已知限制：`to_style` 可能返回两个码位（`𝒬\u{fe00}`），而 `mathfont.glyph` 是按字符映射的，`cal`/`scr` 这类变体要单独确认 Qt 画变体选择符的行为。
 
 ### `MathIdent` 查的是两张表，不是一张
 
