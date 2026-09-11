@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-use visual_typst_core::{Action, Editor, services::{Services, CompletionRequest, RenderRequest, RawRange}};
+use visual_typst_core::{Action, Editor};
+use visual_typst::services::{Services, CompletionRequest, RenderRequest, RawRange};
 
 fn render(service: &Services, expression: &str, definitions: &str) -> Result<serde_json::Value,String> {
     let prefix=format!("{definitions}\n$ ");

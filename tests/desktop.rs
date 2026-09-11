@@ -1,5 +1,5 @@
 use serde_json::json;
-use visual_typst_core::{desktop::analyze, document::Document};
+use visual_typst::{desktop::analyze, document::Document};
 
 #[test]
 fn native_projection_keeps_opaque_definitions_in_source_and_preserves_active_session() {

@@ -870,6 +870,16 @@ dependencies = [
  "typst-syntax",
  "ureq",
  "url",
+ "visual-typst-core",
+]
+
+[[package]]
+name = "visual-typst-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "typst-syntax",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-use visual_typst_core::workspace::resolve;
+use visual_typst::workspace::resolve;
 
 #[test]
 fn project_paths_stay_inside_the_document_directory() {

@@ -651,7 +651,6 @@ src/math/mod.rs + src/math/symbols.rs  →  子模块
 ```
 
 在 `lib.rs` 里写 `pub mod view;` 就等于把 `view.rs` 挂进树。**没有头文件，也没有 `#include` 的顺序问题。**
-
 #### 细讲 5：`pub use` 重导出
 
 ```rust
@@ -662,7 +661,18 @@ pub use cursor::{Action, Editor};     // lib.rs:14
 
 #### 本项目
 
-`lib.rs:3-12` 是模块树；`lib.rs:14` 的 `pub use cursor::{Action, Editor}` 就是重导出。`document.rs:3` 的 `use crate::{Action, Editor, math::*, typst};` 展示了 `crate::` 路径和 `*` 通配（`math::*` 把 `math.rs` 里所有 `pub` 项引进来，你项目里用得很重）。`main.rs` 是同一个 package 的第二个 crate（二进制）。
+项目里有**两个** crate，正好用来分辨"模块"和"crate"：
+
+- 内核 `crates/core/src/lib.rs` 挂五个模块（`math`/`slots`/`typst`/`cursor`/`view`），并在末尾写 `pub use cursor::{Action, Editor};` 重导出——外部于是能写 `visual_typst_core::Action`。
+- 外围 `src/lib.rs` 挂另外六个（`document`/`services`/`workspace`/`packages`/`rpc`/`desktop`），同一个 package 的 `src/main.rs` 是它的二进制。
+
+分界就在这里：`crate::` 只在**同一个 crate 内**有效。外围的 `src/document.rs` 开头是
+
+```rust
+use visual_typst_core::{Action, Editor, math::*, typst};
+```
+
+——引用另一个 crate 必须用它自己的名字，不能写 `crate::`；反过来内核里写 `use visual_typst::…` 会直接编译失败。`math::*` 这种通配把 `math.rs` 里所有 `pub` 项引进来，你项目里用得很重。这条边界不是写在文档里的约定，是编译器守着的：见 `docs/architecture.md` 的"分层：内核与外围"。
 
 ### 第 8 章 · 常见集合 【对照】
 

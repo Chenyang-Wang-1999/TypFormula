@@ -243,12 +243,22 @@ const K_NONE: &[&str] = &[];
 /// This is the state of the vocabulary alignment, and a test asserts that the
 /// set of unclaimed variants is exactly this — so aligning one of them means
 /// editing this list, which is where the reason for the rest stays written down.
-/// The four entries are not alike:
+/// The four entries are three different decisions:
 ///
 /// * `Group` is not missing: a cell of the editor *is* a group of items, so no
 ///   kind has to stand for it.
-/// * `SkewedFraction`, `Cancel` and `Primes` are real gaps: `a/b`,
-///   `cancel(x)`/`strike(x)` and `x'` are kept as `Raw` source text today.
+/// * `SkewedFraction` is deliberately not modelled. Typst keeps `a/b` and
+///   `frac(a, b)` apart; the editor writes both as `frac(a, b)`, and typing `/`
+///   opening a fraction directly is the handier behaviour of the two.
+/// * `Cancel` and `Primes` are real gaps: `cancel(x)`/`strike(x)` and `x'` are
+///   kept as `Raw` source text today. `Primes` would only cover the five-and-up
+///   case anyway — `PrimesItem`'s own comment says so, and one to four primes
+///   are plain glyphs.
+///
+/// `Sqrt` and `Root` both claiming `Radical` is the opposite decision and is
+/// deliberate too: Typst models a square and an nth root as one item with an
+/// optional index, the editor keeps two kinds because their slots differ, and
+/// merging them would make the caret reach an empty index cell in a square root.
 pub const UNMODELLED: &[&str] = &["Cancel", "Group", "Primes", "SkewedFraction"];
 
 /// The spacing class of a single character, in the ported LyX numbering.
@@ -563,7 +573,7 @@ mod tests {
     fn typst_math_kinds() -> Vec<&'static str> {
         const SOURCE: &str = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/vendor/typst/crates/typst-library/src/math/ir/item.rs"
+            "/../../vendor/typst/crates/typst-library/src/math/ir/item.rs"
         ));
         let at = SOURCE.find("pub enum MathKind<").expect("vendored Typst 仍应声明 MathKind");
         let body = &SOURCE[at..];

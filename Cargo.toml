@@ -1,3 +1,16 @@
+[workspace]
+members = ["crates/core"]
+# Without this, a bare `cargo test` at the root tests only the root package and
+# the kernel's own unit tests would silently stop running.
+default-members = [".", "crates/core"]
+# Cargo pulls every path dependency inside the workspace directory in as a member.
+# The vendored Typst tree is a workspace of its own (`vendor/typst/Cargo.toml`
+# carries the `[workspace.package]` its crates inherit) and the adapter is its
+# own workspace too, so both have to be excluded or they are re-parented here and
+# lose the manifest fields they inherit.
+exclude = ["vendor/typst", "native-adapter"]
+resolver = "3"
+
 [package]
 name = "visual-typst"
 version = "0.1.0"
@@ -5,15 +18,15 @@ edition = "2024"
 license = "GPL-2.0-or-later"
 publish = false
 
-[lib]
-name = "visual_typst_core"
-crate-type = ["rlib"]
-
-[[bin]]
-name = "visual-typst"
-path = "src/main.rs"
-
+# The host: everything that talks to the outside world. `src/lib.rs` is the
+# `visual_typst` library the tests use, `src/main.rs` the `visual-typst` binary —
+# both are cargo's defaults, so neither needs a table here.
+#
+# The editing kernel lives in `crates/core`. It depends on this crate in no way,
+# and the split exists so that stays true: a frontend, a transport or a file
+# feature can be changed without opening the kernel.
 [dependencies]
+visual-typst-core = { path = "crates/core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 typst-syntax = { path = "vendor/typst/crates/typst-syntax" }
@@ -21,9 +34,6 @@ url = "2"
 ureq = "3"
 flate2 = "1"
 tar = "0.4"
-
-[build-dependencies]
-serde_json = "1"
 
 [profile.release]
 opt-level = "s"

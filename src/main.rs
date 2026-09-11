@@ -7,10 +7,10 @@
 //! window that started it, which is also why the two modes are private pipes.
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match std::env::args().nth(1).as_deref() {
-        Some("--desktop-core") => visual_typst_core::desktop::serve(),
+        Some("--desktop-core") => visual_typst::desktop::serve(),
         Some("--stdio") => {
             let workspace = std::env::args_os().nth(2).map(std::path::PathBuf::from).ok_or("Missing workspace")?;
-            visual_typst_core::rpc::serve(workspace)
+            visual_typst::rpc::serve(workspace)
         }
         _ => Err("用法：visual-typst --desktop-core | --stdio <工作目录>".into()),
     }

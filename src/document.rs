@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Source is authoritative. Exactly one reusable structural editing session.
-use crate::{Action, Editor, math::*, typst};
+use visual_typst_core::{Action, Editor, math::*, typst};
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 use typst_syntax::{Source, SyntaxKind, SyntaxNode};

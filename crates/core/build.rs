@@ -1,8 +1,17 @@
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
+/// `config/symbols.json` belongs to the repository, not to this crate, so it is
+/// addressed from the manifest directory. The build script runs with the crate
+/// root as its working directory, which is one level deeper than it used to be.
+fn symbols_json() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/symbols.json")
+}
+
 fn main() {
-    println!("cargo:rerun-if-changed=config/symbols.json");
-    let input = fs::read_to_string("config/symbols.json").expect("无法读取 config/symbols.json");
+    let input_path = symbols_json();
+    println!("cargo:rerun-if-changed={}", input_path.display());
+    let input = fs::read_to_string(&input_path)
+        .unwrap_or_else(|error| panic!("无法读取 {}：{error}", input_path.display()));
     let entries: BTreeMap<String, String> = serde_json::from_str(&input)
         .expect("config/symbols.json 必须是源码片段到显示字符串的 JSON 字典");
     let mut generated = String::from("pub const SYMBOLS: &[(&str, &str)] = &[\n");

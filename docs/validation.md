@@ -1107,6 +1107,65 @@ pub const UNMODELLED: &[&str] = &["Cancel", "Group", "Primes", "SkewedFraction"]
 
 改动文件：`src/slots.rs`、`src/math.rs`、`src/cursor.rs`、`src/typst.rs`、`src/view.rs`、`tests/command_mode.rs`、`tests/structured_input.rs`、`docs/architecture.md`、`docs/rust-for-cpp.md`、`docs/rust-book-walkthrough.md`、`docs/validation.md`。
 
+## 分层：内核与外围 · 2026-09-11
+
+`Kind` 与 Typst 词汇对齐之后要动的是引擎侧的数据通道；在那之前先把代码分层，因为后面的每一步都要先知道"这一改动归内核还是外围"。
+
+### 改了什么
+
+拆成两个 crate，五个内核模块搬进 `crates/core/`：
+
+| 层 | crate | 内容 |
+| --- | --- | --- |
+| 内核 | `visual-typst-core`（`crates/core/`） | `math`、`slots`、`typst`、`cursor`、`view` |
+| 外围 | `visual-typst`（仓库根，lib + `visual-typst` 二进制） | `document`、`desktop`、`rpc`、`services`、`packages`、`workspace` |
+
+搬动之前先把 `use crate::` 全梳了一遍，结论是**内核本来就已经闭合**：`math ↔ slots`、`typst → math/slots`、`cursor → math/slots/typst`、`view → cursor/math/slots/typst`，五个模块谁也不引用 `document`/`services` 等任何一个。所以这一轮只差一道边界，没有解环工作。
+
+### 边界是编译器守的，不是文档写的
+
+在 `crates/core/src/lib.rs` 里加一行 `use visual_typst::document as _;` 实测：
+
+```
+error[E0432]: unresolved import `visual_typst`
+  --> crates\core\src\lib.rs:29:5
+   |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `visual_typst`
+```
+
+还原后通过。这就是把内核做成独立 crate（而不是一个模块）的全部理由——`pub(crate)` 拦不住内核文件伸手去够外围文件。
+
+### 两个 cargo 陷阱，都是实测撞上的
+
+1. **工作区会把路径依赖自动收成成员。** 加了 `[workspace] members = ["crates/core"]` 之后构建直接失败：`vendor/typst/crates/typst-syntax` 被拽进我们的工作区，于是它 `edition = { workspace = true }` 去继承**我们的** `[workspace.package]`——那里没有 `edition`。而 vendored 的 Typst 是自带工作区的（`vendor/typst/Cargo.toml` 里就写着 `[workspace.package] edition = "2024"`）。加 `exclude = ["vendor/typst", "native-adapter"]` 后正常。
+2. **裸 `cargo test` 只测根包。** 分层后总数从 121 掉到 111——差的那 10 个正是内核自己的 `slots` 单元测试，它们静默地不跑了。加 `default-members = [".", "crates/core"]` 后总数回到 **121**（分层前 121）。这条写进根 `Cargo.toml` 的注释里，因为它只会在"测试变少了但没人注意"的时候咬人。
+
+### 顺带修掉的路径
+
+- `crates/core/build.rs` 原来按相对路径读 `config/symbols.json`（构建脚本的 CWD 是包根，现在深了一层），改成从 `CARGO_MANIFEST_DIR` 定位；`cargo:rerun-if-changed` 同步。
+- `crates/core/src/slots.rs` 里那条"从 vendored 源码扫出 `MathKind` 变体名"的测试用 `include_str!` + `CARGO_MANIFEST_DIR`，路径要写成 `../../vendor/...`。**它没被漏掉，正是因为它用绝对路径拼接**——如果当初写的是相对路径，这里会静默指向不存在的文件。
+- 测试里跨两个 crate 的引用要分开（`tests/desktop.rs`、`tests/document.rs`、`tests/macro_scope.rs`、`tests/services.rs`、`tests/workspace.rs`）：内核项来自 `visual_typst_core`，外围项来自 `visual_typst`。其余 8 个测试文件只引用内核，一个字没改。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **121 通过 / 5 忽略**（与分层前同数；两个 lib 的单元测试都在跑） |
+| `python -m unittest desktop.test_desktop` | **72 通过** |
+| 线上形状 | `python tools/kind_inventory.py` 复跑，18 个用例的视图与 `docs/kind-inventory.md` 一致（`parameter`/`template-call` 仍为 0 次） |
+| 内核→外围 | 变异检查：加 `use visual_typst::…` 编译失败，还原后通过 |
+| 交付路径 | `target/server/release/visual-typst.exe` 路径与二进制名未变，`build-desktop.cmd` 与 `desktop/bridge.py` 无需改 |
+
+**桌面套件需要更宽的文件权限**：在 `workspace-write` 沙箱下 72 个用例里 66 个报 `QProcess: CreateFile failed. (拒绝访问。)`——是沙箱拦了 QProcess 的命名管道，核心进程根本没起来（`window.py:169` 的 `set_source` 因此失败）。这不是代码问题，用 `danger-full-access` 跑同一条命令即 72 全过。
+
+### 已确认、下一步要做的一件事
+
+**`Number` 只允许至多一个点号**，两条独立规则各自保证：词法上从数字开头只试探性吃一个点、且点后必须还有数字（`lexer.rs:789-807`），解算上 `resolve_text` 要求 `decimal_count <= 1` 且至少一个数字（`resolve.rs:302-308`）。两处不一致的地方也查清了：`MathTextKind::get` 用的是 `is_numeric()`（含 `²`、阿拉伯数字等），而 `resolve_text` 用的是 `is_ascii_digit()`——所以要 1:1 对齐 `MathKind::Number`，解析端必须照**解算**那条，否则 `²3` 会被我们当成 Number、被引擎当成 Text。
+
+据此刻定的行为：普通模式 `.` 走普通字符（`123<光标>456` 输入 `.` → `123 . 456`），数字并入相邻 `Number` 是无条件的（`123.456<光标>` 输入 `7` → `123.4567`），命令模式走解析器、解析出什么就是什么（`<\>123.456<回车>` → `123.456`）。
+
+改动文件：新增 `crates/core/`（`Cargo.toml`、`build.rs`、`src/lib.rs`，以及搬入的 `math.rs`/`slots.rs`/`typst.rs`/`cursor.rs`/`view.rs`）、`tools/kind_inventory.py`、`tools/engine_boxes.py`、`docs/kind-inventory.md`；改 `Cargo.toml`、`Cargo.lock`、`src/lib.rs`、`src/main.rs`、`src/document.rs`、`src/desktop.rs`、`src/services.rs`、`tests/{desktop,document,macro_scope,services,workspace}.rs`、`docs/{architecture,kind-inventory,rust-book-walkthrough}.md`。
+
+
 
 
 

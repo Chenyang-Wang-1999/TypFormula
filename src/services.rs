@@ -141,7 +141,7 @@ impl Lsp {
 #[derive(Deserialize)]
 pub struct CompletionRequest { pub source: String, pub start: usize, pub end: usize, pub caret: usize }
 #[derive(Serialize)]
-pub struct CompletionReply { pub engine: &'static str, pub items: Vec<crate::cursor::CommandCompletion> }
+pub struct CompletionReply { pub engine: &'static str, pub items: Vec<visual_typst_core::cursor::CommandCompletion> }
 #[derive(Deserialize, Serialize)]
 pub struct RenderRequest { #[serde(default)] pub preview: bool, #[serde(default)] pub pdf:bool, #[serde(default)] pub overlays: std::collections::HashMap<String,String>, #[serde(default="default_path")] pub path: String, pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange>, #[serde(default)] pub preview_hashes:Vec<String>,
     /// Render the requested fragments on a source cut after this byte offset.
@@ -293,7 +293,7 @@ impl Services {
                 let Some((text, cursor)) = (if item["insertTextFormat"].as_u64() == Some(2) { snippet_text(text) } else { Some((text.to_string(), text.len())) }) else { continue; };
                 let mut replacement = req.source[req.start..req.end].to_string();
                 replacement.replace_range(start-req.start..end-req.start, &text);
-                items.push(crate::cursor::CommandCompletion { label: label.into(), replacement, caret: start-req.start+cursor });
+                items.push(visual_typst_core::cursor::CommandCompletion { label: label.into(), replacement, caret: start-req.start+cursor });
             }
         }
         let prefix = req.source[req.start..req.caret].rsplit(|c:char| !c.is_alphanumeric() && c != '_' && c != '-').next().unwrap_or("");

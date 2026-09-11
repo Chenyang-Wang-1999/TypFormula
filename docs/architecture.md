@@ -45,6 +45,24 @@ Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`�
 
 Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 UTF-16。所有跨层转换集中于 `desktop/model.py`（`to_byte`/`from_byte`/`u16`/`from_u16`/`lsp_position`）和 `src/services.rs`。LSP 返回替换范围后检查边界与重叠；异步请求返回时核对源码版本和文件身份，避免过期结果写入当前文档。
 
+## 分层：内核与外围
+
+代码分两个 crate，边界由 **cargo** 强制，不靠约定——`pub(crate)` 拦不住"内核文件伸手去够外围文件"，crate 边界可以。
+
+| 层 | crate | 内容 | 依赖 |
+| --- | --- | --- | --- |
+| 内核 | `visual-typst-core`（`crates/core/`） | `math`（可编辑树）、`slots`（每个 `Kind` 的唯一一张声明表）、`typst`（解析与回写）、`cursor`（`Editor` 与全部编辑动作）、`view`（交给前端的形状） | 只有 `typst-syntax` + serde |
+| 外围 | `visual-typst`（仓库根） | `document`（源码即权威）、`desktop`/`rpc`（两条私有管道）、`services`/`packages`/`workspace`（进程、网络、路径）、`visual-typst` 二进制 | 内核 + std/网络/压缩 |
+
+方向是单向的：外围可以依赖内核，内核**不能**依赖外围。这条不是纸面规则：在 `crates/core/src/lib.rs` 里写 `use visual_typst::…` 会编译失败（`unresolved import`，实测）。所以"只改外围、不动内核"是编译器保证的——加一个新前端、新传输或新文件功能时，内核的五个模块不需要打开。
+
+内核里**不许出现**的东西（出现就说明该往上挪）：`std::process`、`std::fs`、网络、任何"传输/协议"形状的类型。给它定量身标准会更清楚：内核只回答两件事——**这棵树是什么**，以及**它该怎么写成 Typst**。
+
+两处容易踩的坑，写在根 `Cargo.toml` 里：
+
+- cargo 会把工作区目录内**所有路径依赖**自动收成成员，所以 `vendor/typst`（自带 `[workspace.package]`，它的 crate 靠继承）和 `native-adapter`（自己就是工作区）必须 `exclude`，否则会被重新认亲、丢掉它们继承的字段。
+- 不写 `default-members = [".", "crates/core"]` 的话，根目录下裸跑 `cargo test` 只测根包，**内核自己的单元测试会静默不跑**。实测加上它以后总数与分层前一致（121 通过 / 5 忽略）。
+
 ## 后端
 
 后端没有网络端口：`visual-typst --stdio <目录>` 由窗口启动，请求按 id 匹配回包，`src/rpc.rs` 每请求分发一个线程，`Services` 通过互斥量共享，因此整页编译不会把公式取图和语言请求排在它后面。项目目录由启动参数指定，窗口把当前文档所在目录作为编译根；`src/workspace.rs` 用规范化路径限制项目边界，任何越界或含父级步骤的路径都被拒绝。
@@ -57,7 +75,7 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 
 ## 槽位模型
 
-`math::MathAtom` 只保存实例数据（几列、有哪个脚标）；一个节点的**格子含义、视图名、Typst 拼写、所对应的 Typst 构造与导航规则**集中在 `src/slots.rs` 的唯一一张表里，由穷尽 `match` 的 `Kind::decl()` 声明 9 项：`view`、`typst`、`slots`、`arity`、`entry`、`horizontal`、`vertical`、`class`、`write`。`entry_cell` / `math_class` / `idx_horizontal` / `cursor::vertical` / `view_atom` / `write_atom` 全部读这张表，不再各自 `match Kind`——加一个 `Kind` 时编译器会要求把这几件事一次说清。
+`math::MathAtom` 只保存实例数据（几列、有哪个脚标）；一个节点的**格子含义、视图名、Typst 拼写、所对应的 Typst 构造与导航规则**集中在 `crates/core/src/slots.rs` 的唯一一张表里，由穷尽 `match` 的 `Kind::decl()` 声明 9 项：`view`、`typst`、`slots`、`arity`、`entry`、`horizontal`、`vertical`、`class`、`write`。`entry_cell` / `math_class` / `idx_horizontal` / `cursor::vertical` / `view_atom` / `write_atom` 全部读这张表，不再各自 `match Kind`——加一个 `Kind` 时编译器会要求把这几件事一次说清。
 
 `typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个 `decl` 可以认领 0 个（编辑器专有：`MacroCall`/`TemplateCall`/`Parameter`/`Unknown`）、1 个或多个（`Raw` 认领 `Box`/`Mathml`/`External`；`Sqrt` 与 `Root` 都认领 `Radical`；`Decoration` 认领 `Accent` 与 `Line`）。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何 `Kind` 认领的变体"恰好等于 `slots::UNMODELLED`——即 `Cancel`、`Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一个就必然要改那张表，并在那里写下为什么其余几个还没做。`view` 名与变体名**故意不同**（`Kind::Fenced` 的排布名仍是 `delim`）：排布名是给前端的绘图契约，只在画法变化时才需要改。
 
@@ -71,6 +89,8 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 视图节点还带一个 `role`：父节点声明的**槽位角色**（`numerator`/`denominator`/`base`/`upper`/`lower`/`radicand`/`index`/`inner`/`cell`/`arg`）。前端 `mathview.py` 按角色取子节点，位置只作回退，所以一个复用已有排布与角色的新 `Kind` 不需要改前端。前端另有一张 `ARRANGEMENTS` 白名单：遇到不认识的排布**报告一次**（经 `Typesetter.warn` 到状态栏），而不是静默按横排画错。
 
 回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 13 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符。
+
+每个 `Kind` 实际给前端提供了什么、对应的引擎 item 又有什么、两者差在哪，逐条列在 `docs/kind-inventory.md`（从真实后端与真实适配器取回，不是读代码推的）。
 
 ## 整页预览
 

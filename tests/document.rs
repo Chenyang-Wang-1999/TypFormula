@@ -1,4 +1,4 @@
-use visual_typst_core::document::Document;
+use visual_typst::document::Document;
 use serde_json::json;
 fn load(source:&str)->Document {let mut doc=Document::default();doc.apply(json!({"action":"set_source","source":source})).unwrap();doc}
 #[test]
