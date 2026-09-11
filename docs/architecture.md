@@ -67,7 +67,7 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 两处容易踩的坑，写在根 `Cargo.toml` 里：
 
 - cargo 会把工作区目录内**所有路径依赖**自动收成成员，所以 `vendor/typst`（自带 `[workspace.package]`，它的 crate 靠继承）和 `native-adapter`（自己就是工作区）必须 `exclude`，否则会被重新认亲、丢掉它们继承的字段。
-- 不写 `default-members = [".", "crates/core"]` 的话，根目录下裸跑 `cargo test` 只测根包，**内核自己的单元测试会静默不跑**。实测加上它以后总数与分层前一致（121 通过 / 5 忽略）。
+- 不写 `default-members = [".", "crates/core"]` 的话，根目录下裸跑 `cargo test` 只测根包，**内核自己的单元测试会静默不跑**。实测加上它以后总数与分层前一致（当时 121 通过 / 5 忽略；数字随后续工作增长，写文档时是 129 通过 / 5 忽略）。
 
 ## 后端
 
@@ -79,17 +79,151 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 
 `/api/render` 和 `/api/attachments` 使用正式版自己的 native-adapter。数学 IR 标签桥接保存在 `vendor/typst`；构建不再准备原型引擎或修改其他目录。源码、资源与缓存失败不影响代码区继续输入。
 
+## 一个公式怎么变成可编辑的树
+
+这一节把"哪一层知道什么"写成一条链，因为分界线不明显，读代码时很容易把 `parse_atom` 的分支结构误当成 Typst 的分层结构。**一条公式里能成为可编辑节点的构造，只有两个来源：Typst 的语法节点，或者 `config/commands.json` 里的名字。**
+
+### 来源一：语法节点（parser 直接给出，与名字无关）
+
+`typst-syntax` 的 parser 里，mathematical operator 带优先级，会被折成**专门的节点**（`parser.rs:404` 的 `math_op`）：
+
+| 源码 | 节点 | `typst.rs` 的分支 |
+| --- | --- | --- |
+| `1/2` | `MathFrac` | `:541` |
+| `x_1`、`x^2`、`x'` | `MathAttach` | `:542` |
+| `∛x`、`∜x` | `MathRoot` | `:550` |
+| `(a + b)`、`[x]` | `MathDelimited` | `:555` |
+| `&`、`\` | `MathAlignPoint`、`Linebreak` | `:494`（`parse_cell` 预处理） |
+
+`math_op` 把 `/` 映射到 `MathFrac`、`_`/`^` 映射到 `MathAttach`，**按算符形态判定，完全不查名字**。所以 `1/2` 是分式这件事，parser 自己就知道。
+
+### 来源二：名字表（parser 给不出，只能查配置）
+
+`parser.rs:281-284` 是另一条路：
+
+```rust
+if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
+    math_args(p);
+    p.wrap(m, SyntaxKind::MathCall);
+}
+```
+
+规则只有一句：**一个 `MathIdent` 后面紧跟 `(`（`directly_at`，中间不许有空格），就包成 `MathCall`**。不查名字、不查作用域。所以 `frac(...)`、`vec(...)`、`cancel(...)`、`foo(...)` 在这一层**型别完全相同**——`MathCall` 只断言"有个标识符被调用了"，不回答"它是什么"。
+
+那"它是什么"在哪回答？在 **`typst-eval`**：把 callee 求值成作用域里的 `Func`，实参求值成 `Content`，得到 `Content::Elem(FracElem{…})`。**`MathKind` 还要更晚**：它是布局期的中间表示，`resolve_equation` 的调用点全在 `typst-layout`（`math/mod.rs:68`、`:123`）和 `typst-html`（`rules.rs:824`），`typst-library/src/math/ir/mod.rs:23` 只提供函数本身。到那里才由 `resolve.rs:197` 起的一长串 `to_packed::<FracElem>()` / `to_packed::<CancelElem>()`（`:222`）按**元素类型**分派。
+
+**所以内核拿不到它。** `visual-typst-core` 只依赖 `typst-syntax`，`typst-eval`/`typst-library`/`typst-layout` 只有 `native-adapter` 那一侧才链接。名字→结构这件事必须由内核自己回答，`config/commands.json` 就是那个答案：
+
+```
+"frac(1, 2)"
+   ├─ typst-syntax : MathCall{callee:"frac", args:[1, 2]}   ← 调用结构与参数范围
+   └─ parse_atom   : 查表 → Kind::Fraction，两个参数各自 parse_cell  ← 名字表给的答案
+```
+
+### 由此得到的三条判断
+
+1. **`commands.json` 不是识别机制，是识别机制的补充。** 它只管"写成调用形式的构造"。`frac(1,2)` 不在表里会退成 `Raw`，但 `1/2` 仍然可编辑——同一种排版有两条入口，只有一条依赖这张表。
+2. **表里删一项的后果，`tests/round_trip.rs` 测不出来。** 删掉 `"frac"` 后 `frac(1,2)` 变 `Raw`，而 `Raw` 保留原文、往返照样成立。这类改动只有直接断言 `Kind` 的用例才有牙（对照 `math::is_number` 的单元测试：外部来源的规则，往返测试看不见）。
+3. **要拿真实 `MathKind` 就绕不开跑一遍 layout。** 这不是选型问题，是 `resolve_equation` 的位置决定的——`native-adapter` 与 `tools/engine_boxes.py` 都因此必然在布局路径上。
+
+### 三张表的边界（当前的已知缺口）
+
+| 名字 | 引擎里有对应元素 | 表里有名字 | 结果 |
+| --- | --- | --- | --- |
+| `frac`（调用写法） | `FracElem` | 是 | `Kind::Fraction` |
+| `mat`、`hat`、`overline` | `MatElem`/`AccentElem`/`OverlineElem` | 是 | 结构节点 |
+| `cancel`、`strike` | `CancelElem` | **否** | `Raw`，引擎自己画（`MathKind::Cancel` 未建模） |
+| `vec` | `VecElem` | **否** | `Raw`。**注意 `VecElem` 是 define 过的**（`math/mod.rs:68`），所以引擎确实把它解析成列向量；内核不认它只是因为表里没有 |
+
+最后一行的细节值得留一句：`VecElem::resolve_vec`（`resolve.rs:1018`）把**每个参数各包成一行**（`map(|child| vec![child])`）再交给 `resolve_cells`，所以 `vec(1,2,3)` 与 `mat(1;2;3)` 排版逐字节相同。这是元素自己的固定行为，与逗号/分号的分列语义无关——前一版文档若把它解释成"逗号分隔却要换行"，那是错的。
+
+### `MathIdent` 查的是两张表，不是一张
+
+上面讲的 `commands.json` 只接住**调用**（后面有 `(`）。一个**裸标识符**走的是另一条路，而且中间还要先过宏作用域：
+
+```
+$RR$  →  MathIdent("RR")
+   ├─ ① parse_atom:532   ctx.is_bound("RR")?        ← 宏/定义作用域（不是配置）
+   │       否 → 继续
+   ├─ ② node.cast::<ast::Expr>()  → MathIdent 不 cast 成任何 Expr → 落到 :643 的 `_`
+   └─ ③ :645   symbol("RR")?                        ← config/symbols.json
+           ├─ 命中 → Kind::Symbol { name, glyph }
+           └─ 未命中 → MathAtom::from_source → 又查一次 symbol() → Kind::Raw
+```
+
+所以"名字→结构"一共有**三处**入口，容易混成一处：
+
+| 入口 | 表 | 命中后 | 未命中后 |
+| --- | --- | --- | --- |
+| 裸标识符，先 | 宏作用域（`definitions` 里的 `#let`） | `MacroCall`（可展）或 `Raw`（不可展） | 继续查符号表 |
+| 裸标识符，后 | `config/symbols.json`（40 项） | `Kind::Symbol` | `Kind::Raw` |
+| 调用 `name(...)` | `config/commands.json`（9 项） | 结构命令的 `Kind` | `Kind::Raw` |
+
+**`Symbol` 不是 `Char`**，这一点常被含混过去：`Kind::Symbol` 的载荷是 `{name, glyph}`，`name` 保留源名、`glyph` 只用于显示（`view.rs`把它放进 `display_glyph`），回写走 `Write::OwnText` 写的是 **`name`** ——所以 `alpha` 存盘回来还是 `alpha`，不会变成 `𝛼`。真正"拆成字符"的是单字母的 `MathText`：`$R$` 是 `Char{text:"R"}`，而 `$RR$` 是 `MathIdent` 整体落 `Raw`（多字母标识符是一个节点，**不是**两个 `MathText`，所以那条 `graphemes` 拆分不会碰它）。
+
+| 输入 | 节点 | Kind | 回写 |
+| --- | --- | --- | --- |
+| `$R$` | `MathText` | `Char{text:"R"}` | `R` |
+| `$alpha$` | `MathIdent` | `Symbol{name:"alpha", glyph:"𝛼"}` | `alpha` |
+| `$RR$` | `MathIdent` | `Raw{source:"RR"}` | `RR` |
+| `$RRR$` | `MathIdent` | `Raw`（引擎侧 `unknown variable: RRR`） | `RRR` |
+
+`$RR$` 落在最后一行**不是错误**：`RR` 在引擎里是一个符号（黑板粗体 ℝ，`style.rs:150` 的文档自己写着 `bb(N) = NN`），实测 24pt 下 `RR` 与 `bb(R)` 盒子逐字节相同（都是 17.328），而单个斜体 `R` 是 18.792、`R R` 是 37.584。它成 `Raw` 只是因为 `symbols.json` 这 40 项没收它——与 `cancel`/`vec` 是**两级不同的缺口**：`cancel` 是引擎有元素、编辑器没有 `Kind`；`RR` 是引擎有符号、符号表没收录。共同点是都只剩 `Raw` 这一条退路（保留原文，引擎自己画，编辑器内部无结构）。
+
+## 两棵树：可编辑树与显示树
+
+宏调用最容易被误解的一点，是"显示时展开、回写时不展开"看起来需要一个判断。**实际上没有那个判断**——展开产物从一开始就不在被回写的那棵树里。
+
+| | 可编辑树 `MathData` | 显示树 `View` |
+| --- | --- | --- |
+| `MacroCall` 是什么 | `{name, cells}`——只有名字和实参 | 展开后的模板 |
+| 模板从哪来 | **不存** | 每次 `response()` 从注册表现取 |
+| 谁读它回写 | `write_atom` → `Write::Named` | 没人读 |
+| 生命周期 | 作者编辑、撤销、存盘 | 一次回复 |
+
+```
+MathData:  MacroCall { name: "twice", cells: [x] }        ← 唯一权威
+                │  view_atom (view.rs:117) 现算
+                ▼
+View:      macro
+             ├─ template = view_cell(&def.template)      ← 从注册表取，不在节点里
+             └─ bind_template: 把 Parameter{index} 换成实参 View 的克隆
+```
+
+四步机制，缺一不可：
+
+1. **回写只认名字和实参**（`typst.rs:776`）：`Write::Named` 拼 `format!("{name}({})", joined(&atom.cells))`；公式常量那种 `function: false` 连括号都不写，直接 `name`。**模板不在节点里**，所以"要不要写出来"这个问题不存在。
+2. **展开是读取时现算**（`view.rs:117`）：`registry.get(name)` 拿定义，节点存名字、注册表存定义——与 `Symbol{name,glyph}`、`Accent{name}` 同一个模式：节点存"指向什么"，内容存在别处。
+3. **绑定就是替换占位符**（`view.rs:226`）：模板里的 `Parameter{index}` 换成调用点实参 View 的 `cloned()`；**克隆一份给显示，原实参仍在 `cells[0]`**。
+4. **嵌套调用递归替换**（`view.rs:239`）：`TemplateCall{definition}` 按**定义版本号**取模板再整体替换，所以后面的同名定义不会改变早先宏的捕获。
+
+三个让这件事安全的细节：`def.template` 是 `Arc<MathData>`（`typst.rs:39`），模板只有一份、N 个调用点共享，`View` 那一侧才克隆；**参数个数不符就不展开**（`view.rs:124` 要求 `def.params.len() == atom.cells.len()`），定义中途变了就退化成 `macro-collapsed` 显示原文而不是错位展开；**展开有 4096 的上限**（`PROJECTION_LIMIT`），递归宏退回同样的折叠显示。
+
+**由此看清三类构造处在三种状态**：
+
+| | 底层存什么 | 显示 | 谁展开 |
+| --- | --- | --- | --- |
+| 可展宏 `twice(x)` | `MacroCall{name, cells}` | 模板 + 实参 | 内核（`view.rs:117`） |
+| 不可展宏 `foo(x)` | `Raw{"foo(x)"}` | 原文，`edit` 进源码 | 无 |
+| 结构命令 `frac(x,y)` | `Fraction{cells}` | 分数排布 | 不适用（形状直接建出来） |
+
+"底层保留函数名、显示时展开"这个统一设想，第一类已经是；第三类不是展开而是**直接建形状**；第二类今天**做不到**，因为 `Raw` 只有一个 `source: String`、**没有名字字段**——要把 `foo` 从 `"foo(x)"` 里切出来只能重新解析那段字符串。这正是 `Raw`（不建模的不透明片段）与 `MacroCall`（有名字有实参）作为两种数据形状的分界。
+
 ## 槽位模型
 
 `math::MathAtom` 只保存实例数据（几列、有哪个脚标）；一个节点的**格子含义、视图名、Typst 拼写、所对应的 Typst 构造与导航规则**集中在 `crates/core/src/slots.rs` 的唯一一张表里，由穷尽 `match` 的 `Kind::decl()` 声明 9 项：`view`、`typst`、`slots`、`arity`、`entry`、`horizontal`、`vertical`、`class`、`write`。`entry_cell` / `math_class` / `idx_horizontal` / `cursor::vertical` / `view_atom` / `write_atom` 全部读这张表，不再各自 `match Kind`——加一个 `Kind` 时编译器会要求把这几件事一次说清。
 
-`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个 `decl` 可以认领 0 个（编辑器专有：`MacroCall`/`TemplateCall`/`Parameter`/`Unknown`）、1 个或多个（`Raw` 认领 `Box`/`Mathml`/`External`；`Sqrt` 与 `Root` 都认领 `Radical`；`Char` 与 `Symbol` 都认领 `Glyph`）。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何 `Kind` 认领的变体"恰好等于 `slots::UNMODELLED`——即 `Cancel`、`Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一个就必然要改那张表，并在那里写下为什么其余几个还没做。`view` 名与变体名**故意不同**（`Kind::Fenced` 的排布名仍是 `delim`）：排布名是给前端的绘图契约，只在画法变化时才需要改。
+`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个 `decl` 可以认领 0 个（编辑器专有：`MacroCall`/`TemplateCall`/`Parameter`/`Unknown`）、1 个或多个（`Raw` 认领 `Box`/`Mathml`/`External`；`Sqrt` 与 `Root` 都认领 `Radical`；`Char` 与 `Symbol` 都认领 `Glyph`）。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何 `Kind` 认领的变体"恰好等于 `slots::UNMODELLED`——即 `Cancel`、`Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一个就必然要改那张表，并在那里写下为什么其余几个还没做。这四个未建模项与上一节的"名字表"是**两件事**：`Cancel` 已经在引擎里被解析成元素（`resolve.rs:222`），只是编辑器没有它的结构；而 `VecElem` 连这一步都还没走到表里。`view` 名与变体名**故意不同**（`Kind::Fenced` 的排布名仍是 `delim`）：排布名是给前端的绘图契约，只在画法变化时才需要改。
 
 `Char` 的载荷是**一个字形簇**（`String`，不是一个 `char`），因为"字符"与"Unicode 标量"不是一回事：`é` 可能是一个标量也可能是两个，emoji 常是好几个。词法本来就把一个字形簇收进一个节点，`GlyphItem` 也装一个簇——按标量拆会让回写在簇中间插入分隔符，把 `é` 写成 `e ́`。`Kind::Number` 同理是"一个格"，串内字符由 `Write::Run` 连成一个记号。
 
 **命令名在 `config/commands.json` 里**，`crates/core/build.rs` 把它和 `config/symbols.json` 一起生成成 `COMMANDS`/`SYMBOLS` 两张表。文件里的值是 **`Kind` 的 `view` 名**（`frac` → `fraction`、`mat` → `grid`、`hat` → `decoration`），因为视图名是给前端的契约、比 `Kind` 变体名稳定（`Frac` 改名成 `Fraction` 不影响这个文件的意思）。`slots::kind_for_view` 把视图名翻译回 `Kind`。
 
-这条配置只回答一个问题：**"这个名字，编辑器有没有对应的结构"**。它不回答参数个数（那是 `Decl::write` 的拼写里数出来的：`frac({0}, {1})` 是两格）、不回答拼写（也是 `write`）。所以它不是第二张表，而是"编辑器认识哪些命令"这**一个**事实的存放处——`slots.rs` 的两条单元测试把它钉在这里：每个名字必须指向一个真实存在、且视图名与声明一致的 `Kind`，反之每个"命令能建的 `Kind`"也必须有名字。实测改一行配置（`"cancel": "line"`）就能让 `cancel(x)` 从 `Raw` 变成 `line` 节点，不需要动任何 Rust。
+这条配置只回答一个问题：**"这个名字，编辑器有没有对应的结构"**。它不回答参数个数（那是 `Decl::write` 的拼写里数出来的：`frac({0}, {1})` 是两格）、不回答拼写（也是 `write`）。所以它不是第二张表，而是"编辑器认识哪些命令"这**一个**事实的存放处——`slots.rs` 的两条单元测试把它钉在这里：每个名字必须指向一个真实存在、且视图名与声明一致的 `Kind`，反之每个"命令能建的 `Kind`"也必须有名字。
+
+一处不能从配置到达：**`grid` 不在 `kind_for_view` 的可达视图里。** 表格的形状来自它的参数列表（几格一行），只有 `parse_atom` 里 `mat` 自己那条分支知道，所以 `grid` 是**按命令名**豁免的，而不是按视图名。区别有实测意义：按视图名豁免时 `"cases": "grid"` 能通过检查，而这个名字既查不到、也没有解析分支，写回时会带着一个从未被填过的 `columns` 走到 `chunks()` 上。检查因此改成按名字（`slots.rs` 的 `source_built_commands` 白名单，目前只有 `mat`）。
+
+「实测改一行配置（`"cancel": "line"`）就能让 `cancel(x)` 从 `Raw` 变成 `line` 节点」这句要连同上面第三节一起读：**只有调用写法**会被这条路接住，而且把一个名字指向 `line` 是类型上合法、语义上错误的——它会得到一条位置取自 `name == "overline"` 判定的规则线。这正是"配置能改什么"的边界。
 
 这条例外值得说明：`config/` 是仓库的，crate 是 `crates/core/`，所以构建脚本用 `CARGO_MANIFEST_DIR` 定位 `../../config/`，并且把 `cargo:rerun-if-changed` 指到真实文件上，改配置会触发重建。
 
@@ -102,7 +236,7 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 
 视图节点还带一个 `role`：父节点声明的**槽位角色**（`numerator`/`denominator`/`base`/`upper`/`lower`/`radicand`/`index`/`inner`/`cell`/`arg`）。前端 `mathview.py` 按角色取子节点，位置只作回退，所以一个复用已有排布与角色的新 `Kind` 不需要改前端。前端另有一张 `ARRANGEMENTS` 白名单：遇到不认识的排布**报告一次**（经 `Typesetter.warn` 到状态栏），而不是静默按横排画错。
 
-回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 13 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符。
+回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 **15** 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符。
 
 每个 `Kind` 实际给前端提供了什么、对应的引擎 item 又有什么、两者差在哪，逐条列在 `docs/kind-inventory.md`（从真实后端与真实适配器取回，不是读代码推的）。
 
