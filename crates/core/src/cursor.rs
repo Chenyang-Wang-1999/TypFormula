@@ -2,7 +2,7 @@
 // Translated branches from upstream/src/Cursor.cpp and
 // upstream/src/mathed/InsetMathNest.cpp, InsetMathScript.cpp, InsetMathFrac.cpp.
 // Authors of original algorithms are listed in docs/LYX-CREDITS.
-use crate::{math::*, slots::Vertical, typst};
+use crate::{math::*, slots::{self, Vertical, Write}, typst};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -64,6 +64,34 @@ pub struct Editor {
 impl Default for Editor {
     fn default() -> Self { Self { root: vec![], cursor: Cursor::default(), anchor: None, definitions: String::new(), display: true, message: String::new(), completion_index: 0, revision: 0, geometry: vec![], target_x: None, history: vec![], future: vec![], typing: false, lsp_completions: None, failed_previews: HashSet::new(), failed_context: None } }
 }
+/// The shape a new matrix starts with, which is what `mat` builds when it is typed
+/// with no arguments: one row of two columns, the same as `\mat` + Enter has always
+/// given. The full size a *repeating* node ends up at is the author's to grow.
+const NEW_MATRIX_COLUMNS: usize = 2;
+const NEW_MATRIX_ROWS: usize = 2;
+
+/// Give a node built from a bare command name the slots its spelling promises.
+///
+/// `$frac()$` is a fraction with no arguments and `$mat()$` a table with none — both
+/// are exactly what the source says. The editor's `frac` and `mat` mean the other
+/// thing: slots to type into, which is what the factory used to build. A node the
+/// parser already gave cells to is left alone, so `frac(a, b)` is never grown.
+///
+/// The count comes from the **spelling**, so there is no second list of arities:
+/// `frac({0}, {1})` fills two cells, `overline({0})` one, a matrix one row of its
+/// column count, and a delimiter pair the body between its characters.
+fn fill_command_cells(atom: &mut MathAtom) {
+    if !atom.cells.is_empty() { return; }
+    let want = match atom.decl().write {
+        Write::Template(template) => typst::placeholder_indices(template).len(),
+        Write::Positioned { above, .. } => typst::placeholder_indices(above).len(),
+        Write::Matrix => NEW_MATRIX_COLUMNS * NEW_MATRIX_ROWS,
+        Write::Delimited => 1,
+        _ => 0,
+    };
+    for _ in 0..want { atom.cells.push(vec![]); }
+}
+
 impl Editor {
     pub(crate) fn snapshot(&self) -> Snapshot { Snapshot { root: self.root.clone(), cursor: self.cursor.clone(), anchor: self.anchor.clone(), definitions: self.definitions.clone(), display: self.display } }
     pub(crate) fn restore(&mut self, s: Snapshot) { self.root = s.root; self.cursor = s.cursor; self.anchor = s.anchor; self.definitions = s.definitions; self.display = s.display; }
@@ -136,7 +164,7 @@ impl Editor {
         let prefix = prefix.trim();
         if !prefix.chars().all(|c| c.is_alphanumeric() || c == '.') { return vec![]; }
         let registry = typst::macro_registry(&self.definitions);
-        let mut names: Vec<_> = COMMANDS.iter().copied().map(str::to_string)
+        let mut names: Vec<_> = slots::command_names().into_iter().map(str::to_string)
             .chain(registry.entries.iter().filter(|d| d.expandable && !d.shadowed).map(|d| d.name.clone()))
             .filter(|n| n.starts_with(prefix)).collect();
         names.sort(); names.dedup(); names
@@ -390,15 +418,24 @@ impl Editor {
         // is committed as that fragment's source instead of being refused.
         let from_source = self.editing_source();
         let previous_definitions = self.definitions.clone();
-        let name = completion.unwrap_or_else(|| draft.trim().to_string());
+        let name = completion.clone().unwrap_or_else(|| draft.trim().to_string());
         let name = if name == "/" { "frac".to_string() } else { name };
-        let template = name.is_empty() || self.factory(&name).is_some();
-        let parsed = if !cancel && !template {
-            match typst::parse_command(&name, &self.definitions) {
+        // A command *name* typed on its own is read as the call it spells, so `\frac`
+        // + Enter builds a fraction rather than an identifier called `frac`. The test
+        // is `trim`ped but the draft may not carry anything else: `frac ` is a name
+        // with a space, while `frac(a, b)` and `alpha + beta` are bodies and are
+        // parsed exactly as written — which is what keeps a half-typed body
+        // (`frac(a, b`) an error instead of a silent loss. A completion replaces the
+        // whole draft with a name, so it counts as one.
+        let bare_name = (completion.is_some() || draft.trim() == name || draft.trim() == "/")
+            && self.is_callable(&name);
+        let parsed = if cancel || name.is_empty() { None } else {
+            let text = if bare_name { typst::parse_command_invocation(&name, &self.definitions) }
+                else { typst::parse_command(&name, &self.definitions) };            match text {
                 Ok(doc) => Some(doc),
                 Err(error) => { self.message = format!("公式尚未完成：{error}"); return true; }
             }
-        } else { None };
+        };
         let pos = self.cursor.pos - 1;
         let atom = self.data_mut().remove(pos);
         self.cursor.pos = pos;
@@ -418,9 +455,31 @@ impl Editor {
                     a.cells[0].iter().map(typst::write_atom).collect::<String>()
                 } else { typst::write_atom(a) }).collect::<Vec<_>>().join(" ");
                 data = text.chars().map(MathAtom::character).collect();
+                let n = data.len(); self.data_mut().splice(pos..pos, data); self.cursor.pos += n;
+            } else {
+                // A node the parser built has to be *writable*, and that is the one
+                // thing the parser cannot know: `$frac()$` really resolves to a
+                // fraction with no cells, so writing it back would emit `frac()`
+                // instead of the two slots the editor's `frac` means — and worse,
+                // `write_atom` would put the template's own `{0}` into the document.
+                // Filling the cells is what the removed factory did, kept as the one
+                // place a parsed answer becomes an editable node.
+                //
+                // It runs for every draft, not only a bare name: `frac()` and
+                // `frac(a, b)` parse to the same kind, and only the first needs cells
+                // added. `fill_command_cells` leaves a node that already has them
+                // alone, so this is safe for both.
+                for atom in &mut data { fill_command_cells(atom); }
+                let n = data.len(); self.data_mut().splice(pos..pos, data); self.cursor.pos += n;
+                // A lone command node is entered at its first slot, the way a
+                // factory-built one used to be, so `\frac` + Enter leaves the caret
+                // in the numerator. A longer draft leaves the caret after it.
+                if bare_name && n == 1 && !self.data()[pos].cells.is_empty() {
+                    let entry = self.data()[pos].entry_cell(true);
+                    self.push(pos, entry, false);
+                }
             }
-            let n = data.len(); self.data_mut().splice(pos..pos, data); self.cursor.pos += n;
-        } else if from_source && !template {
+        } else if from_source {
             // The draft was opened from a Raw fragment and does not parse as a
             // formula: keep the edited text as that fragment's source, because the
             // source is authoritative and refusing would lose the repair.
@@ -495,8 +554,10 @@ impl Editor {
         match key {
             "Enter" => {
                 if self.quoted_draft() { self.interpret_char('"'); return; }
-                // Built-in exact names still create empty, editable LyX slots.
-                let exact = self.pending().is_some_and(|s| COMMANDS.contains(&s.trim()) || list.iter().any(|name| name == s.trim()));
+                // Built-in exact names still create empty, editable LyX slots; a
+                // macro name comes from the completion list instead.
+                let exact = self.pending().map(str::trim).is_some_and(|s| self.is_command_name(s))
+                    || list.iter().any(|name| Some(name.as_str()) == self.pending().map(str::trim));
                 let single_name = self.pending().is_some_and(|s| !s.trim().is_empty() && s.trim().chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_'));
                 if !exact && single_name {
                     if let Some(label) = list.get(self.completion_index) { self.accept_completion(label); }
@@ -549,20 +610,19 @@ impl Editor {
         }
         self.completion_index = 0;
     }
-    fn factory(&self, name: &str) -> Option<MathAtom> {
-        let registry = typst::macro_registry(&self.definitions);
-        if registry.is_bound(name) {
-            let def = registry.get(name).filter(|d| d.expandable)?;
-            return Some(MathAtom { kind: Kind::MacroCall { name: name.into(), function: def.function }, cells: vec![vec![]; def.params.len()] });
-        }
-        Some(match name {
-            "frac" => MathAtom::nest(Kind::Fraction, 2), "sqrt" => MathAtom::nest(Kind::Sqrt, 1),
-            "root" => MathAtom::nest(Kind::Root, 2), "mat" => MathAtom::nest(Kind::Table { columns: 2 }, 4),
-            "abs" => MathAtom::nest(Kind::Fenced { left: "|".into(), right: "|".into() }, 1),
-            "norm" => MathAtom::nest(Kind::Fenced { left: "‖".into(), right: "‖".into() }, 1),
-            "overline" | "underline" | "hat" | "vec" => MathAtom::nest(Kind::Decoration { name: name.into() }, 1),
-            _ => return None,
-        })
+    /// Was this draft a command name on its own? Only used to decide whether a
+    /// half-typed name may be replaced by the highlighted completion.
+    fn is_command_name(&self, name: &str) -> bool {
+        slots::command_names().contains(&name)
+    }
+    /// Whether a name on its own should be read as the call it spells.
+    ///
+    /// True for a built-in command and for a macro the definitions bind, because both
+    /// name a node the editor can put slots in; a variable or an unknown name is left
+    /// as the text it is.
+    fn is_callable(&self, name: &str) -> bool {
+        self.is_command_name(name)
+            || typst::macro_registry(&self.definitions).get(name).is_some_and(|def| def.expandable)
     }
     fn nice_insert(&mut self, name: &str) {
         if name == "sup" || name == "sub" { self.script(name == "sup"); return; }
@@ -573,29 +633,48 @@ impl Editor {
         }
         let saved = self.take_selection(); self.insert_named(name, saved);
     }
+    /// Put a command in, by handing its spelling to the parser.
+    ///
+    /// There is no second opinion here about what a command builds: `parse_command`
+    /// reads `frac`/`sqrt`/`overline`/`hat`/`mat` … through the same table the
+    /// document goes through, so a command typed in the editor and the same text
+    /// read from the file cannot disagree.
+    ///
+    /// One thing is filled in behind the parser's back, and only one: a node whose
+    /// own spelling promises a placeholder needs that cell to exist, because
+    /// `$frac()$` really resolves to a fraction with no cells and writing it back
+    /// would emit `frac()` instead of the empty slots the author asked for. See
+    /// `slots::Decl::grow_empty`.
     fn insert_named(&mut self, name: &str, saved: MathData) {
-        let Some(mut atom) = self.factory(name) else {
-            let pos = self.cursor.pos;
-            match typst::parse_command(name, &self.definitions) {
-                Ok(doc) => {
-                    let previous = self.definitions.clone();
-                    self.definitions = doc.definitions;
-                    let n = doc.root.len(); self.data_mut().splice(pos..pos, doc.root); self.cursor.pos += n;
-                    self.refresh_definitions(&previous);
-                }
-                Err(error) => {
-                    let n = saved.len(); self.data_mut().splice(pos..pos, saved); self.cursor.pos += n;
-                    self.message = error;
-                }
-            }
-            return;
-        };
-        let active = atom.active();
-        let entry = if active { atom.entry_cell(true) } else { 0 };
-        if active { atom.cells[0] = saved; }
         let pos = self.cursor.pos;
-        self.plain_insert(atom);
-        if active { self.push(pos, entry, false); }
+        // A command with no arguments of its own is read as the call it spells, so
+        // `mat` builds a matrix rather than an identifier called `mat`.
+        let invocation = typst::parse_command_invocation(name, &self.definitions);
+        match invocation {
+            Ok(doc) => {
+                let previous = self.definitions.clone();
+                self.definitions = doc.definitions;
+                let mut data = doc.root;
+                for atom in &mut data { fill_command_cells(atom); }
+                // The caret enters the node when it has a first slot to sit in, which
+                // is what makes a fresh `\frac` land in the numerator whether the
+                // parser supplied the cells (`frac`) or `fill_command_cells` did.
+                let active = data.len() == 1 && data[0].active();
+                if active { data[0].cells[0] = saved; }
+                let n = data.len();
+                self.data_mut().splice(pos..pos, data);
+                self.cursor.pos += if active { 1 } else { n };
+                if active {
+                    let entry = self.data()[pos].entry_cell(true);
+                    self.push(pos, entry, false);
+                }
+                self.refresh_definitions(&previous);
+            }
+            Err(error) => {
+                let n = saved.len(); self.data_mut().splice(pos..pos, saved); self.cursor.pos += n;
+                self.message = error;
+            }
+        }
     }
     // InsetMathNest::script: selection becomes SCRIPT CONTENT, not the base.
     fn script(&mut self, up: bool) {

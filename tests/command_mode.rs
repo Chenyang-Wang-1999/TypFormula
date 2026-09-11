@@ -24,6 +24,38 @@ fn only_enter_parses_spaces_and_parentheses() {
 }
 
 #[test]
+fn a_command_written_with_empty_parentheses_is_writable() {
+    // `\frac` and `\frac()` are both things a reader types, and they must end up the
+    // same way. The parser sees `frac()` as a fraction with *no* cells — correctly,
+    // that is what the source says — so the cells the editor's `frac` promises have
+    // to be filled in before the node enters the tree. Without that, `write_atom`
+    // reaches a template placeholder with no cell behind it and writes the literal
+    // `{0}` into the document, which is corruption rather than a missing feature.
+    //
+    // The check is on the *written* form, because that is what reaches the document:
+    // a tree that is merely odd still round-trips, while a leaked placeholder does not.
+    for (bare, with_parens) in [
+        ("\\frac", "\\frac()"), ("\\sqrt", "\\sqrt()"), ("\\hat", "\\hat()"),
+        ("\\overline", "\\overline()"), ("\\abs", "\\abs()"), ("\\mat", "\\mat()"),
+        ("\\norm", "\\norm()"), ("\\underline", "\\underline()"),
+    ] {
+        let mut plain = Editor::default(); input(&mut plain, bare); key(&mut plain, "Enter");
+        let mut parens = Editor::default(); input(&mut parens, with_parens); key(&mut parens, "Enter");
+        assert!(plain.pending().is_none() && parens.pending().is_none(),
+                "{bare} / {with_parens} 没有提交：{}", parens.message);
+        let written = typst::write_cell(&parens.root);
+        assert_eq!(written, typst::write_cell(&plain.root),
+                   "{with_parens} 与 {bare} 应当得到同一棵树");
+        assert!(!written.contains('{'),
+                "{with_parens} 把模板占位符写进了文档：{written}");
+        // The same document must read back as the same tree, placeholder or not.
+        let mut reread = Editor::default();
+        reread.apply(Action::Import { source: format!("${written}$") }).unwrap();
+        assert_eq!(typst::write_cell(&reread.root), written, "{written} 不能往返");
+    }
+}
+
+#[test]
 fn arrows_edit_inside_draft_and_never_leave_at_boundaries() {
     let mut e = Editor::default(); input(&mut e, "\\α中");
     key(&mut e, "ArrowLeft"); input(&mut e, " + ");

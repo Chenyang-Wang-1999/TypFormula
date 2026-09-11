@@ -182,6 +182,77 @@ class NativeTest(unittest.TestCase):
         runs=[value[0] for kind,_,_,value in box.operations if kind=='text']
         self.assertEqual(runs,list('12.5'))
 
+    def test_a_line_draws_its_rule_on_the_side_it_stores(self):
+        """`LineItem` holds only the position, so the node says which side it is.
+
+        The arrangement must be one this frontend knows, like `number`, or a formula
+        with an overline would report a frontend/backend mismatch; and the two sides
+        have to land differently, which is the point of storing a position instead
+        of a command name.
+        """
+        def lay(source):
+            self.load(source)
+            view=self.window.analysis['formulas'][0]['view']
+            lines=[node for node in self.window.view_nodes(view) if node['kind']=='line']
+            self.window.typesetter.unknown.clear()
+            box=self.window.typesetter.layout(view)
+            self.assertEqual(self.window.typesetter.unknown,set(),source)
+            return lines,box
+        self.load("$x$")
+        base=self.window.typesetter.layout(self.window.analysis['formulas'][0]['view'])
+        # Typst math commands carry no backslash -- `\o` would be an escape -- so
+        # the source spells the command the way the writer does.
+        lines,above=lay("$overline(x)$")
+        self.assertEqual([node['text'] for node in lines],['above'])
+        lines,below=lay("$underline(x)$")
+        self.assertEqual([node['text'] for node in lines],['below'])
+        # A rule above grows the box upwards and lifts the baseline; a rule below
+        # grows it downwards and leaves the baseline where it was.
+        self.assertGreater(above.height,base.height)
+        self.assertGreater(above.baseline,base.baseline)
+        self.assertGreater(below.height,base.height)
+        self.assertAlmostEqual(below.baseline,base.baseline)
+
+    def test_the_box_the_caret_is_in_is_marked_at_its_corners(self):
+        """The reader has to be able to see which box the caret is editing.
+
+        The marking follows the caret's own slices: `frac(a, b)` with the caret in
+        the numerator marks exactly that cell -- not the fraction, not the
+        denominator.
+        """
+        self.load("$frac(a, b) + c$")
+        window=self.window;window.compile_timer.stop()
+        window.activate(window.analysis['formulas'][0]['start'])
+        numerator_stop=next(node for node in window.view_nodes(window.math_state['view'])
+                            if node.get('cursor') and node['cursor']['slices']==[{'atom':0,'cell':0}])
+        window.math_action('click',cursor=numerator_stop['cursor'])
+        view=window.math_state['view']
+        fraction=next(node for node in window.view_nodes(view) if node['kind']=='fraction')
+        numerator,denominator=fraction['children'][:2]
+        # The fraction's own node is marked: the caret's slice chain is
+        # root cell -> fraction atom -> numerator cell, so every box on the way is a
+        # box the caret is inside. What must *not* be marked is a box the caret is
+        # not in -- the denominator is the control here.
+        #
+        # Two marks, not three: the cell that holds the fraction atom is marked when
+        # the marker reaches the atom, and the fraction's box *is* what gets drawn
+        # for that cell in the outer box, so they are one mark, not two.
+        self.assertEqual(len(self.marked_corners(view)),2,"光标路径上的框各一个")
+        self.assertEqual(numerator.get("_active"),True,"分子格被标记")
+        self.assertEqual(fraction.get("_active"),True,"分式也在光标路径上")
+        self.assertIsNone(denominator.get("_active"),"分母格不该被标记")
+        # A move deeper into the formula moves the mark with it.
+        window.math_action('key',key='ArrowDown')
+        view=window.math_state['view']
+        fraction=next(node for node in window.view_nodes(view) if node['kind']=='fraction')
+        self.assertEqual(fraction['children'][1].get("_active"),True,"下键之后标记跟着到分母")
+        self.assertIsNone(fraction['children'][0].get("_active"))
+
+    def marked_corners(self,view):
+        """The boxes whose layout carries a corner mark, as (width, height)."""
+        box=self.window.typesetter.layout(view)
+        return [value for kind,_,_,value in box.operations if kind=='corners']
+
     def service(self,route,body,client=None):
         result=[];loop=QEventLoop();timer=QTimer();timer.setSingleShot(True);timer.timeout.connect(loop.quit)
         def receive(value,error):result.append((value,error));loop.quit()

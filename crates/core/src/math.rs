@@ -4,8 +4,12 @@
 // Lars Gullik Bjønnes, Stefan Schimanski. See docs/LYX-CREDITS.
 use crate::slots::{char_class, Decl, Entry, Horiz};
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 
-mod configured { include!(concat!(env!("OUT_DIR"), "/symbols.rs")); }
+// The symbol table and the command table are both generated from `config/`, by
+// `build.rs`, into one file. `symbols::SYMBOLS` is a sorted source→glyph map;
+// `commands::COMMANDS` maps a command name to a kind's view name (see `slots`).
+pub mod configured { include!(concat!(env!("OUT_DIR"), "/config.rs")); }
 
 pub type MathData = Vec<MathAtom>;
 
@@ -59,13 +63,19 @@ pub struct MathAtom {
 /// * an *opaque* kind stands in for several `MathKind`s the editor keeps as
 ///   source text (`Raw`, and `Fenced`'s delimiters are strings, not items as in
 ///   `FencedItem`);
-/// * a *split* pair is one construct modelled as two kinds, or two constructs
-///   modelled as one (`Sqrt`/`Root` against `Radical`; `Decoration` against
-///   `Accent` and `Line`).
+/// * a *split* kind is one whose one Typst construct the editor models with more
+///   than one node (`Sqrt` and `Root` against `Radical`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Kind {
-    Char { value: char },
+    /// One character, held as a grapheme cluster: Typst's `Glyph`.
+    ///
+    /// `text` is a `String` rather than a `char` because a reader's "character"
+    /// and a Unicode scalar are not the same thing: `é` may be one scalar or two,
+    /// and an emoji cluster is often several. The lexer keeps one cluster in one
+    /// token, and `GlyphItem` holds one cluster too, so keeping one here is what
+    /// stops the writer from putting a separator *inside* a character.
+    Char { text: String },
     Symbol { name: String, glyph: String },
     /// A run of digits with at most one dot: Typst's `Number`.
     ///
@@ -90,12 +100,29 @@ pub enum Kind {
     // `columns` and `row_lengths` are the flat encoding of Typst's
     // `MultilineItem::rows`: the cells are one flat list, padded to `columns`.
     Multiline { columns: usize, row_lengths: Vec<usize> },
-    Decoration { name: String },
+    /// A base with a mark above or below: Typst's `Accent`.
+    ///
+    /// The name is the command that built it (`hat`, `vec`), which is what the
+    /// writer needs; the engine's `AccentItem` carries the resolved mark item
+    /// instead, and derives above/below from the mark's own Unicode class, so the
+    /// position is not stored here.
+    Accent { name: String },
+    /// A base with a rule above or below: Typst's `Line`.
+    ///
+    /// `LineItem` holds nothing but the position, so neither does this: the
+    /// spelling (`overline` or `underline`) follows from it.
+    Line { above: bool },
     Unknown { name: String, saved: MathData, caret: usize, anchor: Option<usize>, original: Option<String> },
 }
 
 impl MathAtom {
-    pub fn character(value: char) -> Self { Self { kind: Kind::Char { value }, cells: vec![] } }
+    /// One character typed by the editor. A single scalar is one cluster.
+    pub fn character(value: char) -> Self { Self { kind: Kind::Char { text: value.to_string() }, cells: vec![] } }
+    /// One character read from source, as the lexer grouped it.
+    pub fn glyph(text: &str) -> Self {
+        debug_assert_eq!(text.graphemes(true).count(), 1, "一个 Char 只能装一个字形簇：{text:?}");
+        Self { kind: Kind::Char { text: text.to_string() }, cells: vec![] }
+    }
     /// One run of digits, from its spelling. `is_number` decides what may be a run.
     pub fn number(text: &str) -> Self {
         Self { kind: Kind::Number, cells: vec![text.chars().map(MathAtom::character).collect()] }
@@ -137,8 +164,9 @@ impl MathAtom {
     pub fn confirm_deletion(&self) -> bool { self.active() }
     pub fn math_class(&self) -> u8 {
         // A character's class follows the character, not the kind, so it is
-        // answered before the table is consulted.
-        if let Kind::Char { value } = self.kind { return char_class(value); }
+        // answered before the table is consulted. For a cluster the first scalar
+        // decides, the way `GlyphItem` reads `default_math_class` off it.
+        if let Kind::Char { text } = &self.kind { return text.chars().next().map_or(0, char_class); }
         self.decl().class
     }
     // InsetMathScript::idxOfScript, ensure, removeScript (same cell ordering).
@@ -206,7 +234,6 @@ pub fn symbol(name: &str) -> Option<&'static str> {
     configured::SYMBOLS.binary_search_by(|(source,_)| source.cmp(&name))
         .ok().map(|i| configured::SYMBOLS[i].1)
 }
-pub const COMMANDS: &[&str] = &["frac", "sqrt", "root", "mat", "abs", "norm", "overline", "underline", "hat", "vec"];
 
 #[cfg(test)]
 mod tests {

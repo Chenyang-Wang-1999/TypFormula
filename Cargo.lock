@@ -880,6 +880,7 @@ dependencies = [
  "serde",
  "serde_json",
  "typst-syntax",
+ "unicode-segmentation",
 ]
 
 [[package]]

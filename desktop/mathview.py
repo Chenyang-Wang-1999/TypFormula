@@ -13,6 +13,44 @@ from .svg import qt_svg
 OBJECT = QTextFormat.UserObject + 1
 OBJECT_ID = QTextFormat.UserProperty + 1
 
+def mark_active_path(view, slices):
+    """Stamp `_active` on the view nodes the caret's slices name.
+
+    A slice is `{atom, cell}` from the root down, so the path is walked the same
+    way the backend names it: into child `cell` of atom `atom`, again for the next
+    slice. A view cell holds stops *and* atoms, so the view children are not the
+    data atoms — the `stop` node whose `cursor.pos` equals `atom` is what marks the
+    atom's place, and the next child is that atom. The box highlight then needs no
+    second walk, and a stale or impossible slice simply marks nothing.
+
+    The nodes are stamped in place for one layout pass: `geometry` is sent back to
+    the core from `refresh`, and an extra key in the view is ignored there.
+    """
+    marks = set()
+    node = view
+    for slice in slices or []:
+        children = node.get("children")
+        if not children: break
+        at = None
+        for index, child in enumerate(children):
+            if child.get("kind") == "stop" and child.get("cursor", {}).get("pos") == slice.get("atom"):
+                at = index
+                break
+        if at is None or at + 1 >= len(children): break
+        node = children[at + 1]
+        marks.add(id(node))
+        cell = node.get("children")
+        if not cell or slice.get("cell", 0) >= len(cell): break
+        node = cell[slice["cell"]]
+        marks.add(id(node))
+    for candidate in _walk(view):
+        if id(candidate) in marks: candidate["_active"] = True
+        else: candidate.pop("_active", None)
+
+def _walk(view):
+    yield view
+    for child in view.get("children", []): yield from _walk(child)
+
 class BitmapCache:
     """Bounded device-pixel cache; SVG paths are interpreted only once.
 
@@ -62,7 +100,7 @@ class Typesetter:
         "char", "symbol", "number", "raw", "text", "unknown", "parameter",
         "draft-text", "draft-placeholder", "draft-caret", "absent", "stop",
         "cell", "empty-cell", "fraction", "sqrt", "root", "script",
-        "grid", "aligned", "delim", "decoration",
+        "grid", "aligned", "delim", "decoration", "line",
         "macro", "macro-argument", "macro-collapsed", "template-call",
     })
 
@@ -192,6 +230,22 @@ class Typesetter:
         return {"kind": "absent", "children": []}
 
     def layout(self, node, factor=1.0, text_mode=False):
+        """Lay one node out and mark the box the caret is in.
+
+        `_active` is stamped by `MathCanvas.refresh` on the nodes along the
+        caret's own path (the slice atoms and their cells), so the marking below
+        needs no second walk and no knowledge of where the caret is.
+        """
+        box = self.layout_node(node, factor, text_mode)
+        if node.get("_active"):
+            # Four corners, not a frame: the editor's boxes sit next to each other
+            # and a full outline would read as one big rectangle around a formula.
+            # The corners say "you are editing this" while leaving the middle of
+            # the box clear for the glyphs.
+            box.operations.insert(0, ("corners", 0, 0, (box.width, box.height)))
+        return box
+
+    def layout_node(self, node, factor=1.0, text_mode=False):
         font, metrics, em, ascent, descent = self.line(factor)
         kind = node.get("kind", "cell")
         children = node.get("children", [])
@@ -323,22 +377,36 @@ class Typesetter:
             x=0
             for part in parts:
                 box.add(part,x,baseline-part.baseline);x+=part.width
-            if kind=="decoration":
-                name=node.get("text","")
-                if name in ("underline","underbrace","underbracket","underparen"):
+            if kind=="line":
+                # `LineItem` holds only the position, so the node says which one it
+                # is instead of naming a command the frontend would decode.
+                if node.get("text")=="below":
                     box.operations.append(("line",0,box.height,(box.width,0)));box.height+=3
                 else:
                     old=box;box=Box(old.width,old.height+5,old.baseline+5);box.add(old,0,5)
-                    if name in ("hat","widehat"):
-                        box.operations.extend([("line",0,4,(box.width/2,-4)),("line",box.width/2,0,(box.width/2,4))])
-                    elif name in ("dot","ddot","dddot"):
-                        dots={"dot":"·","ddot":"··","dddot":"···"}[name]
-                        glyph,draw_font,width=self.run(dots,factor)
-                        box.operations.append(("text",(box.width-width)/2,ascent*.4,(glyph,draw_font,"symbol")))
-                    else:
-                        box.operations.append(("line",0,2,(box.width,0)))
-                        if name in ("arrow","vec"):
-                            box.operations.extend([("line",box.width,2,(-4,-2)),("line",box.width,2,(-4,2))])
+                    box.operations.append(("line",0,2,(box.width,0)))
+            elif kind=="decoration":
+                # A mark above the base. The drawing is chosen by the name, and only
+                # by names the backend can actually produce: `hat`/`vec` are the two
+                # accents its command table accepts (`crates/core/src/cursor.rs`), so
+                # anything else here would be a branch no formula can reach.
+                #
+                # Every accent this backend accepts is an above one. A bottom accent
+                # needs the mark's own metrics, which is the engine-data channel that
+                # does not exist yet, so guessing a lower position would only be wrong
+                # in a different way.
+                #
+                # `vec` is deliberately *not* an arrow: Typst's `vec` is a column
+                # vector (`(x)` over one element), not the accent `arrow`. Drawing an
+                # arrow for it was a guess made when this file was written and it
+                # contradicts the document; the arrow belongs to `arrow(x)`, which the
+                # backend leaves as `Raw` and the engine draws itself.
+                name=node.get("text","") if node.get("text") in ("hat","vec") else ""
+                old=box;box=Box(old.width,old.height+5,old.baseline+5);box.add(old,0,5)
+                if name=="hat":
+                    box.operations.extend([("line",0,4,(box.width/2,-4)),("line",box.width/2,0,(box.width/2,4))])
+                else:
+                    box.operations.append(("line",0,2,(box.width,0)))
         if kind in ('unknown','text'):
             inner=box;box=Box(inner.width+8,inner.height+4,inner.baseline+2)
             mode='string' if kind=='text' or node.get('_string_mode') else 'command'
@@ -375,6 +443,18 @@ class Typesetter:
                 painter.setBrush(Qt.NoBrush)
                 painter.setPen(QPen(QColor("#a9b4c0"),1,Qt.DashLine))
                 painter.drawRect(QRectF(px+.5,py+.5,max(1,width-1),max(1,height-1)))
+            elif kind == "corners":
+                # The box the caret is in, marked at its four corners. Each corner is
+                # two short strokes along the edges: at a small size that reads as a
+                # corner bracket, while a framed rectangle around every nested box
+                # would make a formula look like a table.
+                width,height=value
+                arm=min(4.0,width/2,height/2)
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor("#166ac5"),1.2))
+                for cx,cy,dx,dy in ((0,0,1,1),(width,0,-1,1),(0,height,1,-1),(width,height,-1,-1)):
+                    painter.drawLine(QPointF(px+cx,py+cy),QPointF(px+cx+dx*arm,py+cy))
+                    painter.drawLine(QPointF(px+cx,py+cy),QPointF(px+cx,py+cy+dy*arm))
             elif kind == 'mode':
                 width,height,mode=value
                 painter.setBrush(QColor('#fff8e9' if mode=='string' else '#edf4ff'))
@@ -438,6 +518,7 @@ class MathCanvas(QWidget):
         self.owner.bind_active_raw(state)
         for node in self.owner.view_nodes(state['view']):
             if node.get('kind')=='unknown':node['_string_mode']=state.get('string_mode',False)
+        mark_active_path(state['view'],state.get('cursor',{}).get('slices',[]))
         self.owner.prepare_view(state["view"],state.get("formula_definitions",""),state.get("display",False))
         self.state=state;self.box=self.owner.typesetter.layout(state["view"])
         self.resize(int(self.box.width+12),int(self.box.height+12))

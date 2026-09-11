@@ -12,6 +12,10 @@ description = "The visual-typst editing kernel: model, declarations, parser and 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# One `Char` is one grapheme cluster, which is the unit the Typst lexer keeps
+# together and the unit `GlyphItem` holds. Typst already depends on this, so the
+# kernel gains no new code in the build, only a name it can use.
+unicode-segmentation = "1"
 typst-syntax = { path = "../../vendor/typst/crates/typst-syntax" }
 
 # `build.rs` turns `config/symbols.json` into the symbol table `typst.rs`

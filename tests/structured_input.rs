@@ -8,7 +8,7 @@ fn raw(a:&MathAtom,s:&str){assert!(matches!(&a.kind,Kind::Raw{source} if source=
 /// The spelling of one `Number`: the characters of its single cell.
 fn run(a:&MathAtom)->String{
     assert!(matches!(a.kind,Kind::Number),"{a:?}");
-    a.cells[0].iter().map(|c|if let Kind::Char{value}=c.kind {value.to_string()} else {format!("{c:?}")}).collect()
+    a.cells[0].iter().map(|c|if let Kind::Char{text}=&c.kind {text.clone()} else {format!("{c:?}")}).collect()
 }
 
 #[test]
@@ -55,7 +55,7 @@ fn ordinary_input_keeps_char_nodes_and_only_maps_single_character_display() {
     assert_eq!(typst::write_cell(&e.root),"< = +");
     key(&mut e,"Backspace");assert_eq!(e.root,previous);
     let mut e=command("<=");let symbol=e.root[0].clone();input(&mut e,"+");
-    assert_eq!(e.root[0],symbol);assert!(matches!(e.root[1].kind,Kind::Char{value:'+'}));
+    assert_eq!(e.root[0],symbol);assert!(matches!(&e.root[1].kind,Kind::Char{text} if text=="+"));
     let mut e=Editor::default();input(&mut e,"times");assert_eq!(e.root.len(),5);
     assert!(e.root.iter().all(|a|matches!(a.kind,Kind::Char{..})));
     input(&mut e,"\\times");key(&mut e,"Enter");assert!(matches!(&e.root[5].kind,Kind::Symbol{name,..} if name=="times"));
@@ -146,7 +146,7 @@ fn the_caret_goes_inside_a_number_run() {
     let mut e=load("1234");for _ in 0..3 { key(&mut e,"ArrowRight"); }input(&mut e,"x");
     assert_eq!(typst::write_cell(&e.root),"12 x 34");
     assert_eq!(e.root.iter().map(|a|a.kind.clone()).collect::<Vec<_>>(),
-               vec![Kind::Number,Kind::Char{value:'x'},Kind::Number]);
+               vec![Kind::Number,Kind::Char{text:"x".into()},Kind::Number]);
     assert_eq!(e.cursor.pos,2,"the caret stays where the user put it");
     // A character that opens a structure keeps its own rule at the split point.
     // `/` takes the atom on its left as the numerator and moves the caret into the
@@ -170,6 +170,30 @@ fn the_caret_goes_inside_a_number_run() {
     let mut e=load("x 1 y");key(&mut e,"ArrowRight");key(&mut e,"ArrowRight");key(&mut e,"Backspace");
     assert_eq!(typst::write_cell(&e.root),"x 1 y");
     assert!(e.root.iter().all(|a|!matches!(a.kind,Kind::Number)),"{:?}",e.root);
+}
+
+#[test]
+fn one_character_is_one_grapheme_cluster() {
+    // A reader's "character" is not a Unicode scalar: `é` can be `e` plus a
+    // combining accent, and an emoji can be several scalars joined by ZWJ. The
+    // lexer keeps one cluster in one token and `GlyphItem` holds one cluster, so
+    // the editor does too.
+    //
+    // Before this, the parse split by scalar: `e` and its accent became two
+    // `Char`s, the writer put its separator between them, and one keystroke turned
+    // `é` into `e`, a space, the typed letter and a floating accent -- measured as
+    // `0x65 0x20 0x7a 0x20 0x301` for `é` plus `z`.
+    for cluster in ["e\u{301}", "\u{1f44d}\u{1f3fd}", "\u{1f468}\u{200d}\u{1f469}"] {
+        let mut e=load(&format!("${cluster}$"));
+        assert_eq!(e.root.len(),1,"{cluster}: one node");
+        assert_eq!(e.root[0].kind,Kind::Char{text:cluster.into()},"{cluster}");
+        // Editing must not split it: a keystroke rewrites the formula in the
+        // writer's own spelling, which is where a separator would appear.
+        key(&mut e,"End");input(&mut e,"z");
+        let written=typst::write_cell(&e.root);
+        assert_eq!(written,format!("{cluster} z"),"{cluster}: 字形簇不能被拆开");
+        assert_eq!(load(&written).root,e.root,"{cluster}: 写出后必须读回同一棵树");
+    }
 }
 
 #[test]

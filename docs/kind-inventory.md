@@ -14,7 +14,7 @@
 
 | `Kind` | 存储字段 | 槽位（role·scale·可空） | 入口（前进 → / 后退 ←） | 左右 | 上下 | 视图名 | 回写 | 线上实测 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `Char` | `value: char` | 无（叶子） | 边界 | 线性 | 无 | `char` | 自己的字符 | `text`=字符；编辑器里打的 `-` 另带 `display_glyph`=`−`(U+2212) |
+| `Char` | `text`（**一个字形簇**） | 无（叶子） | 边界 | 线性 | 无 | `char` | 自己的 `text` | `text`=字符；编辑器里打的 `-` 另带 `display_glyph`=`−`(U+2212) |
 | `Symbol` | `name`, `glyph` | 无 | 边界 | 线性 | 无 | `symbol` | 自己的 `name` | `text`=`glyph`（如 `alpha` → `𝛼`） |
 | `Number` | 无 | `inner`(100%) | 边界 | 线性 | 无 | `number` | 格内字符**不加分隔符**（`Write::Run`） | children 1×`cell@inner`，里面逐字是 `char`（`12.5` 是 4 个）；光标因此能停在数字之间 |
 | `Raw` | `source` | 无 | 边界 | 线性 | 无 | `raw` | 自己的 `source` | `text`=源码片段 + **`edit`**（一个真实光标，前端据此给"打开源码"）；在宏模板里另带 `definitions`/`origin`/`source_range` |
@@ -30,7 +30,8 @@
 | `Fenced` | `left`, `right` | `inner`(100%) | 边界 | 线性 | 无 | `delim` | `abs()`/`norm()`/字面定界符 | `text`=`"左\n右"` + children 1×`cell@inner` |
 | `Table` | `columns` | `cell`(100%)，可重复 | 中行首/末格 | 列内 | 列运算 | `grid` | `mat(…)` | `columns`=列数 + N×`cell@cell` |
 | `Multiline` | `columns`, `row_lengths` | `cell`，可重复 | 边界 | 列内 | 列运算 | `aligned` | 行用 `&`、`\` | `columns`=列数 + N×`cell@cell`（`row_lengths` 只给回写用，不上线） |
-| `Decoration` | `name` | `inner`(100%) | 边界 | 线性 | 无 | `decoration` | `{name}({0})` | `text`=名字 + children 1×`cell@inner` |
+| `Accent` | `name` | `inner`(100%) | 边界 | 线性 | 无 | `decoration` | `{name}({0})` | `text`=名字 + children 1×`cell@inner` |
+| `Line` | `above: bool` | `inner`(100%) | 边界 | 线性 | 无 | `line` | `overline({0})` / `underline({0})`（`Write::Positioned`） | `text`=`above` 或 `below` + children 1×`cell@inner` |
 
 ## 二、线上 `View` 的 14 个字段，谁填了什么
 
@@ -54,7 +55,7 @@
 
 | `Kind` | `MathKind` | 引擎 item 的字段 |
 | --- | --- | --- |
-| `Char` | `Glyph` | `GlyphItem`：`text`、`class`、`stretch`、`mid_stretched`、`flac` |
+| `Char` | `Glyph` | `GlyphItem`：`text`（**恰好一个字形簇**，构造函数里有 `assert`）、`class`、`stretch`、`mid_stretched`、`flac` |
 | `Symbol` | `Glyph` | 同上 |
 | `Number` | `Number` | `NumberItem`：`text`（数字串；引擎在 `resolve_text` 里按"全 ASCII 数字、至多一个点、至少一个数字"判定） |
 | `Raw` | `Box`、`Mathml`、`External` | `BoxItem`：`elem`、`locator`；`MathmlItem`：`elem`、`body`；`ExternalItem`：`content`、`locator` |
@@ -65,7 +66,8 @@
 | `Fenced` | `Fenced` | `FencedItem`：`open: Option<MathItem>`、`close: Option<MathItem>`、`body`、`balanced` |
 | `Table` | `Table` | `TableItem`：`cells`、`gap`、`augment`、`align`、`alternator` |
 | `Multiline` | `Multiline` | `MultilineItem`：`rows: Vec<AlignedRow>`、`centered`；`AlignedRow` 是一行的各对齐列 |
-| `Decoration` | `Accent`、`Line` | `AccentItem`：`base`、`accent: MathItem`、`position`、`dotless`、`exact_frame_width`；`LineItem`：`base`、`position` |
+| `Accent` | `Accent` | `AccentItem`：`base`、`accent: MathItem`、`position`、`dotless`、`exact_frame_width` |
+| `Line` | `Line` | `LineItem`：`base`、`position`（没有记号，只有位置，所以编辑器也只存位置） |
 | `MacroCall`/`TemplateCall`/`Parameter`/`Unknown` | — | 编辑器专有，没有对应 item |
 
 另外每个 item 还都挂着一份 `MathProperties`：`class`、`size`、`cramped`、`limits`、`lspace`/`rspace`、`ignorant`、`spaced`、`align_form_infix`、`editor_label`、`span`。编辑器这边只搬了 `class`（进 `Decl`）；`limits`（居中极限还是侧挂脚标）是**单独去问**的（`native-adapter` 的 attachments 服务），其余都没有对应物。
@@ -74,8 +76,8 @@
 
 | `Kind` | 引擎有而我们没有 | 后果 |
 | --- | --- | --- |
-| `Decoration` | `Accent` 与 `Line` 是两个 item：`Accent` 带**记号 item** 和 `position`（由记号字符的 `is_bottom()` 推出），`Line` 只有 `position` | 一个 `name: String` 同时装了两种东西；上下位置由名字隐含，前端再从名字反推 |
-| `Decoration` | 记号本身是**已解析的 item**，并带 `dotless`（有帽字母去点的替换）与 `exact_frame_width` | 前端按名字手画记号（`hat` 两条线、`vec` 加箭头…），拿不到 `accent_base_height`、拉伸量、`accent_attach` 这些字体度量 |
+| `Accent` | `position` 由**记号字符自己**决定（`Accent::is_bottom` 用 ICU 的 `CanonicalCombiningClass::Below`），编辑器不存 | 编辑器只存命令名；今天接受的 `hat`/`vec` 都是上标，所以这个偏差暂时看不出来 |
+| `Accent` | 记号本身是**已解析的 item**，并带 `dotless`（有帽字母去点的替换）与 `exact_frame_width` | 前端按名字手画记号（`hat` 两条线、`vec` 一条横线），拿不到 `accent_base_height`、拉伸量、`accent_attach` 这些字体度量 |
 | `Sqrt`/`Root` | 引擎是一个 `Radical`，`index: Option` | 编辑器分成两个 `Kind`（这是**有意保留**的：两者插槽不同，合并反而对前端不友好） |
 | `Scripts` | 6 个附件字段（`top`/`bottom` 是居中极限，`top_right`/`bottom_right` 是侧挂脚标，另有左侧两个） | 编辑器只有 3 格；左侧附件 `native-adapter` 明确报错"暂不支持左侧附件的槽位映射" |
 | `Fenced` | 定界符是 `Option<MathItem>`（`cases` 只有一个），另有 `balanced` | 编辑器存两个字符串，无 `left`/`right` 之分（`cases` 那种单边定界符表达不了） |
@@ -93,13 +95,15 @@
 
 实测：30 个用例的完整 `view` JSON 里，`"kind": "parameter"` 与 `"kind": "template-call"` 出现 **0 次**。它们仍必须有 `Decl`（`template_size` 要遍历、`Write::TemplateOnly` 要在写入时停下），但**前端永远看不到它们**。
 
-## 六、探测中发现的十件事
+## 六、探测中发现的十二件事
 
-1. **`vec` 不是 accent。** `resolve_vec`（`resolve.rs:1018`）把每个参数变成一行再套定界符（`VecElem` 定义在 `matrix.rs`，默认 `delim: DelimiterPair::PAREN`）——它是**列向量**，和 `mat` 同族。`VecElem` 自己的文档就写着："To typeset a symbol that represents a vector, `math.accent[arrow]` and `bold` are commonly used"（`matrix.rs:23-25`）。编辑器现在把 `vec` 当 `Decoration{name:"vec"}` 画一个箭头。实测：`vec(x)` 与 `mat(x)` 的**映射 SVG 逐字节相同**（29.5584×23.904pt），`vec(x, y)` 与 `mat(x; y)` 也相同；而真正的 accent 宽度**一点不变**（`hat(x)` = `x` = 13.728pt）。
+1. **`vec` 不是 accent。** `resolve_vec`（`resolve.rs:1018`）把每个参数变成一行再套定界符（`VecElem` 定义在 `matrix.rs`，默认 `delim: DelimiterPair::PAREN`）——它是**列向量**，和 `mat` 同族。`VecElem` 自己的文档就写着："To typeset a symbol that represents a vector, `math.accent[arrow]` and `bold` are commonly used"（`matrix.rs:23-25`）。编辑器把 `vec` 建成 `Accent`，而前端曾经按名字给它画一个箭头——**前端那行是凭名字猜的**（来自本仓库第二个提交 `d15f35d 桌面端`，Rust 侧从来没有 `arrow` 这个 Kind 或命令）。实测：`arrow(x)` 才是引擎的 `Accent`（13.728×17.328pt，宽度不变），`vec(x)` 是 29.5584×23.904pt（定界符被拉伸），两者不是一回事；`vec(x)` 与 `mat(x)` 的**映射 SVG 逐字节相同**，`vec(x, y)` 与 `mat(x; y)` 也相同。箭头已删除，`vec` 现在按普通记号画（一条横线）。**`vec` 该建成什么**仍然开着：退回 `Raw`（引擎自己画，立刻正确，失去参数的结构编辑）／建成 `Fenced(Table)`（保住结构，回写会把 `vec(a, b)` 变成 `(mat(a; b))`）。
 7. **`mat` 的默认定界符是圆括号，前端画的是方括号。** `MatElem::delim` 默认 `DelimiterPair::PAREN`（`matrix.rs:103`）。`mathview.py` 的 `grid` 分支画的是两条竖线加四个短横（`mathview.py:311-314`），即方括号。实测 `(mat(x))` 比 `mat(x)` 宽出正好一对定界符（48.2304 − 29.5584 = 18.672pt，与 `(x)` − `x` 相同），说明 `mat` 自己那对确实画着圆括号。
 8. **一条被证伪的怀疑。** 我一度以为映射会漏掉 `vec` 的定界符（因为 `vec(x)` 与 `mat(x)` 完全一样）。查下来不是：`mat` 的默认定界符本来就是圆括号，所以 `mat(x)` 与 `mat(x, delim: "(")` 是同一个东西，两者相同是必然的。`Write::Matrix` 因此也需要重新审视——它写出的 `mat(…)` 在前端是方括号，在文档里是圆括号。
 9. **数字串是一个"像 text 一样的容器"。** `Number` 有一个格，里面是逐字的 `Char`，所以光标**能停在数字之间**（`12|34` 插一个 `9` 得到 `12934`），这是叶子模型根本表达不了的。前端仍然只多一个排布名（`number`），通用"有子节点"分支会把那个格画出来；名字必须在 `ARRANGEMENTS` 白名单里，否则整篇带数字的公式都会报"不认识的排布"（`desktop/test_desktop.py::test_a_number_run_is_a_container_with_a_known_arrangement` 守着）。
-10. **普通模式敲出的小数与读进来的小数不是同一棵树**（有意）：读 `12.5` 是一个 `Number(12.5)`，逐键敲 `1` `2` `.` `5` 是 `Number(12) Char(.) Number(5)`，写出 `12 . 5`。实测四种写法两两渲染完全相同（见下），所以是纯表示差异；命令模式走解析器，得到的是一个 `Number`。
+10. **普通模式敲出的小数与读进来的小数不是同一棵树**（有意）：读 `12.5` 是一个 `Number`，逐键敲 `1` `2` `.` `5` 是 `Number(12) Char(.) Number(5)`，写出 `12 . 5`。实测四种写法两两渲染完全相同（见下），所以是纯表示差异；命令模式走解析器，得到的是一个 `Number`。
+11. **一个"字符"是一个字形簇，不是一个 Unicode 标量。** 词法把 `e`+U+0301、`👍🏽`、ZWJ 家庭 emoji 各收成一个 `MathText` 节点，而 `GlyphItem.text` 也是一个字形簇；编辑器原先按标量拆成多个 `Char`，于是**回写会在字形簇中间插入分隔符**，敲一个键就把 `é` 变成 `e` + 空格 + 飘在后面的重音符（实测码位 `0x65 0x20 0x7a 0x20 0x301`）。对齐载荷为一个字形簇之后：`0x65 0x301 0x20 0x7a`，字形簇完好。这是"回写义务"那一类缺陷，会改坏文档内容。
+12. **前端"有分支但后端到不了"的名字，一共九个，已全部删除。** 逐个对照后端命令表（`crates/core/src/cursor.rs`）与 `Decl::view`：`decoration` 里的 `widehat`/`dot`/`ddot`/`dddot`/`arrow`/`underline`/`underbrace`/`underbracket`/`underparen` 都不可能出现在线上——后端只产生 `hat`/`vec`（`Accent`）与 `overline`/`underline`（`Line`），其余名字会落成 `Raw` 由引擎自己画。反向的检查也做了：`line` 的 `above`/`below`、`script` 的 `_placement`（`limits`/`scripts`）、`unknown` 的 `_string_mode` 都是真的到得了的；`ARRANGEMENTS` 白名单里多出的 `draft-*`/`absent`/`stop`/`cell`/`macro-argument` 是前端自造或后端合成的节点，不在 `Decl` 里，属于白名单该有的成员。
 
 | 写法对 | 实测（24pt，真实适配器） |
 | --- | --- |

@@ -1262,6 +1262,230 @@ error[E0432]: unresolved import `visual_typst`
 
 改动文件：`crates/core/src/{math,slots,typst,cursor,view}.rs`、`tests/{structured_input,round_trip,caret_navigation,lyx_traces}.rs`、`desktop/{mathview,test_desktop}.py`、`tools/kind_inventory.py`、`docs/{architecture,kind-inventory,validation}.md`。
 
+## `Decoration` 拆成 `Accent`/`Line`，`Char` 载荷改成一个字形簇 · 2026-09-11
+
+### 一、`Decoration` → `Accent` + `Line`
+
+引擎侧本来就是两个 item、字段也不同：`AccentItem { base, accent: MathItem, position, dotless, exact_frame_width }` 与 `LineItem { base, position }`。一个 `name: String` 同时装这两样东西，既说不出"位置是引擎决定的"，又逼前端从名字反推上下。
+
+| | 旧 | 新 |
+| --- | --- | --- |
+| 存储 | `Decoration { name }` | `Accent { name }`（`hat`/`vec`）与 `Line { above: bool }`（`overline`/`underline`） |
+| `typst` | 认领 `["Accent","Line"]` | 各认领一个 |
+| 视图名 | `decoration`（两者共用） | `Accent` → `decoration`（`text`=名字）；`Line` → **`line`**（`text`=`above`/`below`） |
+| 回写 | `"{name}({0})"` | `Accent` 照旧；`Line` 走新的 `Write::Positioned { above, below }`，由**存的位置**选模板 |
+
+`Line` 只存位置，因为 `LineItem` 只有位置——写回用哪个命令是从位置推出来的，不是另存一个名字。前端新增一个 `line` 排布（按 `text` 画基线上方或下方的横线），`decoration` 只留记号；顺带删掉了 `decoration` 里那串**永远不会到达**的名字分支（`underbrace`/`underbracket`/`underparen` 等：引擎把它们解成**带拉伸记号的 `Accent`**，不是 `Line`，而且它们本来就不在编辑器的命令表里，会走 `Raw`）。`vec` 仍是 `Accent`（也就是仍然画箭头）——它是引擎侧的**缺陷**（`vec` 是列向量 `Fenced(Table)`），修它要改行为，等你定，见 `docs/kind-inventory.md` 第六节第 1 条。
+
+### 二、`Char` 的载荷：一个 `char` → 一个字形簇
+
+原先的解析按 **Unicode 标量**拆：`e`+U+0301、`👍🏽`、ZWJ 家庭 emoji 各被拆成 2/2/5 个 `Char`，而词法本来把它们各收成**一个**节点、`GlyphItem.text` 也装**一个**字形簇。后果是**回写义务**上的缺陷——分隔符被插进字形簇中间：
+
+| 字形簇 | 修前（敲一个键之后的码位） | 修后 |
+| --- | --- | --- |
+| `e`+U+0301 | `65 20 7a 20 301` → `é` 变成 `e` + 空格 + 飘在 `z` 后面的重音符 | `65 301 20 7a` |
+| `👍🏽` | `1f44d 20 7a 20 1f3fd` → 肤色修饰符被拆开 | `1f44d 1f3fd 20 7a` |
+| ZWJ 家庭 | 被空格切成五个独立 emoji | 整个簇加空格加 `z` |
+| NFC 的 `é`（单标量） | 正常 | 正常 |
+
+改法：`Kind::Char { value: char }` → `Kind::Char { text: String }`（一个字形簇），解析改用 `graphemes(true)`（内核新增直接依赖 `unicode-segmentation`，它本来就在依赖树里，构建里没有新代码）；构造函数带 `debug_assert_eq!(count, 1)`，与 `GlyphItem::create` 的 `assert` 对应。`char_class` 取簇的**首个**标量，也与 `GlyphItem` 读 `default_math_class` 的方式一致。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **126 通过 / 5 忽略** |
+| `python -m unittest desktop.test_desktop` | **73 通过** |
+| `python tools/kind_inventory.py` | `Accent` → `decoration`；`Line` → `line`（`cell@inner`）；`Char` 不变 |
+| 字形簇 | 上表四行，真实后端 + 源码码位对照 |
+
+### 新用例的牙齿（三次变异）
+
+| 变异 | 结果 |
+| --- | --- |
+| 解析改回按标量拆（`chars()`） | 失败：`one_character_is_one_grapheme_cluster`（`left: 2, right: 1` 个节点） |
+| 前端 `ARRANGEMENTS` 去掉 `line` | 失败：`test_a_line_draws_its_rule_on_the_side_it_stores`（报出未认领排布） |
+| 前端 `line` 分支按名字而非按位置画 | 由同一条用例的几何断言覆盖：上/下两条的 `height` 与 `baseline` 走向必须不同 |
+
+第二条检查**第一次是假失败**：新用例先写成 `$\overline{x}$`，而 Typst 的数学命令**不带反斜杠**（`\o` 是转义），于是文档里解析成 `\o` + `verline` + `{x}`，`line` 节点根本不存在，断言在"找不到节点"上失败——看着像回归，其实是用例写错了。改用 `$overline(x)$` 后通过，并把这条写进用例注释。
+
+`Accent`/`Line` 的往返由 `tests/round_trip.rs` 的 `accent_atoms_round_trip` 与新增的 `line_atoms_round_trip` 守着——`Line` 的判据是"两个命令必须回到它们拼出来的那个位置"，而不是某个别处的标志位。
+
+改动文件：`crates/core/{Cargo.toml,src/{math,slots,typst,cursor,view}.rs}`、`Cargo.lock`、`tests/{structured_input,round_trip}.rs`、`desktop/{mathview,test_desktop}.py`、`tools/kind_inventory.py`、`docs/{architecture,kind-inventory,validation}.md`。
+
+## `vec` 不再画箭头 + 前端名字分支排查 · 2026-09-11
+
+### 箭头是哪来的：Python，不是 Rust
+
+`desktop/mathview.py` 的 `decoration` 分支里有一行 `if name in ("arrow","vec")` 给记号补了两笔箭羽。**Rust 侧从来没有 `arrow` 这个 Kind 或命令**：`crates/core/src/cursor.rs` 与 `typst.rs` 只认 `hat`/`vec` 两个 `Accent`，`math.rs` 的 `COMMANDS` 里也没有 `arrow`。追到引入点：`d15f35d 桌面端` 这个提交（本仓库第二个提交）里就已经有这一行，当时后端还是原型，`decoration` 是"按名字画"的形态。所以它是一次**凭名字猜的绘图**，不是从 LyX 或 Typst 搬来的。
+
+实测确认这个猜法错得干净：`arrow(x)` 是引擎的 `Accent`（13.728×17.328pt，宽度不变），`vec(x)` 是列向量 `Fenced(Table)`（29.5584×23.904pt，宽度 2.15 倍），两者根本不是一回事。改法：`vec` 走通用分支（基线上方画一条横线），箭头分支整段删除。
+
+### 同类问题排查（"前端有分支、后端到不了"）
+
+把所有前端名字分支逐个对照后端能产生的东西：
+
+| 位置 | 结论 |
+| --- | --- |
+| `decoration` 的 `widehat`/`dot`/`ddot`/`dddot` | **到不了**：后端命令表只有 `hat`/`vec`（`cursor.rs`），这四个会落成 `Raw`，由引擎自己画。已删 |
+| `decoration` 的 `arrow` | 同上，已删 |
+| `decoration` 的 `underline`/`underbrace`/`underbracket`/`underparen` | **到不了**：`overline`/`underline` 现在是独立的 `Line`（`view: "line"`），另三个会被引擎解成带拉伸记号的 `Accent`，而它们又不在命令表里 → `Raw`。上一轮拆分时已删 |
+| `line` 的 `above`/`below` | 到得了：正是 `Line { above }` 的两个值 |
+| `script` 的 `_placement`（`limits`/`scripts`） | 到得了：由适配器按 Typst 的 `Limits` 算出来，实测 `sum_1^2` 显示模式是 `limits`、行内是 `scripts` |
+| `unknown` 的 `_string_mode` | 到得了：由 `MathCanvas.refresh` 自己盖上，给命令草稿选底色 |
+| 排布名白名单 `ARRANGEMENTS` | 与后端 `Decl::view` 逐一对照：后端现在声明 18 个排布名，白名单里多出的 `draft-*`/`absent`/`stop`/`cell` 等是前端自造或后端合成的节点，不是 `Decl` 里的 |
+
+结论：**除已修的两处，没有其他"到不了的分支"**；`mathview.py` 里那串名字表已经和后端对齐。
+
+### 光标所在框的四角高亮
+
+新增 `mark_active_path(view, cursor.slices)`：按光标的 `slices` 链在视图里走一遍（一个 slice 是 `{atom, cell}`，视图的一个 cell 里 stop 与原子交替排列，所以"`stop` 的 `cursor.pos` 等于 `atom`"就是那个原子的位置），给走到的节点盖上 `_active`；`layout` 对带 `_active` 的框在四角各画两笔短括号（不是整框，否则嵌套公式会看着像表格）。
+
+实测 `frac(a, b)`、光标在分子时：**2 个框被标记**——根格与分子格。分式的节点本身也在路径上（`fraction._active` 为真），但它的框就是根格那个框的绘制结果，所以画面上是 2 个。分母**没有**标记，这是这条用例的对照项。下键移到分母后标记跟着走。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **127 通过 / 5 忽略** |
+| `python -m unittest desktop.test_desktop` | **75 通过**（73 + 角标 1 + 上一轮 `line` 1） |
+| `python tools/kind_inventory.py` | `vec` 仍是 `decoration`（`vec` 节点），画法变了、形状没变 |
+
+### 新用例的牙齿（两次变异）
+
+| 变异 | 结果 |
+| --- | --- |
+| `layout` 里去掉角标插入 | 失败：`0 != 2` 个框 |
+| `mark_active_path` 取错兄弟节点（`index+2`） | 失败：`1 != 2` 个框 |
+
+写这条用例时也踩了两次自己的坑，都记在用例注释里：第一次用 `core.call("click")` 直接点，核心答"请先进入公式"（点击不是进入公式的方式，要先 `window.activate`）；第二次断言"只有一个框"是我对标记语义的预期错——**光标路径上的每个框都算数**，正确的是两个。
+
+改动文件：`desktop/{mathview,test_desktop}.py`、`docs/{validation,kind-inventory}.md`。
+
+## 三张命令表收敛，命令名进配置文件 · 2026-09-11
+
+### 问题
+
+同一个命令名原先写在**三个地方**：`math.rs` 的 `COMMANDS`（"这是不是命令"）、`cursor.rs` 的 `factory`（"打字时建什么"）、`typst.rs` 的 `(name, args.len())` match（"读源码时建什么"）。三份能漂开，漂开的后果是**同一个名字打字进去和从文档读出来得到两种树**；实测 `vec` 就是这样：三处都按名字猜它是 accent，而引擎说它是列向量。
+
+### 收敛结果
+
+| 原来 | 现在 |
+| --- | --- |
+| `math.rs::COMMANDS` | 删除 |
+| `cursor.rs::factory`（10 个分支） | 删除，命令交给 `parse_command_invocation` |
+| `typst.rs` 的 `(name, args.len())` match | 删除，改问 `slots::command_kind(name)` |
+| `Decl::commands`（内联常量 `C_*`） | 移到 `config/commands.json`，`build.rs` 生成 `COMMANDS` 表 |
+
+```json
+{ "frac": "fraction", "sqrt": "sqrt", "root": "root", "mat": "grid",
+  "abs": "delim", "norm": "delim",
+  "overline": "line", "underline": "line",
+  "hat": "decoration", "vec": "decoration" }
+```
+
+值是 **`Kind` 的视图名**而不是变体名：视图名是给前端的契约，比 `Kind` 稳定（`Frac` → `Fraction` 那次改名不需要动这个文件）。`build.rs` 同时生成符号表，两张表进同一个 `OUT_DIR/config.rs`。
+
+### 参数个数不在这份配置里
+
+这点是讨论出来的关键：**配置只说"编辑器有没有这个名字的结构"，不说它要几个参数**。参数个数从**拼写**里数出来（`fill_command_cells`）：`frac({0}, {1})` 两格、`overline({0})` 一格、矩阵是行列默认值、定界符是中间那个体。所以没有第二份 arity 数据——这也正是"由 parser 给出参数列表"做不到的地方：实测 `typst-syntax` 看 `frac()` 和 `foo()` 完全一样（都是 `MathCall` + 空 args），arity 是 `typst-eval` 求值期才知道的，而内核刻意不依赖求值。
+
+### 实测：改一行配置就多一条命令
+
+给配置加 `"cancel": "line"` 并重建，**不动任何 Rust**：
+
+| | 加之前 | 加之后 |
+| --- | --- | --- |
+| `\cancel(x)` 回车 | `Raw{cancel(x)}` | `line` 节点（写成 `underline(x)`——因为 `cancel` 的记号引擎侧是 `CancelItem`，配成 `line` 只是演示配置生效） |
+
+还原后回到 `Raw`。这条演示说明配置真的在驱动行为，而不是文档。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **129 通过 / 5 忽略**（127 + 配置表 2 条） |
+| `python -m unittest desktop.test_desktop` | **75 通过** |
+| 十条命令逐条比对 | 键入与从源码读得到的 `Kind` 完全一致（上一轮的表继续成立） |
+
+### 新用例的牙齿（两次变异）
+
+| 变异 | 结果 |
+| --- | --- |
+| `"sqrt": "radical"`（不存在的视图名） | 失败：`config/commands.json 里的 sqrt 指向未知视图名 radical` |
+| `"sqrt": "grid"`（视图名存在但是另一个 Kind） | 失败：`sqrt 是命令能建的 Kind，却没有命令名` |
+
+第二条是关键：只检查"视图名存在"是不够的，配置完全可以把 `sqrt` 指到 `grid` 而两边都合法——反向检查（每个命令能建的 `Kind` 都必须有名字）才抓得住。
+
+### 仍未修的一处
+
+`\frac()` 回车会把 `frac({0}, {1})`（模板原文）写进文档：草稿 `frac()` 不等于 `frac`，`bare_name` 为假，于是走了没有方程包装的那条 `parse_command`。这与 `\overline` 那次同类，是**数据损坏**，等你定方案后再修。
+
+改动文件：`config/commands.json`（新增）、`crates/core/{build.rs,src/{math,slots,cursor,typst}.rs}`、`docs/{architecture,validation}.md`。
+
+## `frac()` 的模板占位符泄漏 · 2026-09-11
+
+### 现象与更正
+
+上一节我写的是"`\frac()` 把 `frac({0}, {1})` 写进文档"。**这条描述对 release 不准确**：`write_atom` 在模板占位符找不到格子时执行的是 `debug_assert!(false, …)`，debug 构建 panic，release 构建**跳过断言继续执行**，写进文档的是**字面的 `{0}`**。我是在 debug 测试里看到 panic 就下了结论，没有区分构建类型——危害性质（数据损坏）判断对了，描述错了。
+
+### 根因
+
+`fill_command_cells`（补格子）只在 `bare_name` 为真时执行，而 `bare_name` 的判据是"草稿去掉空白后恰好等于命令名"：
+
+| 草稿 | `bare_name` | 补格子 | 结果 |
+| --- | --- | --- | --- |
+| `frac` | 真 | 执行 | `frac("", "")` |
+| `frac()` | **假** | **不执行** | 解析出 `Fraction` 但 **0 格** → 写出时泄漏 `{0}` |
+| `frac(1,2)` | 假 | 不执行（也不需要） | `frac(1, 2)` |
+
+问题在于**"要不要补格子"和"要不要补调用语法"被同一个布尔量决定了**，而它们是两件事：前者取决于节点缺不缺格子，后者取决于作者写没写参数。
+
+`frac()` 这个草稿本身**不是系统产生的**：实测补全表给的是不带括号的裸名（`\fr` 的候选是 `['frac']`），`Complete` 只把草稿变成 `frac`。它是**读者手打的退化输入**，但仍然必须结果是合法的——因为它会写进文档。
+
+### 改法
+
+把补格子从布尔量里拿出来，对**每一份**解析成功的草稿都执行：
+
+```rust
+for atom in &mut data { fill_command_cells(atom); }
+```
+
+`fill_command_cells` 只对**没有格子**的节点动手（`if !atom.cells.is_empty() { return; }`），所以 `frac(1,2)` 不受影响；而 `frac`、`frac()` 两种写法因此得到同一棵树。
+
+### 实测（真实 release 二进制）
+
+| 草稿 | 改前 | 改后 |
+| --- | --- | --- |
+| `\frac` | `frac("", "")` | `frac("", "")` |
+| `\frac()` | **`frac({0}, {1})`** | `frac("", "")` |
+| `\frac(1,2)` | `frac(1, 2)` | `frac(1, 2)` |
+| `\hat()` `\overline()` `\abs()` `\mat()` `\norm()` `\underline()` `\sqrt()` `\vec()` | 同类泄漏 | 与各自的裸名写法一致 |
+
+13 种输入逐个验过，写出结果里**没有 `{`**。
+
+### 新用例的牙齿
+
+`tests/command_mode.rs::a_command_written_with_empty_parentheses_is_writable` 对**每一条命令**比对"裸名写法"和"空括号写法"：两者的写出必须相同、都不含 `{`、且能读回同一棵树。
+
+变异检查：把补格子改回"只在 `bare_name` 时执行"，用例立即失败：
+
+```
+thread '…is_writable' panicked at crates\core\src\typst.rs:730:27:
+模板占位符 {0} 没有对应的格子
+```
+
+还原后全绿。这条用例补上了此前缺失的一类输入——`tests/command_mode.rs` 原本覆盖了 `\frac(a, b)` 和裸 `\frac`，唯独没有退化括号，而新增一条命令时这类输入是自动被覆盖的。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **130 通过 / 5 忽略** |
+| `python -m unittest desktop.test_desktop` | **75 通过** |
+
+改动文件：`crates/core/src/cursor.rs`、`crates/core/src/slots.rs`（`command_views` 补 `#[cfg(test)]`）、`tests/command_mode.rs`、`docs/validation.md`。
+
 
 
 

@@ -1,0 +1,11 @@
+{
+  "frac": "fraction",
+  "sqrt": "sqrt",
+  "root": "root",
+  "mat": "grid",
+  "abs": "delim",
+  "norm": "delim",
+  "overline": "line",
+  "underline": "line",
+  "hat": "decoration"
+}

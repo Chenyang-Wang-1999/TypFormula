@@ -36,7 +36,8 @@ CASES = [
     ("Fenced", "$(a)$", []),
     ("Table", "$mat(1, 2; 3, 4)$", []),
     ("Multiline", "$a &= 1 \\ b &= 2$", []),
-    ("Decoration", "$hat(x)$", []),
+    ("Accent", "$hat(x)$", []),
+    ("Line", "$overline(x)$", []),
     # The two kinds that exist only inside a macro template: neither is reachable
     # from source, so what this shows is their absence.
     ("TemplateCall/Parameter", "#let inner(x) = $ #x $\n#let outer(a) = $ frac(inner(#a), 2) $\n$ outer(y) $", []),
@@ -54,7 +55,7 @@ WIRE = ["kind", "role", "text", "display_glyph", "columns", "attachment", "edit"
 # Views that belong to a node kind (`slots::Decl::view`), for the summary.
 VIEW_KINDS = ["char", "symbol", "number", "raw", "unknown", "text", "macro", "macro-collapsed",
               "macro-argument", "template-call", "parameter", "fraction", "sqrt", "root",
-              "script", "delim", "grid", "aligned", "decoration", "absent"]
+              "script", "delim", "grid", "aligned", "decoration", "line", "absent"]
 
 
 def call(child, payload):

@@ -2,7 +2,8 @@
 // Typst replaces MathParser/TeXMathStream at import and command confirmation.
 // Structural editing and draft keystrokes do not reparse the formula.
 use crate::math::*;
-use crate::slots::Write;
+use crate::slots::{self, Write};
+use unicode_segmentation::UnicodeSegmentation;
 use typst_syntax::{Source, SyntaxKind, SyntaxNode, ast::{self, AstNode}};
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}};
 
@@ -386,6 +387,11 @@ pub struct Parsed { pub root: MathData, pub definitions: String, pub display: bo
 
 /// Parse a single equation against the lexical document prefix without treating
 /// surrounding markup as part of the editable math tree.
+///
+/// A draft is bare expression text, not a document, so `$ {text} $` is how the
+/// equation is addressed: `parse_formula` then takes the equation node and nothing
+/// else, which is what makes the result a formula and not a paragraph of loose
+/// atoms. Every command path goes through here.
 pub fn parse_formula(text: &str, context: &str) -> Result<Parsed, String> {
     let source = Source::detached(text.to_owned());
     let eq = source.root().children().find(|n| n.kind()==SyntaxKind::Equation).ok_or("缺少公式")?;
@@ -404,17 +410,50 @@ pub fn parse_formula_node(node:&SyntaxNode,context:&str)->Result<Parsed,String> 
     Ok(Parsed { root: parse_cell(eq.body().to_untyped(), &ctx), definitions: context.to_owned(), display: eq.block() })
 }
 
+/// Parse a command draft as a formula.
+///
+/// The draft is *expression* text, not a document, so it is always addressed as the
+/// inside of an equation: `parse_formula` takes the equation node and nothing else,
+/// which is what makes the answer a formula rather than a paragraph of loose atoms.
+///
+/// A draft that *is* a document — the author pasted one — is parsed as one, and the
+/// caller keeps the definitions it carries. `Source::detached` over the raw text is
+/// what tells the two apart: `$ x $` is a document and `x` is not.
 pub fn parse_command(text: &str, definitions: &str) -> Result<Parsed, String> {
-    let source = Source::detached(text.to_string());
-    let document = source.root().children().any(|n| matches!(n.kind(), SyntaxKind::Equation | SyntaxKind::LetBinding));
-    let body = if document { text.to_string() } else { format!("$ {text} $") };
+    let document = Source::detached(text.to_string()).root().children()
+        .any(|n| matches!(n.kind(), SyntaxKind::Equation | SyntaxKind::LetBinding));
+    if !document { return parse_formula(&format!("$ {text} $"), definitions); }
     let separator = if definitions.is_empty() || definitions.ends_with('\n') { "" } else { "\n" };
-    if !document { return parse_formula(&body, definitions); }
-    if source.root().children().any(|n| n.kind() == SyntaxKind::LetBinding) {
-        parse_document(&format!("{definitions}{separator}{body}"))
-    } else { parse_formula(&body, definitions) }
+    if Source::detached(text.to_string()).root().children().any(|n| n.kind() == SyntaxKind::LetBinding) {
+        parse_document(&format!("{definitions}{separator}{text}"))
+    } else { parse_document(text) }
 }
 
+/// Parse a command name as the call it spells, filling in what only the registry
+/// knows: a macro's own argument count, or `()` for a built-in.
+///
+/// Used when a command is typed with nothing after it, so the parser builds the node
+/// the command means instead of an identifier with that name. Which call it spells is
+/// still the parser's answer — this only supplies the arguments nobody typed.
+///
+/// A name the registry defines wins over a built-in of the same name, exactly as it
+/// does in a document. That case cannot go through the parser at all: the arguments
+/// do not exist yet, so there is nothing for the macro branch to match on, and the
+/// node is built here with one empty cell per parameter — the same shape the call
+/// would have once its arguments were typed.
+pub fn parse_command_invocation(text: &str, definitions: &str) -> Result<Parsed, String> {
+    let registry = macro_registry(definitions);
+    if let Some((_, def)) = registry.get(text).filter(|def| def.expandable).map(|def| (0usize, def)) {
+        if !def.params.is_empty() {
+            let atom = MathAtom {
+                kind: Kind::MacroCall { name: def.name.clone(), function: true },
+                cells: vec![vec![]; def.params.len()],
+            };
+            return Ok(Parsed { root: vec![atom], definitions: definitions.to_owned(), display: true });
+        }
+    }
+    parse_formula(&format!("$ {text}() $"), definitions)
+}
 pub fn parse_document(text: &str) -> Result<Parsed, String> {
     let initial = Source::detached(text.to_owned());
     let document = initial.root().children().any(|n| matches!(n.kind(), SyntaxKind::Equation | SyntaxKind::LetBinding));
@@ -537,27 +576,66 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
                 }
                 return vec![MathAtom::raw(node.full_text())];
             }
-            if !COMMANDS.contains(&name.as_str()) { return vec![MathAtom::from_source(node.full_text())]; }
+            // A name the table does not know is not a command: leave the text as
+            // the engine spelled it and let the compiler draw it.
+            if !candidate_names().contains(&name.as_str()) {
+                return vec![MathAtom::from_source(node.full_text())];
+            }
             let mut args = vec![];
-            let mut widths = vec![];
+            // Cells per **row**, in source order: a comma keeps the count, a
+            // semicolon ends a row. So `mat(1, 2, 3)` is one row of three and
+            // `mat(1; 2; 3)` is three rows of one — the *columns* of the table are
+            // the width of its first row, which is why every row has to agree before
+            // this can be a table at all.
+            let mut cells_per_row = vec![];
             let mut width = 0;
             for item in call.args().arg_items() {
                 let ast::Arg::Pos(expr) = item.arg else { return vec![MathAtom::from_source(node.full_text())]; };
                 let mut arg = parse_cell(expr.to_untyped(), ctx);
                 if arg.len() == 1 && matches!(arg[0].kind, Kind::Text) && arg[0].cells[0].is_empty() { arg.clear(); }
                 args.push(arg); width += 1;
-                if item.ends_in_semicolon { widths.push(width); width = 0; }
+                if item.ends_in_semicolon { cells_per_row.push(width); width = 0; }
             }
-            if width > 0 { widths.push(width); }
-            let kind = match (name.as_str(), args.len()) {
-                ("frac", 2) => Kind::Fraction, ("sqrt", 1) => Kind::Sqrt, ("root", 2) => Kind::Root,
-                ("abs", 1) => Kind::Fenced { left: "|".into(), right: "|".into() },
-                ("norm", 1) => Kind::Fenced { left: "‖".into(), right: "‖".into() },
-                ("overline" | "underline" | "hat" | "vec", 1) => Kind::Decoration { name },
-                ("mat", n) if n > 0 && widths.iter().all(|w| *w == widths[0]) => Kind::Table { columns: widths[0] },
-                _ => return vec![MathAtom::from_source(node.full_text())],
+            if width > 0 { cells_per_row.push(width); }
+            // Only a matrix whose rows are all the same width is one: `mat(a, b; c)`
+            // is not a table Typst can lay out, so it stays source. An empty `mat()`
+            // has no rows at all and is still the matrix the author asked for, so the
+            // editor's own default stands in for the shape it cannot read.
+            if name == "mat" {
+                return match (args.len(), cells_per_row.iter().all(|w| *w == cells_per_row[0])) {
+                    (n, true) if n > 0 => vec![MathAtom { kind: Kind::Table { columns: cells_per_row[0] }, cells: args }],
+                    (0, _) => vec![MathAtom::nest(Kind::Table { columns: 2 }, 4)],
+                    _ => vec![MathAtom::from_source(node.full_text())],
+                };
+            }
+            let kind = match slots::command_kind(&name) {
+                Some(kind) => kind,
+                None => return vec![MathAtom::from_source(node.full_text())],
             };
-            if matches!(kind, Kind::Root) { args.swap(0, 1); }
+            // The name is part of the spelling the table records, so it is what fills
+            // a kind whose own data is a name or a position: `hat` is the accent
+            // called `hat`, `overline` the one that goes above, and the two delimiter
+            // pairs are spelled by their own characters.
+            let kind = match kind {
+                Kind::Accent { .. } => Kind::Accent { name: name.clone() },
+                Kind::Line { .. } => Kind::Line { above: name == "overline" },
+                Kind::Fenced { .. } => match name.as_str() {
+                    "abs" => Kind::Fenced { left: "|".into(), right: "|".into() },
+                    _ => Kind::Fenced { left: "‖".into(), right: "‖".into() },
+                },
+                // Cells are stored in the order the *editor* walks them, which is not
+                // always the order Typst writes: `root(index, radicand)` is stored as
+                // `[radicand, index]`, the reverse. Which is which is read off the
+                // same `Write` template that writes it back, so they cannot drift.
+                other => {
+                    if let slots::Write::Template(template) = other.decl().write {
+                        if placeholder_indices(template).first() == Some(&1) && args.len() == 2 {
+                            args.swap(0, 1);
+                        }
+                    }
+                    other
+                }
+            };
             MathAtom { kind, cells: args }
         }
         Some(ast::Expr::MathShorthand(_)) | Some(ast::Expr::Escape(_)) => MathAtom::from_source(node.full_text()),
@@ -572,15 +650,38 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
                 // runs count is the engine's rule (`math::is_number`) and not the
                 // lexer's: `²3` is one token but resolves to a `Text`.
                 if is_number(&raw) { return vec![MathAtom::number(&raw)]; }
-                return raw.chars().map(MathAtom::character).collect();
+                // One atom per *grapheme cluster*, which is what the lexer put in
+                // this node and what `GlyphItem` holds. Splitting by scalar here
+                // would let `write_cell` put a separator inside a character, and
+                // `e` + a combining accent would come back as `e ́`.
+                return raw.graphemes(true).map(MathAtom::glyph).collect();
             } else { MathAtom::from_source(raw) }
         }
     };
     if matches!(atom.kind, Kind::Text) && atom.cells[0].is_empty() { vec![] } else { vec![atom] }
 }
 
-fn parse_marker(node: &SyntaxNode) -> MathData {
-    // A single marker can also be the complete expression in an argument.
+/// The command names the parser may meet as an ordinary call.
+///
+/// `∛x`/`∜x` are a different syntax node (`MathRoot`, handled separately), but the
+/// written commands are ordinary calls: `root(3, x)` is a `MathCall` like any other,
+/// which is what lets the parser look every command up in the one table.
+fn candidate_names() -> Vec<&'static str> {
+    slots::command_names()
+}
+/// The cell indices a `Write::Template` names, in the order they appear.
+pub fn placeholder_indices(template: &str) -> Vec<usize> {
+    let mut out = vec![];
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let close = match rest[open..].find('}') { Some(close) => open + close, None => break };
+        if let Ok(index) = rest[open + 1..close].parse::<usize>() { out.push(index); }
+        rest = &rest[close + 1..];
+    }
+    out
+}
+
+fn parse_marker(node: &SyntaxNode) -> MathData {    // A single marker can also be the complete expression in an argument.
     let columns = if node.kind() == SyntaxKind::MathAlignPoint { 2 } else { 1 };
     let row_lengths = if columns == 2 { vec![2] } else { vec![1, 1] };
     vec![MathAtom { kind: Kind::Multiline { columns, row_lengths }, cells: vec![vec![], vec![]] }]
@@ -620,7 +721,7 @@ fn fill_template(template: &str, atom: &MathAtom) -> String {
         let key = &rest[open + 1..open + close];
         match key {
             "name" => match &atom.kind {
-                Kind::MacroCall { name, .. } | Kind::Decoration { name } => out.push_str(name),
+                Kind::MacroCall { name, .. } | Kind::Accent { name } => out.push_str(name),
                 other => unreachable!("模板用了 {{name}}，但 {other:?} 没有名字"),
             },
             other => match other.parse::<usize>().ok().and_then(|index| atom.cells.get(index)) {
@@ -648,7 +749,7 @@ pub fn write_atom(atom: &MathAtom) -> String {
     let joined = |cells: &[MathData]| cells.iter().map(write_cell).collect::<Vec<_>>().join(", ");
     match atom.decl().write {
         Write::OwnText => match &atom.kind {
-            Kind::Char { value } => value.to_string(),
+            Kind::Char { text } => text.clone(),
             Kind::Symbol { name, .. } | Kind::Raw { source: name } | Kind::Unknown { name, .. } => name.clone(),
             other => unreachable!("{other:?} 由自己的文本拼写，但它没有文本"),
         },
@@ -657,7 +758,7 @@ pub fn write_atom(atom: &MathAtom) -> String {
             other => unreachable!("{other:?} 声明为占位拼写"),
         },
         Write::TemplateOnly => unreachable!("template edges never belong to the editable source tree"),
-        Write::Quoted => serde_json::to_string(&atom.cells[0].iter().map(|a| if let Kind::Char { value } = a.kind { value.to_string() } else { write_atom(a) }).collect::<String>()).unwrap(),
+        Write::Quoted => serde_json::to_string(&atom.cells[0].iter().map(|a| if let Kind::Char { text } = &a.kind { text.clone() } else { write_atom(a) }).collect::<String>()).unwrap(),
         Write::Run => {
             let run: String = atom.cells[0].iter().map(write_atom).collect();
             // A run is digits and at most one dot by construction; if an edit ever
@@ -667,6 +768,11 @@ pub fn write_atom(atom: &MathAtom) -> String {
             run
         }
         Write::Template(template) => fill_template(template, atom),
+        Write::Positioned { above, below } => fill_template(match &atom.kind {
+            Kind::Line { above: true } => above,
+            Kind::Line { above: false } => below,
+            other => unreachable!("{other:?} 声明为按位置拼写，但它没有位置"),
+        }, atom),
         Write::Named => match &atom.kind {
             Kind::MacroCall { name, function } => if *function { format!("{name}({})", joined(&atom.cells)) } else { name.clone() },
             other => unreachable!("{other:?} 声明为具名调用"),

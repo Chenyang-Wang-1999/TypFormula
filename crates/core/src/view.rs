@@ -155,11 +155,12 @@ impl Editor {
             Kind::MacroCall { .. } => unreachable!(),
             Kind::TemplateCall { definition } => { let mut view = View::new(view_kind, "", children); view.columns = *definition; view }
             Kind::Parameter { index } => { let mut view = View::new(view_kind, "", vec![]); view.columns = *index; view }
-            Kind::Char { value } => {
-                let mut view = View::new(view_kind, value.to_string(), vec![]);
-                // A Char contains exactly one Unicode scalar. Lookup only this
-                // character, never its neighbors; editing/source remain Char.
-                // The painter bypasses this display hint inside text cells.
+            Kind::Char { text } => {
+                let mut view = View::new(view_kind, text, vec![]);
+                // A Char is one grapheme cluster, the unit the lexer and the engine
+                // both keep together. Lookup only this character's text, never its
+                // neighbors; editing/source remain Char. The painter bypasses this
+                // display hint inside text cells.
                 view.display_glyph = symbol(&view.text).map(str::to_string);
                 view
             }
@@ -210,7 +211,10 @@ impl Editor {
             }
             Kind::Text => View::new(view_kind, "", children),
             Kind::Fenced { left, right } => View::new(view_kind, format!("{left}\n{right}"), children),
-            Kind::Decoration { name } => View::new(view_kind, name, children),
+            Kind::Accent { name } => View::new(view_kind, name, children),
+            // `LineItem` stores the position and nothing else, so the wire carries
+            // the position rather than a name the frontend would have to decode.
+            Kind::Line { above } => View::new(view_kind, if *above { "above" } else { "below" }, children),
             Kind::Table { columns } => { let mut v = View::new(view_kind, "", children); v.columns = *columns; v }
             Kind::Multiline { columns, .. } => { let mut v = View::new(view_kind, "", children); v.columns = *columns; v }
         }

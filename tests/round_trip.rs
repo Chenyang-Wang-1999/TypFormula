@@ -16,8 +16,8 @@
 //! * `Unknown` 承载半打完的命令草稿，是纯编辑器状态，没有 Typst 拼写：
 //!   `fra` 不是一个公式。
 //!
-//! 即"可往返的 Kind"共 14 个：Char, Symbol, Number, Raw, MacroCall, Text,
-//! Fraction, Sqrt, Root, Scripts, Fenced, Table, Multiline, Decoration。
+//! 即"可往返的 Kind"共 15 个：Char, Symbol, Number, Raw, MacroCall, Text,
+//! Fraction, Sqrt, Root, Scripts, Fenced, Table, Multiline, Accent, Line。
 
 use visual_typst_core::{Action, Editor, typst};
 
@@ -154,11 +154,22 @@ fn aligned_atoms_round_trip() {
 }
 
 #[test]
-fn decoration_atoms_round_trip() {
-    for source in [
-        "hat(x)", "vec(x)", "dot(x)", "overline(x)", "underline(x)",
-        "hat(a + b)", "overline(frac(a, b))",
-    ] {
+fn accent_atoms_round_trip() {
+    // A mark beside the base; the name is the callee and the cell is the body.
+    // `vec(x)` is deliberately absent: `vec` is not an accent in Typst (it is a
+    // column vector), so the editor no longer builds one for it and the source stays
+    // a `Raw`. See `docs/kind-inventory.md`.
+    for source in ["hat(x)", "hat(a + b)", "hat(frac(a, b))"] {
+        round_trips(source);
+    }
+}
+
+#[test]
+fn line_atoms_round_trip() {
+    // `overline`/`underline` are Typst's `Line`, whose item holds nothing but the
+    // position: the two commands must come back as the position they spell, not as
+    // one command with a flag somewhere else.
+    for source in ["overline(x)", "underline(x)", "overline(frac(a, b))", "underline(a + b)"] {
         round_trips(source);
     }
 }
