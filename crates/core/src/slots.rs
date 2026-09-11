@@ -556,9 +556,10 @@ impl Kind {
 /// Views that are not the whole story for their kind.
 pub mod view {
     /// A macro call the editor cannot expand. It is the `RawMacro` arrangement: a
-    /// known callee whose arguments are shown as slots, drawn as *source* rather
-    /// than as a compiled image, because the kernel has no template to instantiate.
-    /// `Kind::MacroCall`'s declaration names the expandable form.
+    /// known callee drawn as a compiled **image of its own source** while the caret is
+    /// outside it, and as its name plus argument slots once the caret enters, because
+    /// the kernel has no template to instantiate. `Kind::MacroCall`'s declaration names
+    /// the expandable form.
     pub const MACRO_COLLAPSED: &str = "raw_macro";
 }
 

@@ -16,8 +16,10 @@
 //! * `Unknown` 承载半打完的命令草稿，是纯编辑器状态，没有 Typst 拼写：
 //!   `fra` 不是一个公式。
 //!
-//! 即"可往返的 Kind"共 15 个：Char, Symbol, Number, Raw, MacroCall, Text,
-//! Fraction, Sqrt, Root, Scripts, Fenced, Table, Multiline, Accent, Line。
+//! 即"可往返的 Kind"共 16 个：Char, Symbol, Number, Raw, MacroCall, Text,
+//! Fraction, Sqrt, Root, Scripts, Fenced, Table, Multiline, Accent, Line, Style。
+//! 其中 `Style` 与 `Sqrt`/`Root`/`Accent`/`Line` 一样，**只作为形状存在**：树里
+//! 存的是借了它形状的 `MacroCall`（`bold(x)`），回写就是这个调用自己的拼写。
 
 use visual_typst_core::{Action, Editor, math::{Kind, MathAtom}, typst};
 
@@ -253,6 +255,34 @@ fn line_atoms_round_trip() {
     // one command with a flag somewhere else.
     for source in ["overline(x)", "underline(x)", "overline(frac(a, b))", "underline(a + b)"] {
         round_trips(source);
+    }
+}
+
+/// 字体变体（`Style`）存成借形状的调用，所以回写必须是**这个调用自己的拼写**。
+///
+/// 这一条比别的回写更容易悄悄坏掉：`Style` 的形状不带数据，写回完全靠名字，
+/// 而它的**正文可能又是一层变体**（`bold(upright(a))`），于是内外两层各自都要
+/// 写对、括号不能多也不能少。嵌套那一例如果退化成逐层替换的结果
+/// （`bold(𝐚)`），读回来就是另一棵树。
+#[test]
+fn style_atoms_round_trip() {
+    for source in ["bold(x)", "upright(A)", "bold(upright(a))", "bold(x + 1)"] {
+        round_trips(source);
+        let editor = load(source);
+        assert!(
+            matches!(&editor.root[0].kind, Kind::MacroCall { name, .. } if name == "bold" || name == "upright"),
+            "{source} 应当由 commands.json 建成借形状的调用，实际是 {:?}",
+            editor.root[0].kind
+        );
+        assert_eq!(editor.root[0].decl().view, "style", "{source} 借到的是样式的形状");
+    }
+    // 正文不是**一行字形**时内核不建样式节点（`typst::has_glyph_run`），于是同一个
+    // 命令落回普通调用：它照样往返，但借到的是 `macro` 而不是 `style`。这一对
+    // 用例是有意成对写的——只写前面那半，会让人以为"`upright` 总是样式节点"。
+    for source in ["upright(alphabets)", "bold(frac(a, b))"] {
+        round_trips(source);
+        let editor = load(source);
+        assert_eq!(editor.root[0].decl().view, "macro", "{source} 没有字形串，应当是普通调用");
     }
 }
 

@@ -1600,6 +1600,64 @@ thread '…is_writable' panicked at crates\core\src\typst.rs:730:27:
 
 改动文件：`desktop/mathfont.py`、`desktop/mathview.py`、`desktop/test_desktop.py`、`native-adapter/src/main.rs`、`docs/validation.md`。
 
+## 过期注释与文档的全面排查 · 2026-09-11
+
+重构（Kind/View 重划、`Style`、`Number` 容器、命令表收敛）之后，代码里与文档里都留了一批"当时对、现在不对"的说法。这一轮把它们当**缺陷**清了一遍：注释错了会误导下一个改这段代码的人，而文档错了会让"判据"本身失真。
+
+方法不是通读，而是**逐条验证**：凡出现"文件/函数/字段/测试名/行号/条目数"的说法，就去 grep 或 glob 一次，对不上才改。两个并行审计（文档一份、源码注释一份）各自带证据回报。
+
+### 明确错误的（已改）
+
+| 位置 | 原说法 | 实际 |
+| --- | --- | --- |
+| `crates/core/src/view.rs`（`Style` 分支） | 注释说 `edit` 是给 `annotate` 定位用的，且"字形未到就用**调用的图**" | `style` 从不取图（`annotate` 只看 `raw`/`raw_macro`），回退画的是**调用本身**；`edit` 只对前端有意义，因此没有 `source_range` |
+| `crates/core/src/slots.rs`（`MACRO_COLLAPSED`） | "`raw_macro` 画成*源码*而非编译图" | **反了**：光标在外时画的正是整段调用的**图**，进去才画名字与槽位 |
+| `crates/core/src/math.rs`（`Table`） | "`Fraction` 是形状描述符、不存储" | `Fraction` **就是**存的（`a/b` 语法）；不存的五个是 `Sqrt`/`Root`/`Accent`/`Line`/`Style` |
+| `crates/core/src/cursor.rs` | "见 `slots::Decl::grow_empty`" | 全仓没有这个符号，机制是 `fill_command_cells` |
+| `desktop/window.py`（`self.contexts`） | 记的是"每个公式的 `(start,end,context)` 排序表" | 实际是 `{render_id 前缀 → 脚本形状摘要}` |
+| `desktop/window.py`（`invalidate_raw`） | "持有调用的片段**按公式**各存一份图" | 按**源码文本**共享（`raw_key`），跨公式只有一份 |
+| `src/services.rs`（用户可见文案） | 取字超时"先按整段调用的**图**显示" | 现在画的是调用本身（名字与主体），不取图 |
+| `README.md` | `cases(...)` 还是"保留为 Raw"的例子 | `cases`/`cancel`/`vec` 都已进 `commands.json` |
+| `docs/architecture.md` | `SourceDock` 类；`lsp_position` 在 `model.py`；`commands.json（9 项）`；`bb(A)` 是 `Raw`；`Style{text, style_name}`；`lr(...)` 64 处 | 分别是 `Window.source_dock`（`QDockWidget`）、`Window.lsp_position`、14 项、未知名字的调用（`raw_macro`）、`Kind::Style{name}`（`style_name`/`text` 是线上字段）、实测 14 个文件 80 处 |
+| `docs/architecture.md` | `cancel`/`vec` 与 `RR` 一样"只剩 `Raw` 一条退路" | 前两个在命令表里、是可编辑结构；只有 `RR` 是那一类 |
+| `docs/kind-inventory.md` | `text`/`edit` 的"只有…"枚举漏 `style`；"30 个用例"/"26 个用例…24 个" | 已补 `style`；实测 `CASES` **32**、`ARRANGEMENTS` **25**（本轮真发出的线名 23） |
+| `docs/desktop.md` | 未设置环境变量时用 `target/server/debug/...` | `bridge.py` 是 **release 优先**，debug 只是回退 |
+
+行号引用（`typst.rs:541`、`view.rs:117`、`typst.rs:776` 等）整体漂移，已按当前代码重新核对。**没有**去修 `docs/rust-book-walkthrough.md`、`docs/rust-for-cpp.md` 里的行号：它们是教学材料，指代的是概念不是位置，逐行维护没有收益。
+
+### 顺带补上的一条测试
+
+`tests/stored_kinds.rs` 守着"哪些 `Kind` 真的会进树"，而 `tests/round_trip.rs` 守着"每个会进树的原子都能往返"——但 `Style` 之前**没有往返用例**，于是"可往返的 Kind 共 15 个"这句话本身就是错的（漏了一个）。新增 `style_atoms_round_trip`：`bold(x)`、`upright(A)`、`bold(upright(a))`、`bold(x + 1)` 断言借到 `style` 形状并往返，`upright(alphabets)`、`bold(frac(a, b))` 断言**落回普通调用**（主体不是一行字形，`has_glyph_run` 为假）。写这条时踩了一次：最初把 `bold(x + 1, 2)` 也放进"普通调用"那一组，它当场报出**多余实参被静默丢弃**（`bold(x + 1, 2)` 写成 `bold(x + 1)`）——那不是 `Style` 的问题，而是一个本文件不负责的既有缺陷，于是把它从用例里撤掉，没有顺手改行为。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **137 通过 / 5 忽略**（新增 1 条） |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过** |
+| `python -m unittest desktop.test_desktop` | **85 通过** |
+| `python tools/kind_inventory.py` | 退出码 0 |
+
+另外记下一次环境坑：桌面套件在受限沙箱下会**整片报错**（`QProcess: CreateFile failed（拒绝访问）`，79/85 个用例 ERROR）。那不是回归，是 `QProcess` 管道被沙箱拒绝；放开 IPC 后全绿。**看起来像"改注释改崩了"的整片失败，先看错误类型再怀疑自己。**
+
+### 两个审计各自的完整版里、第一轮漏掉的两条
+
+- `docs/kind-inventory.md` 那句「`Fraction`/`Sqrt`/`Root`/`Accent`/`Line` 这五个只作为形状描述符」**自己跟自己打架**：`Fraction` 是存的（`a/b` 语法与 `frac(a, b)` 都存），下一句「只有 `a/b` 还真的存 `Kind::Fraction`」正是承认它。我第一轮只补了漏掉的 `Style`，没纠正 `Fraction` 的错位——已改。
+- `config/README.md` 说值「是希望显示的 Unicode 字符（**也可使用字符串**）」：`build.rs` 按 `BTreeMap<String, String>` 解析，非字符串直接编译失败，括号里那半句是旧格式残留。已改，并补一句说明同一目录的 `commands.json` 管的是**结构**而不是显示（此前这篇只讲 `symbols.json`，容易让人以为 `commands.json` 也在这里描述）。
+
+### 验证（本轮补完后重跑）
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **137 通过 / 5 忽略** |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过** |
+| `python -m unittest desktop.test_desktop` | **85 通过** |
+| `python tools/kind_inventory.py` | 退出码 0 |
+
+
+改动文件：`crates/core/src/{math,slots,typst,view,cursor}.rs`、`desktop/window.py`、`src/services.rs`、`tests/round_trip.rs`、`README.md`、`AGENTS.md`、`config/README.md`、`docs/{architecture,kind-inventory,desktop,validation}.md`。
+
+
 
 
 

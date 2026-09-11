@@ -12,7 +12,7 @@ Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`�
 
 编辑器自己画的公式有三个约定，都与编译结果对齐：**脚标移位**取 Typst 的 `.36 em / .25 em`（从编译 SVG 的基线差量出），基底是组合对象时再按它的真实升降部让开；**空槽**（`empty-cell`）画成虚线方框而不是 `□` 字形，`\frac` + Enter 之后分子分母各一个，方框会把该槽的 stop 一起折进 Box，否则光标画不出来、核心的 `move_vertical` 也找不到落点；**独占一行的行间公式**整行居中（`Editor.apply_alignment` 设块的 `AlignHCenter`），与正文同行的保持左对齐，因为 Typst 会把块级公式断到单独一行而投影不会。命令草稿与 Raw 源码共用 `source_run`，都走编辑器正文字体：它们是待编译的源码，不是编译出的字形。
 
-源码栏（`SourceDock`）与编辑器**逐行对齐**：同一个文档默认字体、同一个顶部偏移，并把编辑器实测的每行高度以 `MinimumHeight` 写进源码栏的块（带高公式的行比纯文本行高）。行高逐一相等之后两栏的滚动值可以直接对应，`Window.mirror_scroll` 双向跟随。跟随只发生于**用户滚动**：重投影会重建两栏并各放回自己的滚动值，源码栏的光标同步也会让源码栏滚到自己的光标处，这两种都不算"要跟随的滚动"（`Window.loading` 期间 `mirror_scroll` 直接返回，`Window.project` 设完光标把源码栏滚回原位），否则停在一处的源码栏光标会把编辑器一起拽走。源码栏是 `QTextEdit` 而非 `QPlainTextEdit`：后者的文档布局忽略块行高。
+源码栏（`Window.source_dock`，一个 `QDockWidget`，里面放 `SourceEditor`）与编辑器**逐行对齐**：同一个文档默认字体、同一个顶部偏移，并把编辑器实测的每行高度以 `MinimumHeight` 写进源码栏的块（带高公式的行比纯文本行高）。行高逐一相等之后两栏的滚动值可以直接对应，`Window.mirror_scroll` 双向跟随。跟随只发生于**用户滚动**：重投影会重建两栏并各放回自己的滚动值，源码栏的光标同步也会让源码栏滚到自己的光标处，这两种都不算"要跟随的滚动"（`Window.loading` 期间 `mirror_scroll` 直接返回，`Window.project` 设完光标把源码栏滚回原位），否则停在一处的源码栏光标会把编辑器一起拽走。源码栏是 `QTextEdit` 而非 `QPlainTextEdit`：后者的文档布局忽略块行高。
 
 公式字体分两件事：**结构行度量**（em、基线、下降部）取编辑器正文字体，**字形**取数学字体。`desktop/mathfont.py` 注册随附字体并读回 Qt 报告的真实家族名，只在已安装的家族里解析设置里的 `math_font`；名字不存在时退回随附数学字体而不是交给 `QFont`，因为 Qt 的替换是静默的，随后逐字回退又会把多个设计混进同一个公式。数学字体本身不能提供行度量：`NewComputerModern Math` 必须容纳四层高的定界符，12pt 下报告 `ascent=99`、`height=185`，直接当行高会得到几乎空白的巨框。数学变量的字形来自 Unicode 数学斜体区间（`a→𝑎`、`h→ℎ`），与编译结果同一套字形；文本单元保持直立。这里有一个必须分清的分界：**那个映射只适用于编辑器自己认出来的变量**。字体变体（`style` 节点）画的是**引擎已经替换好的**串，再映射一遍就把 `upright(A)` 的直体 `A` 改回斜体 `𝐴`——所以 `mathfont.glyph(..., substituted=True)` 让引擎给的串原样画（`bold` 只是因为 `𝐀` 不是 ASCII 才一直没露馅）。`h` 是这条映射唯一的例外，而且例外来自 **Unicode 的洞**而不是映射规则：U+1D455（mathematical italic small h）**未分配**，引擎把默认斜体 h 排成 Planck 常数 `ℎ` U+210E；52 个字母逐个问过真适配器，只有它一处不同。随附字体位于 `fonts/`，`native-adapter` 也把数学字体编进自己的二进制。
 
@@ -49,7 +49,7 @@ Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`�
 
 结构修改通过唯一 Editor 执行；若序列化结果实际改变，Document 仅替换活动范围，窗口把这次替换并入自己的撤销栈并重建投影，不会再次 `set_source` 清空活动树。源码进入和退出不做隐式格式化。隐藏公式只保存静态投影，不保存单独的光标和撤销栈。
 
-Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 UTF-16。所有跨层转换集中于 `desktop/model.py`（`to_byte`/`from_byte`/`u16`/`from_u16`/`lsp_position`）和 `src/services.rs`。LSP 返回替换范围后检查边界与重叠；异步请求返回时核对源码版本和文件身份，避免过期结果写入当前文档。
+Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 UTF-16。所有跨层转换集中于 `desktop/model.py`（`to_byte`/`from_byte`/`u16`/`from_u16`）与 `Window.lsp_position`（`desktop/window.py`，唯一的 UTF-16 → LSP character 转换点）和 `src/services.rs`。LSP 返回替换范围后检查边界与重叠；异步请求返回时核对源码版本和文件身份，避免过期结果写入当前文档。
 
 ## 分层：内核与外围
 
@@ -91,11 +91,11 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 
 | 源码 | 节点 | `typst.rs` 的分支 |
 | --- | --- | --- |
-| `1/2` | `MathFrac` | `:541` |
-| `x_1`、`x^2`、`x'` | `MathAttach` | `:542` |
-| `∛x`、`∜x` | `MathRoot` | `:550` |
-| `(a + b)`、`[x]` | `MathDelimited` | `:555` |
-| `&`、`\` | `MathAlignPoint`、`Linebreak` | `:494`（`parse_cell` 预处理） |
+| `1/2` | `MathFrac` | `:545` |
+| `x_1`、`x^2`、`x'` | `MathAttach` | `:546` |
+| `∛x`、`∜x` | `MathRoot` | `:559` |
+| `(a + b)`、`[x]` | `MathDelimited` | `:575` |
+| `&`、`\` | `MathAlignPoint`、`Linebreak` | `:498`（`parse_cell` 预处理） |
 
 `math_op` 把 `/` 映射到 `MathFrac`、`_`/`^` 映射到 `MathAttach`，**按算符形态判定，完全不查名字**。所以 `1/2` 是分式这件事，parser 自己就知道。
 
@@ -136,7 +136,8 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 | `frac`、`sqrt`、`root`、`hat`、`overline`、`underline`、`abs`、`norm`、`cancel` | `FracElem`/`RootElem`/`AccentElem`/`CancelElem` 等 | 是 | **存成 `MacroCall`，形状查表得到**（见下节） |
 | `mat`、`vec`、`cases` | `MatElem`/`VecElem`/`CasesElem` | 是 | `Kind::Table`，但**行方式与定界符来自配置**（见下节） |
 | `a/b`、`√x`、`(a+b)`、`x^2` | `Fraction`/`Radical`/`Fenced`/`Scripts` | 不适用 | 语法节点，与名字无关 |
-| `bb(A)`、`lr(x, size: #100%)` | `TextElem` 变体 / `LrElem` | **否** | `Raw`，引擎自己画 |
+| `bb(A)`、`lr(x, size: #100%)` | `TextElem` 变体 / `LrElem` | **否** | `bb` 不在表里、`lr` 有具名实参——建的是未知名字的 `MacroCall`（画成 `raw_macro`，参数可编辑），**不是** `Raw` |
+| `bold(x)`、`upright(A)` | 变体在引擎里是**码位替换** | 是 | **存成 `MacroCall`，形状查表得到**；字形由 `/api/glyphs` 问引擎，见下节 |
 
 `vec` 曾经是这里"引擎认得、表里没有"的例子，现在进表了。**注意 `VecElem` 一直是 define 过的**（`math/mod.rs:68`），所以引擎从来就把它解析成列向量；内核当初不认它只是因为表里没有——两者是两回事。
 
@@ -186,7 +187,7 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 ### 配置好的名字存成 `MacroCall`，形状是查出来的
 
-`config/commands.json` 里的名字**不再各自有一个 `Kind`**：节点存的是**调用**（`MacroCall { name, cells }`），而**槽位、视图、拼写**都在画或写的那一刻由名字查表得到（`math::MathAtom::command_shape` → `slots::configured_kind`）。所以 `Kind::Fraction`/`Sqrt`/`Root`/`Accent`/`Line` 这些变体**仍然存在，但不再是树里的节点**——它们是**形状描述符**，被 `configured_kind` 按名字返回。`Kind::Fenced` 与 `Kind::Table` 例外，它们仍然真的被存下来（前者是 `(a+b)` 的语法节点，后者见上表）。
+`config/commands.json` 里的名字**不再各自有一个 `Kind`**：节点存的是**调用**（`MacroCall { name, cells }`），而**槽位、视图、拼写**都在画或写的那一刻由名字查表得到（`math::MathAtom::command_shape` → `slots::configured_kind`）。所以 `Kind::Fraction`/`Sqrt`/`Root`/`Accent`/`Line`/`Style` 这些变体**仍然存在，但不再是树里的节点**——它们是**形状描述符**，被 `configured_kind` 按名字返回。`Kind::Fenced` 与 `Kind::Table` 例外，它们仍然真的被存下来（前者是 `(a+b)` 的语法节点，后者见上表）。
 
 这样做换来一件事：**配置文件决定什么被结构化，而且改了文件不会留下持有旧形状的节点**。代价是两类**按 `Kind` 写死的规则会静默失效**，实测在两处发生过，都记在这里：
 
@@ -210,11 +211,11 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 这条判据**有测试守着**：`tests/stored_kinds.rs` 解析一份覆盖"命令写法 + 语法写法"的语料，收集**真正进过树**的 `Kind`，断言集合恰好是 `Char`/`Symbol`/`Number`/`Raw`/`MacroCall`/`Text`/`Fraction`/`Scripts`/`Fenced`/`Table`/`Multiline`/`Unknown` 十二个。多一个就说明有人把某个**形状描述符**重新变成了会存的节点——那种回归能编译、能往返，此前没人会说。实测把 radical 那一支改回 `Kind::Sqrt`，它会报「多出来的：["Sqrt"]」。
 
-`Sqrt`/`Root`/`Accent`/`Line` 四个变体因此**只在形状表里活着**：`configured_kind` 拿它们当形状返回、`Decl` 描述它们的槽位、`view_atom` 按它们画，但没有源码能存它们。这不是"该删没删"，而是**一个变体身兼两职**——`command_shape()` 与 `is_macro()` 之所以必须存在，就是因为 `Kind::MacroCall` 同时也是"借了形状的命令"。
+`Sqrt`/`Root`/`Accent`/`Line`/`Style` 五个变体因此**只在形状表里活着**：`configured_kind` 拿它们当形状返回、`Decl` 描述它们的槽位、`view_atom` 按它们画，但没有源码能存它们。这不是"该删没删"，而是**一个变体身兼两职**——`command_shape()` 与 `is_macro()` 之所以必须存在，就是因为 `Kind::MacroCall` 同时也是"借了形状的命令"。
 
 ### `Style` 的替换表在适配器那一侧，不在前端也不在内核
 
-`Style{text, style_name}`（`bold`/`upright`…）的**机制**很便宜：形状不带数据（`style_name` 就是命令名，和 `Accent` 一样），所以只要一个形状描述符 + 配置里几行。**贵的是那一步"替换"**，也就是"让前端负责渲染"实际要求什么。查证结果：
+`Kind::Style` 的载荷是 `{name}`（命令名），**线上**才叫 `style_name`；`text` 是线上 View 的字段，装的是整段调用拼写。`Style{name}`（`bold`/`upright`…）的**机制**很便宜：形状不带数据（`name` 就是命令名，和 `Accent` 一样），所以只要一个形状描述符 + 配置里几行。**贵的是那一步"替换"**，也就是"让前端负责渲染"实际要求什么。查证结果：
 
 | 事实 | 证据 |
 | --- | --- |
@@ -236,7 +237,7 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 **取字与画分离**，这一条是踩过一次才定下来的：盖章发生在**布局那一刻**（页面的入口是 `FormulaObject.box`，公式框的入口是 `MathCanvas.refresh`），从缓存里读，所以答案回调只需要 `touch()` + 重画。此前盖章写在"视图建好时"，于是答案晚到时要么补盖、要么不盖——而一个公式恰好有**两个投影**（页面一份、公式框一份），"补盖"就变成每个投影各自的义务，漏掉一个的表现正是一个空白变体。
 
-未做：`bb`/`cal`/`frak`/`scr` 还没进 `config/commands.json`，所以 `bb(A)` 仍是 `Raw`（引擎自己画，正确但不可编辑）。加它们是配置里几行——表不再是障碍。已知限制：`to_style` 可能返回两个码位（`𝒬\u{fe00}`），而 `mathfont.glyph` 是按字符映射的，`cal`/`scr` 这类变体要单独确认 Qt 画变体选择符的行为。
+未做：`bb`/`cal`/`frak`/`scr` 还没进 `config/commands.json`，所以 `bb(A)` 建的是**未知名字的调用**（`raw_macro`：光标在外画一张图，进去画名字与参数槽，参数可编辑）——不是 `Raw`。加它们是配置里几行——表不再是障碍。已知限制：`to_style` 可能返回两个码位（`𝒬\u{fe00}`），而 `mathfont.glyph` 是按字符映射的，`cal`/`scr` 这类变体要单独确认 Qt 画变体选择符的行为。
 
 ### `MathIdent` 查的是两张表，不是一张
 
@@ -258,7 +259,7 @@ $RR$  →  MathIdent("RR")
 | --- | --- | --- | --- |
 | 裸标识符，先 | 宏作用域（`definitions` 里的 `#let`） | `MacroCall`（可展）或 `Raw`（不可展） | 继续查符号表 |
 | 裸标识符，后 | `config/symbols.json`（40 项） | `Kind::Symbol` | `Kind::Raw` |
-| 调用 `name(...)` | `config/commands.json`（9 项） | 结构命令的 `Kind` | `Kind::Raw` |
+| 调用 `name(...)` | `config/commands.json`（14 项） | 借形状的调用（`MacroCall`），或表里没有但实参全是位置实参的 `Kind::Raw`（画成 `raw_macro`） | `Kind::Raw` |
 
 **`Symbol` 不是 `Char`**，这一点常被含混过去：`Kind::Symbol` 的载荷是 `{name, glyph}`，`name` 保留源名、`glyph` 只用于显示（`view.rs`把它放进 `display_glyph`），回写走 `Write::OwnText` 写的是 **`name`** ——所以 `alpha` 存盘回来还是 `alpha`，不会变成 `𝛼`。真正"拆成字符"的是单字母的 `MathText`：`$R$` 是 `Char{text:"R"}`，而 `$RR$` 是 `MathIdent` 整体落 `Raw`（多字母标识符是一个节点，**不是**两个 `MathText`，所以那条 `graphemes` 拆分不会碰它）。
 
@@ -269,7 +270,7 @@ $RR$  →  MathIdent("RR")
 | `$RR$` | `MathIdent` | `Raw{source:"RR"}` | `RR` |
 | `$RRR$` | `MathIdent` | `Raw`（引擎侧 `unknown variable: RRR`） | `RRR` |
 
-`$RR$` 落在最后一行**不是错误**：`RR` 在引擎里是一个符号（黑板粗体 ℝ，`style.rs:150` 的文档自己写着 `bb(N) = NN`），实测 24pt 下 `RR` 与 `bb(R)` 盒子逐字节相同（都是 17.328），而单个斜体 `R` 是 18.792、`R R` 是 37.584。它成 `Raw` 只是因为 `symbols.json` 这 40 项没收它——与 `cancel`/`vec` 是**两级不同的缺口**：`cancel` 是引擎有元素、编辑器没有 `Kind`；`RR` 是引擎有符号、符号表没收录。共同点是都只剩 `Raw` 这一条退路（保留原文，引擎自己画，编辑器内部无结构）。
+`$RR$` 落在最后一行**不是错误**：`RR` 在引擎里是一个符号（黑板粗体 ℝ，`style.rs:150` 的文档自己写着 `bb(N) = NN`），实测 24pt 下 `RR` 与 `bb(R)` 盒子逐字节相同（都是 17.328），而单个斜体 `R` 是 18.792、`R R` 是 37.584。它成 `Raw` 只是因为 `symbols.json` 这 40 项没收它，而这**不是** `cancel`/`vec` 那种缺口：那两个早就在 `commands.json` 里（`decoration` 与 `grid` 形状），建的是借形状的调用，可以编辑；`RR` 才是"符号表没收、只能保留原文由引擎自己画"的那一类。
 
 ## 两棵树：可编辑树与显示树
 
@@ -413,7 +414,7 @@ render.raw: [{start:684, end:694}]
 | Raw/SVG 管道的片段示例（取图、缓存、`_raw_key`、`definition_raw_ranges`、源码区间） | `document.rs`、`macro_scope.rs`、`desktop.rs`、`test_desktop.py` |
 | **让宏变成不可展的惯用写法**：把形参放进 `Raw` | `#let f(x) = $cancel(#x)$` → `参数引用位于 Raw 中，无法在原位编辑` |
 
-第二种最要紧：`cancel(#x)` 是"造一个不可展宏"的手段，它结构化之后那些用例就失去了构造方式。替代范例换成 **`lr(x, size: #100%)`**（共 64 处引用）：`lr` 带具名实参，而解析器对**非位置实参一律退回原文**，所以它保持 `Raw` 是由语法保证的，不只是"暂时没进配置"。`rawcache.contains_call` 也仍然认它（`标识符` 紧跟 `(`）。
+第二种最要紧：`cancel(#x)` 是"造一个不可展宏"的手段，它结构化之后那些用例就失去了构造方式。替代范例换成 **`lr(x, size: #100%)`**（按 `git grep -F 'lr('` 数：14 个文件、80 处）：`lr` 带具名实参，而解析器对**非位置实参一律退回原文**，所以它保持 `Raw` 是由语法保证的，不只是"暂时没进配置"。`rawcache.contains_call` 也仍然认它（`标识符` 紧跟 `(`）。
 
 两类容易漏的坑：一是**硬编码的长度**——`test_desktop.py` 里 `definition+9` 是照着 `cancel(a)` 的 9 个字符写的，换范例后静默变成错的偏移（现在改为从字符串本身取长度）。二是**不会变红而是静默失去被测对象**：`round_trip.rs` 与 `structured_input.rs` 的 Raw 清单里也躺着 `cancel(...)`，它们会继续通过，但已经不在测 Raw 了。所以 `tests/round_trip.rs` 另加了一条直接断言——`cancel` 之所以是结构节点**只因为配置文件写了它**，而往返测试看不见这件事（删掉配置项后它变成 `Raw`，照样逐字节往返），与 `math::is_number` 是同一类盲区。
 

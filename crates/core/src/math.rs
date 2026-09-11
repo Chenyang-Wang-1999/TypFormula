@@ -101,8 +101,9 @@ pub enum Kind {
     /// `columns` is the one piece of instance data no name and no config file can
     /// supply — it comes from how the argument list was punctuated (`mat(a, b; c, d)`
     /// is two columns, `mat(a; b; c)` is one), and a flat cell list no longer says.
-    /// That is why this kind is *stored* while `Fraction`/`Sqrt`/`Accent`/`Line` are
-    /// only shape descriptors.
+    /// That is why this kind is *stored* while `Sqrt`/`Root`/`Accent`/`Line`/`Style`
+    /// are only shape descriptors — the names alone say what those are, and every call
+    /// that borrows one (`sqrt(x)`, `hat(x)`, `bold(x)`) is stored as a `MacroCall`.
     ///
     /// `row_lengths` records how many cells each row really had before the flat list
     /// was padded to `columns`, exactly as `Multiline` does. Rows need not be equal:

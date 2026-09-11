@@ -234,7 +234,7 @@ impl Services {
     pub fn glyphs(&self, req: GlyphRequest) -> Result<Value, String> {
         let mut body = serde_json::to_value(&req).map_err(|e| e.to_string())?;
         body["glyphs"] = Value::Bool(true);
-        self.ask_adapter(body, "取字形簇超时；先按整段调用的图显示")
+        self.ask_adapter(body, "取字形簇超时；先按调用本身（名字与主体）显示")
     }
     /// Run the layout adapter once, with one request on stdin and one reply on stdout.
     fn ask_adapter(&self, body: Value, timeout: &str) -> Result<Value, String> {

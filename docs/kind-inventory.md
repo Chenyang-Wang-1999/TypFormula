@@ -22,7 +22,7 @@
 | `aligned` | `multiline` |
 | `macro`（折叠时） | `raw_macro` |
 
-还有一处要连着读：`Fraction`/`Sqrt`/`Root`/`Accent`/`Line` 这五个**只作为形状描述符存在，不再是树里的节点**。`frac(a, b)`、`sqrt(x)`、`hat(x)` 这些**调用形式**存成 `MacroCall`（形状由名字查出来），`√x`/`∛x` 也折进同一个 `MacroCall`；只有 `a/b`（`/` 语法）还真的存 `Kind::Fraction`。判据见 `docs/architecture.md`：一个构造要是自己的 `Kind`，得带着名字与配置都给不出的**实例数据**（`Table.columns`、`Fenced.left/right`、`Multiline.row_lengths`、`Raw.source`……），或者要保住书写形式。
+还有一处要连着读：`Sqrt`/`Root`/`Accent`/`Line`/`Style` 这五个**只作为形状描述符存在，不再是树里的节点**。`sqrt(x)`、`hat(x)`、`bold(x)` 这些**调用形式**存成 `MacroCall`（形状由名字查出来），`√x`/`∛x` 也折进同一个 `MacroCall`。`Fraction` **不在这五个之列**——`frac(a, b)` 与语法写法 `a/b` 都真的存 `Kind::Fraction`（判据见 `docs/architecture.md`：一个构造要是自己的 `Kind`，得带着名字与配置都给不出的**实例数据**（`Table.columns`、`Fenced.left/right`、`Multiline.row_lengths`、`Raw.source`……），或者要保住书写形式）。
 
 | `Kind` | 存储字段 | 槽位（role·scale·可空） | 入口（前进 → / 后退 ←） | 左右 | 上下 | 形状名 | 回写 | 线上实测 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -52,8 +52,8 @@
 
 | 字段 | 谁填 | 实测值示例 |
 | --- | --- | --- |
-| `kind` | 全部 | 视图名（**线名**，可以与 `Kind` 的*形状名*不同：`Sqrt`/`Fenced`/`Accent`/`Line` 都是 `decorated`） |
-| `text` | 每个节点都有这个字段，但**带内容的只有** `Char`/`Symbol`/`Number`/`Raw`/`raw_macro`/`Fenced`/`decorated`；`Unknown` 与所有结构性 `Kind` 都是空串 | `hat`、`(\n)`、`x`、`12.5`、`layer15(a)` |
+| `kind` | 全部 | 视图名（**线名**，可以与 `Kind` 的*形状名*不同：`Sqrt`/`Fenced`/`Accent`/`Line` 都是 `decorated`，`macro` 折叠时是 `raw_macro`） |
+| `text` | 每个节点都有这个字段，但**带内容的只有** `Char`/`Symbol`/`Number`/`Raw`/`raw_macro`/`Fenced`/`decorated`/`style`；`Unknown` 与所有结构性 `Kind` 都是空串 | `hat`、`(\n)`、`x`、`12.5`、`layer15(a)`、`bold(upright(a))` |
 | `role` | 父节点填给子节点（`Decl::role_at`）；根节点不填 | `numerator`、`radicand`、`inner` |
 | `display_glyph` | **只有 `Char`**，且只有这个字符在 `config/symbols.json` 里时 | 打的 `-` → `−` |
 | `children` | 除叶子外全部；`Scripts` 恒 3 个（缺席补 `absent`） | — |
@@ -65,7 +65,7 @@
 | `style_name` | **只有 `style`**：命令名。前端画"光标进入后显示的名字"用它，而**取字用的是 `text`**（整段调用拼写），两者不是一回事 | `bold` |
 | `border` | 表格的定界符，左+右或单边一个 | `mat`/`vec` → `()`；`cases` → `{ ` |
 | `is_mat` | 表格按 `mat` 的方式切行（而不是一个参数一行） | `mat` true，`vec`/`cases` false |
-| `edit` | **`Raw` 与 `raw_macro`**（两者都靠"源码 + 光标"在文档里定位），值是一个 `Cursor` | `{slices:[], pos:0, occurrence:"root.a0.edit"}` |
+| `edit` | **`Raw`、`raw_macro` 与 `style`**。前两者靠"源码 + 光标"在文档里定位；`style` **不取图**，它的 `edit` 只对前端有意义，因此**没有** `source_range` | `{slices:[], pos:0, occurrence:"root.a0.edit"}` |
 | `attachment` | **只有顶层 `Scripts`**，值是它的 Typst 拼写 | `x^(2)` |
 | `definitions` / `origin` / `source_range` | **只有位于宏模板里的 `Raw`** | 定义上下文 / 定义源码 / 定义中的区间 |
 
@@ -100,9 +100,9 @@
 | `Accent`（`cancel`） | `CancelItem` 的 `length`、`stroke`、`angle`、`inverted`、`cross` | 编辑器只存正文与命令名，前端固定画"内容框的上升对角线 + 0.3em"；`inverted`/`cross`/`angle` 表达不了。实测 `cancel(x)` 与 `x` 的盒子完全相同，所以记号是盖在正文上而不是把盒子撑高 |
 | `Sqrt`/`Root` | 引擎是一个 `Radical`，`index: Option` | 编辑器分成两个 `Kind`（这是**有意保留**的：两者插槽不同，合并反而对前端不友好） |
 | `Scripts` | 6 个附件字段（`top`/`bottom` 是居中极限，`top_right`/`bottom_right` 是侧挂脚标，另有左侧两个） | 编辑器只有 3 格；左侧附件 `native-adapter` 明确报错"暂不支持左侧附件的槽位映射" |
-| `Fenced` | 定界符是 `Option<MathItem>`（`cases` 只有一个），另有 `balanced` | 编辑器存两个字符串，无 `left`/`right` 之分（`cases` 那种单边定界符表达不了） |
+| `Fenced` | 定界符是 `Option<MathItem>`（`cases` 只有一个） | `Fenced` 存的是 `left`/`right` **两个字符串**，所以单边定界符（右边为空）表达得了；这也是 `Kind::Fenced` 唯一超出"名字加配置"的实例数据 |
 | `Fraction` | `line`（是否有分数线）与 `padding` | 编辑器无法表达"无横线分式" |
-| `Table` | `gap`、`augment`、`align`、`alternator` | 只有列数；表内对齐与增广线都没有 |
+| `Table` | `gap`、`augment`、`align`、`alternator` | 只有列数（`columns`/`row_lengths`）；表内对齐（`align`）与增广线（`augment`）都没有。行方式与定界符来自 `config/commands.json` 里那个名字，不是引擎给的 |
 | `Multiline` | `centered` | 没有 |
 | 全部 | `MathProperties` 里的 `cramped`、`lspace`/`rspace`、`spaced`、`ignorant` | 间距类信息只有 `class` |
 
@@ -113,7 +113,7 @@
 - 解析宏定义体时 `ParseContext { template: true }`，`#x` 变成 `Parameter`、嵌套调用变成 `TemplateCall`；
 - 但显示调用时 `view.rs` 的 `bind_template_inner` 会把 `parameter` 换成实参视图、把 `template-call` 换成被调宏的展开结果。
 
-实测：30 个用例的完整 `view` JSON 里，`"kind": "parameter"` 与 `"kind": "template-call"` 出现 **0 次**。它们仍必须有 `Decl`（`template_size` 要遍历、`Write::TemplateOnly` 要在写入时停下），但**前端永远看不到它们**。
+实测：32 个用例的完整 `view` JSON 里，`"kind": "parameter"` 与 `"kind": "template-call"` 出现 **0 次**。它们仍必须有 `Decl`（`template_size` 要遍历、`Write::TemplateOnly` 要在写入时停下），但**前端永远看不到它们**。
 
 ## 六、探测中发现的十二件事
 
@@ -125,7 +125,7 @@
 11. **一个"字符"是一个字形簇，不是一个 Unicode 标量。** 词法把 `e`+U+0301、`👍🏽`、ZWJ 家庭 emoji 各收成一个 `MathText` 节点，而 `GlyphItem.text` 也是一个字形簇；编辑器原先按标量拆成多个 `Char`，于是**回写会在字形簇中间插入分隔符**，敲一个键就把 `é` 变成 `e` + 空格 + 飘在后面的重音符（实测码位 `0x65 0x20 0x7a 0x20 0x301`）。对齐载荷为一个字形簇之后：`0x65 0x301 0x20 0x7a`，字形簇完好。这是"回写义务"那一类缺陷，会改坏文档内容。
 12. **前端"有分支但后端到不了"的名字，一共九个，已全部删除。** 逐个对照命令表（`config/commands.json`）与 `Decl::view`：`decoration` 里的 `widehat`/`dot`/`ddot`/`dddot`/`arrow`/`underline`/`underbrace`/`underbracket`/`underparen` 都不可能出现在线上——后端只产生 `hat` 与 `cancel`（`Accent`，线上都是 `decorated`）以及 `overline`/`underline`（`Line`，线上也是 `decorated`），其余名字会落成 `Raw` 由引擎自己画。反向的检查也做了：`multiline` 的左右交替对齐、`scripts` 的 `_placement`（`limits`/`scripts`）、`unknown` 的 `_string_mode` 都是真的到得了的；`ARRANGEMENTS` 白名单里多出的 `draft-*`/`absent`/`stop`/`cell`/`macro-argument` 是前端自造或后端合成的节点，不在 `Decl` 里，属于白名单该有的成员。后来 View 词汇整体重划（`sqrt`/`delim`/`decoration`/`line` 合并成 `decorated`，`grid`/`aligned`/`script`/`macro-collapsed` 改名），这张白名单也随之换过一遍；`decorated` 内部改用 `marker` 分派，同样只收后端真能产生的记号。
 
-    这次靠人眼逐个对照，**所以后来把它变成了机器检查**：`tools/kind_inventory.py` 现在把 26 个用例里**实际发出的线名**与 `mathview.py` 的 `ARRANGEMENTS` 做双向对照，任一边多出来就打印并**以非零码退出**。实测两个方向都对齐——22 个真发出的线名 + `parameter`/`template-call`（第五节：只存在于宏模板里，上线前就被 `bind_template_inner` 换掉，但必须有画法与 `Decl`）+ `absent`/`symbol`（前端自造）= 全部 24 个。检查本身也验过有牙：往 `ARRANGEMENTS` 里塞一个 `bogus-arm` 立刻报「后端发不出来的排布名」，退出码 1。
+    这次靠人眼逐个对照，**所以后来把它变成了机器检查**：`tools/kind_inventory.py` 现在把 32 个用例里**实际发出的线名**与 `mathview.py` 的 `ARRANGEMENTS` 做双向对照，任一边多出来就打印并**以非零码退出**。实测两个方向都对齐——23 个真发出的线名 + `parameter`/`template-call`（第五节：只存在于宏模板里，上线前就被 `bind_template_inner` 换掉，但必须有画法与 `Decl`）+ `absent`/`symbol`（前端自造）= 全部 25 个。检查本身也验过有牙：往 `ARRANGEMENTS` 里塞一个 `bogus-arm` 立刻报「后端发不出来的排布名」，退出码 1。
 
     顺带在两处踩到"看着该有却没有"：`draft-text` 需要草稿里**有名字**（只打一个 `\` 只有占位符与光标），`empty-cell` 需要**真的有空格子**——而 `frac(a, )` 的尾逗号**不产生实参**，所以要用带显式空档的 `mat(, ; , )`。两个用例因此补进了 `CASES`。
 

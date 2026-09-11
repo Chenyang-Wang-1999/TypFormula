@@ -15,7 +15,7 @@ python -m pip install -r desktop/requirements.txt  # 已安装 PyQt5 时无需�
 
 首次创建窗口时，程序使用鼠标指针所在显示器的可用工作区（排除任务栏），在保留边距的前提下取不超过 1400×900 的尺寸并居中。通过“新窗口”创建的窗口沿用当前窗口所在显示器。计算使用 Qt 的逻辑像素，因此会自动适应 Windows 的 DPI 缩放和具有负坐标的多显示器布局。
 
-构建脚本只构建，不启动窗口。当前提供源码运行入口，尚未打包独立安装器。`VISUAL_TYPST_PYTHON` 可指定 Python 可执行文件；`VISUAL_TYPST_BIN` 可指定核心程序。未设置时使用 `target/server/debug/visual-typst.exe`。原生渲染器使用 `target/adapter/debug/visual-typst-layout.exe`。Tinymist 的查找规则与正式版后端相同。
+构建脚本只构建，不启动窗口。当前提供源码运行入口，尚未打包独立安装器。`VISUAL_TYPST_PYTHON` 可指定 Python 可执行文件；`VISUAL_TYPST_BIN` 可指定核心程序。未设置时优先用 `target/server/release/visual-typst.exe`（`build-desktop.cmd` 构建的就是它），不存在才退回 `target/server/debug/visual-typst.exe`；原生渲染器同理，`target/adapter/release/visual-typst-layout.exe` 优先，其次 `debug`。Tinymist 的查找规则与正式版后端相同。
 
 正式版代码与资源不依赖 `prototypes/`。随附数学字体位于 `fonts/`，桌面端只从这里加载字体，不载入任何前端代码。`desktop/mathfont.py` 启动时注册随附字体并读回 Qt 报告的真实家族名（数学字体为 `NewComputerModern Math`；同一文件在 Windows 上还以 `NewComputerModernMath` 出现），公式用哪一款由设置项 `math_font` 决定，未安装的名字不会被交给 `QFont`——Qt 对找不到的家族名会静默换成系统字体，随后逐字回退又会在同一个公式里混入第三、第四种设计。`math_font` 需要是有数学字形覆盖的字体，换成正文文本字体会让 `≤`、`∑` 这类字符再次逐字回退。
 

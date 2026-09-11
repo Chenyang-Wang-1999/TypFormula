@@ -54,8 +54,9 @@ class Window(QMainWindow):
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
         self.settings=load_settings();self.typesetter=Typesetter(self.settings);self.typesetter.warn=self.report
         self.raw_cache=RawCache();self.raw_pending=set()
-        # (analysis, sorted (start, end, context) per formula, their starts), rebuilt
-        # when the analysis is replaced.
+        # (analysis, {render_id prefix -> digest of the script shape}) for the fragments
+        # whose box follows the script they sit in, rebuilt when the analysis is replaced.
+        # See `context_index` for why only those fragments are in it.
         self.contexts=None
         # Attachment requests per live formula view, so a background cycle does
         # not walk every view node and rebuild every definition prefix.
@@ -843,8 +844,9 @@ class Window(QMainWindow):
     def invalidate_raw(self,records):
         """Drop every image of the fragments a script edit invalidated.
 
-        A fragment that holds a call is stored once per formula, so the sweep goes
-        by source text: the record names the fragment, not one of its pictures.
+        An invalidated record names the fragment's *text*, and one image per source text
+        answers every formula that writes it, so the sweep goes by text rather than by the
+        one picture the record came from.
         """
         for _,text in records:
             prefix=('raw',text)

@@ -644,7 +644,7 @@ impl Editor {
     /// own spelling promises a placeholder needs that cell to exist, because
     /// `$frac()$` really resolves to a fraction with no cells and writing it back
     /// would emit `frac()` instead of the empty slots the author asked for. See
-    /// `slots::Decl::grow_empty`.
+    /// `fill_command_cells`.
     fn insert_named(&mut self, name: &str, saved: MathData) {
         let pos = self.cursor.pos;
         // A command with no arguments of its own is read as the call it spells, so

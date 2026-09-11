@@ -271,18 +271,18 @@ impl Editor {
             // `LineItem` stores the position and nothing else, so the marker is the
             // position spelled the way the frontend draws it.
             Kind::Line { above } => View::decorated(if *above { "overline" } else { "underline" }, "", children),
-            // A font variant. `style_name` is what the frontend asks the engine with, and
-            // `text` is the **call's spelling** (`bold(upright(a))`) — the expression whose
-            // substituted glyphs are wanted, so nothing has to be reassembled from the
-            // children. The glyphs themselves are not here: the kernel cannot reach the
-            // table that produces them, so the frontend stamps them on once it has them.
+            // A font variant. `style_name` is the command that made it, and `text` is the
+            // **call's spelling** (`bold(upright(a))`) — the expression whose substituted
+            // glyphs are wanted, so nothing has to be reassembled from the children. The
+            // glyphs themselves are not here: the kernel cannot reach the table that
+            // produces them, so the frontend reads them out of its own cache when it lays
+            // the view out, and draws the call itself until it has them.
             Kind::Style { name } => {
                 let mut v = View::new("style", typst::write_atom(atom), children);
                 v.style_name = Some(name.clone());
-                // A cursor, so `document::annotate` can locate this call in the document
-                // and give it a range: the *image* of the call is the drawing used until
-                // the substituted glyphs arrive, and it is the one drawing that is always
-                // right (the engine typesets the variant itself).
+                // The cursor locates this call for the *frontend*, not for `annotate`:
+                // a variant is never drawn from an image, so it holds no source range.
+                // Its children are what an edit of the body goes through.
                 v.edit = path.map(|path| Cursor { slices: path.to_vec(), pos, occurrence: format!("{occurrence}.edit") });
                 v
             }
