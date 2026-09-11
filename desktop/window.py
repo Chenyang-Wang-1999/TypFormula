@@ -52,7 +52,7 @@ class Window(QMainWindow):
         self.history=[];self.future=[];self.revision=0;self.analysis={};self.math_state=None
         self.semantic_spans=[];self.engine_spans=[]
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
-        self.settings=load_settings();self.typesetter=Typesetter(self.settings)
+        self.settings=load_settings();self.typesetter=Typesetter(self.settings);self.typesetter.warn=self.report
         self.raw_cache=RawCache();self.raw_pending=set()
         # (analysis, sorted (start, end, context) per formula, their starts), rebuilt
         # when the analysis is replaced.

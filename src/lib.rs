@@ -2,6 +2,7 @@
 // Rust port of the LyX math editing core. See docs/LYX-CREDITS and COPYING.
 pub mod cursor;
 pub mod math;
+pub mod slots;
 pub mod typst;
 pub mod view;
 pub mod document;

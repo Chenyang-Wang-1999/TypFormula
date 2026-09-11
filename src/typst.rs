@@ -2,6 +2,7 @@
 // Typst replaces MathParser/TeXMathStream at import and command confirmation.
 // Structural editing and draft keystrokes do not reparse the formula.
 use crate::math::*;
+use crate::slots::Write;
 use typst_syntax::{Source, SyntaxKind, SyntaxNode, ast::{self, AstNode}};
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}};
 
@@ -465,7 +466,7 @@ fn parse_cell(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
         let columns = rows.iter().map(Vec::len).max().unwrap_or(1);
         let row_lengths = rows.iter().map(Vec::len).collect();
         let cells = rows.into_iter().flat_map(|mut row| { row.resize(columns, vec![]); row }).collect();
-        return vec![MathAtom { kind: Kind::Aligned { columns, row_lengths }, cells }];
+        return vec![MathAtom { kind: Kind::Multiline { columns, row_lengths }, cells }];
     }
     parse_nodes(&children, ctx)
 }
@@ -498,11 +499,13 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
     let atom = match node.cast::<ast::Expr>() {
         Some(ast::Expr::Math(_)) => return parse_cell(node, ctx),
         Some(ast::Expr::Str(s)) => MathAtom { kind: Kind::Text, cells: vec![s.get().chars().map(MathAtom::character).collect()] },
-        Some(ast::Expr::MathFrac(f)) => MathAtom { kind: Kind::Frac, cells: vec![parse_cell(f.num().to_untyped(), ctx), parse_cell(f.denom().to_untyped(), ctx)] },
+        Some(ast::Expr::MathFrac(f)) => MathAtom { kind: Kind::Fraction, cells: vec![parse_cell(f.num().to_untyped(), ctx), parse_cell(f.denom().to_untyped(), ctx)] },
         Some(ast::Expr::MathAttach(a)) if a.primes().is_none() => {
-            let mut script = MathAtom { kind: Kind::Script { cell_1_is_up: a.top().is_some() }, cells: vec![parse_cell(a.base().to_untyped(), ctx)] };
-            if let Some(top) = a.top() { script.cells.push(parse_cell(top.to_untyped(), ctx)); }
-            if let Some(bottom) = a.bottom() { script.cells.push(parse_cell(bottom.to_untyped(), ctx)); }
+            // Storage is always `[base, upper, lower]`, whatever the source
+            // spells: an attachment the source omits stays an empty cell.
+            let mut script = MathAtom { kind: Kind::Scripts, cells: vec![parse_cell(a.base().to_untyped(), ctx), vec![], vec![]] };
+            if let Some(top) = a.top() { script.cells[script_cell(true)] = parse_cell(top.to_untyped(), ctx); }
+            if let Some(bottom) = a.bottom() { script.cells[script_cell(false)] = parse_cell(bottom.to_untyped(), ctx); }
             script
         }
         Some(ast::Expr::MathRoot(r)) => {
@@ -518,7 +521,7 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             // Typst includes the delimiters in MathDelimited::body.
             if body.first().is_some_and(|a| write_atom(a) == left) { body.remove(0); }
             if body.last().is_some_and(|a| write_atom(a) == right) { body.pop(); }
-            MathAtom { kind: Kind::Delim { left, right }, cells: vec![body] }
+            MathAtom { kind: Kind::Fenced { left, right }, cells: vec![body] }
         }
         Some(ast::Expr::MathCall(call)) => {
             let name = call.callee().to_untyped().full_text().to_string();
@@ -547,11 +550,11 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             }
             if width > 0 { widths.push(width); }
             let kind = match (name.as_str(), args.len()) {
-                ("frac", 2) => Kind::Frac, ("sqrt", 1) => Kind::Sqrt, ("root", 2) => Kind::Root,
-                ("abs", 1) => Kind::Delim { left: "|".into(), right: "|".into() },
-                ("norm", 1) => Kind::Delim { left: "‖".into(), right: "‖".into() },
+                ("frac", 2) => Kind::Fraction, ("sqrt", 1) => Kind::Sqrt, ("root", 2) => Kind::Root,
+                ("abs", 1) => Kind::Fenced { left: "|".into(), right: "|".into() },
+                ("norm", 1) => Kind::Fenced { left: "‖".into(), right: "‖".into() },
                 ("overline" | "underline" | "hat" | "vec", 1) => Kind::Decoration { name },
-                ("mat", n) if n > 0 && widths.iter().all(|w| *w == widths[0]) => Kind::Grid { columns: widths[0] },
+                ("mat", n) if n > 0 && widths.iter().all(|w| *w == widths[0]) => Kind::Table { columns: widths[0] },
                 _ => return vec![MathAtom::from_source(node.full_text())],
             };
             if matches!(kind, Kind::Root) { args.swap(0, 1); }
@@ -575,7 +578,7 @@ fn parse_marker(node: &SyntaxNode) -> MathData {
     // A single marker can also be the complete expression in an argument.
     let columns = if node.kind() == SyntaxKind::MathAlignPoint { 2 } else { 1 };
     let row_lengths = if columns == 2 { vec![2] } else { vec![1, 1] };
-    vec![MathAtom { kind: Kind::Aligned { columns, row_lengths }, cells: vec![vec![], vec![]] }]
+    vec![MathAtom { kind: Kind::Multiline { columns, row_lengths }, cells: vec![vec![], vec![]] }]
 }
 
 pub fn write_cell(data: &MathData) -> String {
@@ -602,35 +605,88 @@ pub fn write_cell(data: &MathData) -> String {
     }
     out
 }
+/// Fills a `slots::Write::Template`: `{0}`, `{1}`… are cell indices and
+/// `{name}` is the node's stored name.
+///
+/// One pass rather than successive replacement: a cell's own source can contain
+/// braces (a text run is written as a quoted string), so substituting cell 0
+/// first would let its text be expanded as though it were part of the template.
+fn fill_template(template: &str, atom: &MathAtom) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('}') else { out.push_str(&rest[open..]); return out };
+        let key = &rest[open + 1..open + close];
+        match key {
+            "name" => match &atom.kind {
+                Kind::MacroCall { name, .. } | Kind::Decoration { name } => out.push_str(name),
+                other => unreachable!("模板用了 {{name}}，但 {other:?} 没有名字"),
+            },
+            other => match other.parse::<usize>().ok().and_then(|index| atom.cells.get(index)) {
+                Some(cell) => out.push_str(&write_cell(cell)),
+                // Keep an invented placeholder visible rather than dropping it,
+                // so the round-trip test fails loudly instead of silently
+                // writing a truncated node into the document.
+                None => { debug_assert!(false, "模板占位符 {{{other}}} 没有对应的格子"); out.push_str(&rest[open..open + close + 1]); }
+            },
+        }
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+/// A node's Typst spelling, chosen by its declaration (`slots::Write`).
+///
+/// The `unreachable!` arms are declaration-versus-kind mismatches: the
+/// declaration says which shape a kind has, and `slots.rs`'s tests assert that
+/// every kind agrees with its own declaration. A loud stop is deliberate here —
+/// this function feeds the authoritative source, so writing a truncated node
+/// would corrupt the document, which is worse than stopping.
 pub fn write_atom(atom: &MathAtom) -> String {
-    let c = |idx| write_cell(&atom.cells[idx]);
-    match &atom.kind {
-        Kind::Char { value } => value.to_string(),
-        Kind::Symbol { name, .. } | Kind::Raw { source: name } => name.clone(),
-        Kind::Unknown { name, .. } => name.clone(),
-        Kind::MacroCall { name, function } => if *function { format!("{name}({})", atom.cells.iter().map(write_cell).collect::<Vec<_>>().join(", ")) } else { name.clone() },
-        Kind::Parameter { index } => format!("#parameter{index}"),
-        Kind::TemplateCall { .. } => unreachable!("template edges never belong to the editable source tree"),
-        Kind::Text => serde_json::to_string(&atom.cells[0].iter().map(|a| if let Kind::Char { value } = a.kind { value.to_string() } else { write_atom(a) }).collect::<String>()).unwrap(),
-        Kind::Frac => format!("frac({}, {})", c(0), c(1)),
-        Kind::Sqrt => format!("sqrt({})", c(0)),
-        Kind::Root => format!("root({}, {})", c(1), c(0)),
-        Kind::Script { .. } => {
-            let base = c(0);
+    let cell = |index: usize| atom.cells.get(index).map(write_cell).unwrap_or_default();
+    let joined = |cells: &[MathData]| cells.iter().map(write_cell).collect::<Vec<_>>().join(", ");
+    match atom.decl().write {
+        Write::OwnText => match &atom.kind {
+            Kind::Char { value } => value.to_string(),
+            Kind::Symbol { name, .. } | Kind::Raw { source: name } | Kind::Unknown { name, .. } => name.clone(),
+            other => unreachable!("{other:?} 由自己的文本拼写，但它没有文本"),
+        },
+        Write::Marker => match &atom.kind {
+            Kind::Parameter { index } => format!("#parameter{index}"),
+            other => unreachable!("{other:?} 声明为占位拼写"),
+        },
+        Write::TemplateOnly => unreachable!("template edges never belong to the editable source tree"),
+        Write::Quoted => serde_json::to_string(&atom.cells[0].iter().map(|a| if let Kind::Char { value } = a.kind { value.to_string() } else { write_atom(a) }).collect::<String>()).unwrap(),
+        Write::Template(template) => fill_template(template, atom),
+        Write::Named => match &atom.kind {
+            Kind::MacroCall { name, function } => if *function { format!("{name}({})", joined(&atom.cells)) } else { name.clone() },
+            other => unreachable!("{other:?} 声明为具名调用"),
+        },
+        Write::Attach => {
+            let base = cell(0);
             let mut result = if atom.cells[0].len() > 1 { format!("({base})") } else { base };
-            if let Some(i) = atom.script_idx(false) { result.push_str(&format!("_({})", c(i))); }
-            if let Some(i) = atom.script_idx(true) { result.push_str(&format!("^({})", c(i))); }
+            if let Some(i) = atom.script_idx(false) { result.push_str(&format!("_({})", cell(i))); }
+            if let Some(i) = atom.script_idx(true) { result.push_str(&format!("^({})", cell(i))); }
             result
         }
-        Kind::Delim { left, right } if left == "|" && right == "|" => format!("abs({})", c(0)),
-        Kind::Delim { left, right } if left == "‖" && right == "‖" => format!("norm({})", c(0)),
-        Kind::Delim { left, right } => format!("{left}{}{right}", c(0)),
-        Kind::Grid { columns } => format!("mat({})", atom.cells.chunks(*columns).map(|row| row.iter().map(write_cell).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join("; ")),
-        Kind::Aligned { columns, row_lengths } => atom.cells.chunks(*columns).enumerate().map(|(r, row)| {
-            let used = row.iter().rposition(|c| !c.is_empty()).map_or(1, |i| i+1).max(row_lengths[r]);
-            row[..used].iter().map(|c| if c.is_empty() { String::new() } else { write_cell(c) }).collect::<Vec<_>>().join(" & ")
-        }).collect::<Vec<_>>().join(" \\\n"),
-        Kind::Decoration { name } => format!("{name}({})", atom.cells.iter().map(write_cell).collect::<Vec<_>>().join(", ")),
+        Write::Delimited => match &atom.kind {
+            Kind::Fenced { left, right } if left == "|" && right == "|" => format!("abs({})", cell(0)),
+            Kind::Fenced { left, right } if left == "‖" && right == "‖" => format!("norm({})", cell(0)),
+            Kind::Fenced { left, right } => format!("{left}{}{right}", cell(0)),
+            other => unreachable!("{other:?} 声明为定界包裹"),
+        },
+        Write::Matrix => match &atom.kind {
+            Kind::Table { columns } => format!("mat({})", atom.cells.chunks(*columns).map(|row| joined(row)).collect::<Vec<_>>().join("; ")),
+            other => unreachable!("{other:?} 声明为矩阵"),
+        },
+        Write::Rows => match &atom.kind {
+            Kind::Multiline { columns, row_lengths } => atom.cells.chunks(*columns).enumerate().map(|(r, row)| {
+                let used = row.iter().rposition(|c| !c.is_empty()).map_or(1, |i| i+1).max(row_lengths[r]);
+                row[..used].iter().map(|c| if c.is_empty() { String::new() } else { write_cell(c) }).collect::<Vec<_>>().join(" & ")
+            }).collect::<Vec<_>>().join(" \\\n"),
+            other => unreachable!("{other:?} 声明为对齐公式"),
+        },
     }
 }
 pub fn write_document(data: &MathData, definitions: &str) -> String {

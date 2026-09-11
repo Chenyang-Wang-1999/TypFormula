@@ -2,7 +2,7 @@
 // Translated branches from upstream/src/Cursor.cpp and
 // upstream/src/mathed/InsetMathNest.cpp, InsetMathScript.cpp, InsetMathFrac.cpp.
 // Authors of original algorithms are listed in docs/LYX-CREDITS.
-use crate::{math::*, typst};
+use crate::{math::*, slots::Vertical, typst};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -304,7 +304,7 @@ impl Editor {
                 numerator.push(self.data_mut().remove(pos));
             }
             let pos = self.cursor.pos;
-            self.plain_insert(MathAtom {kind:Kind::Frac,cells:vec![numerator,vec![]]});
+            self.plain_insert(MathAtom {kind:Kind::Fraction,cells:vec![numerator,vec![]]});
             self.push(pos, 1, false); return;
         }
         if ch == ' ' {
@@ -497,10 +497,10 @@ impl Editor {
             return Some(MathAtom { kind: Kind::MacroCall { name: name.into(), function: def.function }, cells: vec![vec![]; def.params.len()] });
         }
         Some(match name {
-            "frac" => MathAtom::nest(Kind::Frac, 2), "sqrt" => MathAtom::nest(Kind::Sqrt, 1),
-            "root" => MathAtom::nest(Kind::Root, 2), "mat" => MathAtom::nest(Kind::Grid { columns: 2 }, 4),
-            "abs" => MathAtom::nest(Kind::Delim { left: "|".into(), right: "|".into() }, 1),
-            "norm" => MathAtom::nest(Kind::Delim { left: "‖".into(), right: "‖".into() }, 1),
+            "frac" => MathAtom::nest(Kind::Fraction, 2), "sqrt" => MathAtom::nest(Kind::Sqrt, 1),
+            "root" => MathAtom::nest(Kind::Root, 2), "mat" => MathAtom::nest(Kind::Table { columns: 2 }, 4),
+            "abs" => MathAtom::nest(Kind::Fenced { left: "|".into(), right: "|".into() }, 1),
+            "norm" => MathAtom::nest(Kind::Fenced { left: "‖".into(), right: "‖".into() }, 1),
             "overline" | "underline" | "hat" | "vec" => MathAtom::nest(Kind::Decoration { name: name.into() }, 1),
             _ => return None,
         })
@@ -509,7 +509,7 @@ impl Editor {
         if name == "sup" || name == "sub" { self.script(name == "sup"); return; }
         if name == "()" {
             let saved = self.take_selection(); let pos = self.cursor.pos;
-            self.plain_insert(MathAtom { kind: Kind::Delim {left:"(".into(),right:")".into()}, cells:vec![saved] });
+            self.plain_insert(MathAtom { kind: Kind::Fenced {left:"(".into(),right:")".into()}, cells:vec![saved] });
             self.push(pos, 0, false); return;
         }
         let saved = self.take_selection(); self.insert_named(name, saved);
@@ -541,18 +541,18 @@ impl Editor {
     // InsetMathNest::script: selection becomes SCRIPT CONTENT, not the base.
     fn script(&mut self, up: bool) {
         let saved = self.take_selection();
-        let in_nucleus = matches!(self.owner().map(|o| &o.kind), Some(Kind::Script { .. })) && self.cursor.slices.last().unwrap().cell == 0;
+        let in_nucleus = matches!(self.owner().map(|o| &o.kind), Some(Kind::Scripts)) && self.cursor.slices.last().unwrap().cell == 0;
         if in_nucleus {
-            let idx = self.owner_mut().unwrap().ensure_script(up);
-            self.cursor.slices.last_mut().unwrap().cell = idx; self.cursor.pos = 0;
-        } else if self.cursor.pos > 0 && matches!(self.data()[self.cursor.pos - 1].kind, Kind::Script { .. }) {
+            // The storage is fixed, so entering an attachment is just naming its
+            // cell rather than creating it.
+            self.cursor.slices.last_mut().unwrap().cell = script_cell(up); self.cursor.pos = 0;
+        } else if self.cursor.pos > 0 && matches!(self.data()[self.cursor.pos - 1].kind, Kind::Scripts) {
             let pos = self.cursor.pos - 1;
-            let idx = self.data_mut()[pos].ensure_script(up);
-            self.push(pos, idx, true);
+            self.push(pos, script_cell(up), true);
         } else {
-            let pos = if self.cursor.pos == 0 { self.plain_insert(MathAtom::script(vec![], up)); 0 }
-                else { let p = self.cursor.pos - 1; let old = self.data_mut().remove(p); self.data_mut().insert(p, MathAtom::script(vec![old], up)); p };
-            self.push(pos, 1, false);
+            let pos = if self.cursor.pos == 0 { self.plain_insert(MathAtom::script(vec![])); 0 }
+                else { let p = self.cursor.pos - 1; let old = self.data_mut().remove(p); self.data_mut().insert(p, MathAtom::script(vec![old])); p };
+            self.push(pos, script_cell(up), false);
         }
         let pos = self.cursor.pos; let count = saved.len(); self.data_mut().splice(pos..pos, saved); self.cursor.pos += count;
     }
@@ -579,7 +579,7 @@ impl Editor {
         } else if let Some(owner) = self.owner() {
             let idx = self.cursor.slices.last().unwrap().cell;
             if !shift && let Some(next) = owner.idx_horizontal(idx, forward) {
-                let root_back = !forward && matches!(owner.kind, Kind::Root | Kind::Grid { .. } | Kind::Aligned { .. });
+                let root_back = !forward && matches!(owner.kind, Kind::Root | Kind::Table { .. } | Kind::Multiline { .. });
                 self.cursor.slices.last_mut().unwrap().cell = next; self.cursor.pos = if root_back { self.data().len() } else { 0 };
             } else { self.pop(forward); }
         }
@@ -630,18 +630,24 @@ impl Editor {
             let idx = self.cursor.slices.last().unwrap().cell;
             let mut target = None;
             let mut end = false;
-            match owner.kind {
-                Kind::Frac => { let t = usize::from(!up); if idx != t { target = Some(t); } }
-                Kind::Root => { let t = usize::from(up); if idx != t { target = Some(t); end = up; } }
-                Kind::Script { .. } => {
+            match owner.decl().vertical {
+                Vertical::Swap { up: up_role, down: down_role, end_up } => {
+                    if let Some(t) = owner.decl().index_of(if up { up_role } else { down_role }) {
+                        if idx != t { target = Some(t); end = up && end_up; }
+                    }
+                }
+                // An attachment keeps its own rules: a script is only reachable
+                // from the end of the base, and it returns to the base's start.
+                Vertical::Attach => {
                     if idx == 0 && self.cursor.pos == self.data().len() { target = owner.script_idx(up); }
                     else if owner.script_idx(true) == Some(idx) && !up || owner.script_idx(false) == Some(idx) && up { target = Some(0); end = true; }
                 }
-                Kind::Grid { columns } | Kind::Aligned { columns, .. } => {
+                Vertical::Column => {
+                    let columns = owner.columns();
                     if up { target = idx.checked_sub(columns); }
                     else if idx + columns < owner.cells.len() { target = Some(idx + columns); }
                 }
-                _ => {},
+                Vertical::None => {},
             }
             if let Some(target) = target {
                 self.cursor.slices.last_mut().unwrap().cell = target;
@@ -683,7 +689,7 @@ impl Editor {
             if let Some(owner) = self.owner() {
                 if matches!(owner.kind, Kind::MacroCall { .. }) { return; }
                 if owner.cells.len() == 1 && pos == 0 { self.pop(false); let p = self.cursor.pos; self.data_mut().remove(p); }
-                else if let Kind::Script { .. } = owner.kind {
+                else if let Kind::Scripts = owner.kind {
                     let idx = self.cursor.slices.last().unwrap().cell;
                     if idx > 0 && pos == 0 { self.owner_mut().unwrap().remove_script(idx); self.cursor.slices.last_mut().unwrap().cell = 0; self.cursor.pos = self.data().len(); }
                 }
@@ -727,7 +733,7 @@ impl Editor {
                 else if let Some(owner) = self.owner() {
                     let idx = self.cursor.slices.last().unwrap().cell;
                     let last = owner.cells.len()-1;
-                    let columns = match owner.kind { Kind::Grid {columns} | Kind::Aligned {columns,..} => columns, _ => 1 };
+                    let columns = match owner.kind { Kind::Table {columns} | Kind::Multiline {columns,..} => columns, _ => 1 };
                     let target = if !end && idx % columns != 0 { Some(idx - idx % columns) }
                         else if end && idx % columns + 1 != columns { Some(idx - idx % columns + columns - 1) }
                         else if !end && idx != 0 { Some(0) }
@@ -745,7 +751,7 @@ impl Editor {
     fn grow_grid(&mut self, column: bool) {
         if self.pending().is_some() { self.message = "请先按 Enter 确认命令".into(); return; }
         let columns = match self.owner().map(|a| &a.kind) {
-            Some(Kind::Grid {columns} | Kind::Aligned {columns,..}) => *columns,
+            Some(Kind::Table {columns} | Kind::Multiline {columns,..}) => *columns,
             _ => { self.message = "请先进入矩阵或对齐公式的一个格子".into(); return; }
         };
         let old_idx = self.cursor.slices.last().unwrap().cell;
@@ -753,13 +759,13 @@ impl Editor {
         if column {
             let rows = grid.cells.len()/columns;
             for row in (0..rows).rev() { grid.cells.insert((row+1)*columns, vec![]); }
-            if let Kind::Aligned {columns:count,row_lengths} = &mut grid.kind {
+            if let Kind::Multiline {columns:count,row_lengths} = &mut grid.kind {
                 *count=columns+1; row_lengths.fill(columns+1);
-            } else { grid.kind = Kind::Grid { columns: columns+1 }; }
+            } else { grid.kind = Kind::Table { columns: columns+1 }; }
             self.cursor.slices.last_mut().unwrap().cell = old_idx / columns * (columns+1) + old_idx % columns;
         } else {
             grid.cells.extend(vec![vec![]; columns]);
-            if let Kind::Aligned {row_lengths,..} = &mut grid.kind { row_lengths.push(columns); }
+            if let Kind::Multiline {row_lengths,..} = &mut grid.kind { row_lengths.push(columns); }
         }
     }
 }

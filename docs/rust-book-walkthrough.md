@@ -487,12 +487,12 @@ Rust 的结构体**不能继承**。想要共享行为，用 trait（第 10 章�
 enum Kind {
     Char { value: char },
     Raw { source: String },
-    Script { cell_1_is_up: bool },
+    Script,
     Grid { columns: usize },
 }
 ```
 
-（这就是你项目里 `math.rs:21-40` 的 `Kind`。）
+（这就是你项目里 `math.rs` 的 `Kind`。）
 
 C++ 的 `enum class` 只能表示"哪一个"；要附带数据必须上 `std::variant` + `std::visit`，写法笨重且容易漏分支。Rust 把两者合一，而且 `match` 是**语法级**支持。
 
@@ -569,16 +569,16 @@ let Some(index) = self.names.get(name) else { return None; };
 
 #### 本项目
 
-`math.rs:21-40` 的 `Kind`、`cursor.rs:16-35` 的 `Action`、`typst.rs:54` 的 `Binding`、`view.rs:6-29` 的 `View`（这个是 struct）——你项目的数据模型几乎全是"枚举 + 结构体"的组合，这正是第 5、6 章的产物。
+`math.rs` 的 `Kind`、`cursor.rs:16` 的 `Action`、`typst.rs:55` 的 `Binding`、`view.rs:8` 的 `View`（这个是 struct）——你项目的数据模型几乎全是"枚举 + 结构体"的组合，这正是第 5、6 章的产物。
 
-另外 `math.rs:77-80` 展示了 match guard 的实际用法：
+另外 `typst.rs:552-559` 展示了 match guard 与 never type 的实际用法：
 
 ```rust
-match self.cells.len() {
-    3 => Some(if up { 1 } else { 2 }),
-    2 if cell_1_is_up == up => Some(1),     // guard
-    _ => None,
-}
+let kind = match (name.as_str(), args.len()) {
+    ("frac", 2) => Kind::Fraction,
+    ("mat", n) if n > 0 && widths.iter().all(|w| *w == widths[0]) => Kind::Table { columns: widths[0] },  // guard
+    _ => return vec![MathAtom::from_source(node.full_text())],                   // 发散
+};
 ```
 
 ### 第 7 章 · 使用包、Crate 和模块管理不断增长的项目 【混合】

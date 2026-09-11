@@ -828,5 +828,285 @@ cell
 
 改动文件：`desktop/rawcache.py`、`desktop/mathview.py`、`desktop/window.py`、`desktop/test_desktop.py`、`docs/desktop.md`、`docs/architecture.md`、`docs/validation.md`。Rust 未改动，无需重建后端。
 
+## 后端槽位改成声明式：一张表 + 两条测试 · 2026-09-11
+
+动机：`Kind` 的槽位含义与导航规则此前散在 5 个文件的 190 处 `Kind::` 引用里。其中 `math.rs` 的 `entry_cell`（`_ =>` 兜底）、`math_class`（`_ => 0`）、`idx_horizontal`（三处 `matches!` 特例）和 `cursor.rs` 的 `vertical`（`_ => {}`）各带静默分支——加一个 `Kind` 时编译器只强制 2 项（`view_atom` 的视图投影、`write_atom` 的源码回写），其余静默走默认值。本次把它收敛成一张穷尽声明的表。
+
+### 步骤 0：先建安全网（回写往返）
+
+`write_atom` 是唯一**没有编译器兜底**的义务：它的结果会被 `Document` 写回权威源码，写错就是静默损坏文档。`tests/round_trip.rs` 的判据是"写出去、读回来、必须等于原树"，14 个用例覆盖 13 个可往返 Kind。
+
+三个刻意的排除，各自有理由而非遗漏：`TemplateCall`（`write_atom` 直接 `unreachable!`）与 `Parameter`（`#parameter0` 不是合法 Typst）只存在于宏模板、不属于可编辑源码树；`Unknown` 承载半打完的命令草稿，`fra` 不是一个公式。
+
+**证明这条测试有牙齿**：故意把 `typst.rs` 里 `root` 的两个参数写反。
+
+| 变更 | 结果 |
+| --- | --- |
+| `root({c(1)}, {c(0)})` → `root({c(0)}, {c(1)})` | `root_atoms_round_trip` 失败：`源码 "root(3, x)" 写成 "$ root(x, 3) $" 后读回了不同的树`，并列出两侧格子 |
+| `git checkout -- src/typst.rs` 还原 | 14 通过 |
+
+**意外结论**：这 14 个用例**在改动前就全部通过**。`write_atom` 本来就正确（含 `root` 的参数倒序、多原子基底的加括号、对齐公式的 `row_lengths`），这条测试是把不变量钉住，不是修 bug。
+
+### 步骤 1：`src/slots.rs`
+
+一个节点声明 6 项：`slots`（角色 + 相对字号 + 是否可空）、`arity`（定长 / 重复）、`entry`（光标首次进入哪一格）、`horizontal`、`vertical`、`class`。`Kind::decl()` 是覆盖全部 16 个 `Kind` 的穷尽 `match`。
+
+| 义务 | 改动前 | 改动后 |
+| --- | --- | --- |
+| 视图投影 `view_atom` | 编译强制 | 编译强制（不变） |
+| 源码回写 `write_atom` | 编译强制 | 编译强制 + 往返测试 |
+| 光标进入 `entry_cell` | `_` 兜底 | **声明驱动** |
+| 左右移动 `idx_horizontal` | 三处 `matches!` 特例 | **声明驱动** |
+| 上下移动 `cursor::vertical` | `_ => {}` | **声明驱动** |
+| 数学间距类 `math_class` | `_ => 0` | **声明驱动** |
+
+`entry_cell` / `idx_horizontal` / `vertical` 里的 `match Kind` 全部消失，改为读声明的通用算法。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **115 通过 / 5 忽略**（基线 86 + 往返 14 + 导航 9 + 表自洽 6） |
+| `python -m unittest desktop.test_desktop` | **71 通过**（离屏，34.1s） |
+| 表自洽性（`src/slots.rs` 内 6 个单元测试） | 命名角色都在表里、定长图式格数 == 真实格子数、入口与左右邻居不越界、字符类正确 |
+
+对真实 release 二进制（`--desktop-core` 管道）逐条探针，不经过 Qt：
+
+| 探针 | 结果 | 钉住的声明 |
+| --- | --- | --- |
+| `root(3, x)` 向右进入 | `[c1]` | `Entry::Role{forward: Index}`——**参数倒序感知**的入口 |
+| 根式内下 / 上 | `[c0]` / `[c1] pos=1` | `Swap` 互换、`end_up` 落格尾 |
+| 再向右 | `[c0]` | `Horiz::Pair` 折回 |
+| `mat(1, 2; 3, 4)` 向右进入 | `[c0]` | `Entry::GridMiddle` |
+| 矩阵下 / 上 | `[c2]` / `[c0]` | `Vertical::Column` |
+| 矩阵列内连按向右 | `c0 → c1 → 离开` | `Horiz::Column` 列边界阻挡 |
+| `frac(x^2, sqrt(y))` | 分子/分母互换；进入 `Script` 落在基底 | `Frac` 的 `Swap`、`Script` 的 `Attach` |
+
+### 表自身的保护强度：变异检查
+
+对 `src/slots.rs` 逐条改错一个声明，再跑全套，看是否有测试失败：
+
+| 变异 | 结果 |
+| --- | --- |
+| `Frac` `end_up` false → true | 1 个套件失败 |
+| `Root` `end_up` true → false | 1 个套件失败 |
+| `Root` `entry` Index ↔ Radicand | 1 个套件失败 |
+| `Root` `horizontal` Pair → Linear | 1 个套件失败 |
+| `Grid` `entry` GridMiddle → Edge | 1 个套件失败 |
+| `Aligned` `entry` Edge → GridMiddle | 1 个套件失败 |
+| `Grid` `horizontal` Column → Linear | 1 个套件失败 |
+| `Script` `entry` Base → Upper/Lower | 1 个套件失败 |
+
+**过程里踩到的坑，值得记下**：第一遍变异检查用 `Copy-Item` 还原备份，而 `Copy-Item` **保留被复制文件的 `LastWriteTime`**。还原后 `slots.rs` 的时间戳比已编译产物更旧，cargo 判定"无需重建"，于是后续测试跑的是**变异后的旧产物**。这一遍得出的"某两条声明无测试覆盖"是**错的**（哈希显示文件本身已正确还原，坏的是构建）。正确做法：写回后把 `LastWriteTime` 置为当前时间。修正后重跑，8 条变异全部被抓住。
+
+**顺带发现的真实缺口**：在补 `tests/caret_navigation.rs` 之前，`Frac` 的 `end_up` 与 `Grid` 的 `Entry::GridMiddle` 确实**没有任何测试覆盖**——把任一条改错，全套仍然全绿。新的导航用例把它们连同 `Root` 的 `end_up`、`Aligned` 的 `Entry::Edge`、`Grid` 的列边界一起钉在真实光标位置上。用例全部先在真实二进制上量过再写下来。
+
+### 附带修正：`char_class` 里的空格
+
+`char_class` 的右括号集原写作 `")] }"`，中间那个空格让**空格字符**落进"右括号"类。本次改成 `")]}"`。
+
+它不是死代码：`interpret_char` 的文本格分支排在 `' '` 分支**之前**，所以在行内字符串里打字真的会插入 `Char(' ')`。唯一读者是 `move_word`（Ctrl+方向键），它按类聚合一段连续字符：
+
+| 文本格 `"a b c"`，Ctrl+→ 从格首 | 空格类 | 结果 |
+| --- | --- | --- |
+| 改动前 | 5（右括号） | 逐个字符走：pos 0 → 1 → 2 → 3（0 与 5 交替，每组只含一个字符） |
+| 改动后 | 0（普通） | 一次走到整段末尾：pos 0 → 5 |
+
+即 Ctrl+→ 在行内字符串里由"逐字符"变成"按类走整段"，与公式内普通字符的处理一致。`tests/caret_navigation.rs::a_text_run_is_one_class_so_ctrl_arrow_moves_by_run` 把这个结果钉住（先量后写）。
+
+### 未做（需要先确认）
+
+- 协议变更：`view` 携带 `role`、前端 `elif kind ==` 链改成按角色分派。
+
+改动文件：`src/slots.rs`（新增）、`src/math.rs`、`src/cursor.rs`、`src/lib.rs`、`tests/round_trip.rs`（新增）、`tests/caret_navigation.rs`（新增）、`docs/architecture.md`、`docs/validation.md`。
+
+## 视图名与回写模板进声明表 · 2026-09-11
+
+`Kind::decl()` 原先声明 6 项（槽位、形态、入口、左右、上下、间距类）；本次把**视图名**与**回写模板**也放进去，共 8 项，加一个 `Kind` 时一次说清。
+
+### `view`
+
+`Decl::view` 是前端排布策略名。`view_atom` 的 16 个字面量全部删掉，改读 `atom.decl().view`，视图名不再有两份；`Frac | Sqrt | Root` 三个 arm 合并成一个。`MacroCall` 有第二个形态（展开不了时显示调用与参数），具名为 `slots::view::MACRO_COLLAPSED`。
+
+### `Write`
+
+`Decl::write` 是一个 10 变体的枚举，覆盖 16 个 `Kind` 的拼写形状，`write_atom` 改为按它分派。收益最直接的是根式：
+
+```rust
+write: Write::Template("root({1}, {0})"),
+```
+
+"内部是 `[被开方式, 根指数]`、Typst 是 `root(指数, 被开方式)`"这个反转，过去分散在 `parse_atom` 的 `args.swap(0, 1)` 与 `write_atom` 的 `c(1), c(0)`，相隔 60 行；现在是一行自解释的声明。
+
+**模板必须单遍展开。** 一个格子的源码里可能有花括号（`Text` 写成带引号的字符串），先后替换会让文本里的 `{1}` 被当成占位符：
+
+| `frac("x{1}y", b)` | 写法 | 结果 |
+| --- | --- | --- |
+| 先后替换 `{0}` 再 `{1}` | 错 | `frac("xby", b)`——文本被改写 |
+| 单遍扫描（现行） | 对 | `frac("x{1}y", b)` |
+
+`tests/round_trip.rs::a_template_does_not_re_expand_braces_that_came_from_a_cell` **直接断言写出的字符串**，因为"先后替换"也可能往返成*另一棵*树。把展开器改成双遍，该用例失败（14 通过 1 失败）；还原后 15 全绿。
+
+`write_atom` 里声明与 `Kind` 不符的分支做成**响亮的 `unreachable!`**，不是静默空串——它写回权威源码，写错是静默损坏文档。两个新单元测试让它可证明不可达：`every_declaration_agrees_with_the_kind_it_describes`、`a_template_only_names_placeholders_that_exist`。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **119 通过 / 5 忽略** |
+| `python -m unittest desktop.test_desktop` | **71 通过**（离屏，33.0s） |
+| 视图名逐一比对 | 九个公式（`x^2`/`frac`/`sqrt`/`root`/`mat`/`hat`/`abs`/`dif`/`aligned`）的 kind 与改动前**逐字相同** |
+| 双遍展开变异 | 被花括号用例捕获 |
+
+## `Script` 存储整形为固定三槽 · 2026-09-11
+
+原先 `Kind::Script { cell_1_is_up: bool }` 配**变长** `cells`：`[base]`、`[base, up]`、`[base, down]`、`[base, up, down]` 四种长度，`cells[1]` 的含义取决于标志位。现在固定为 `[base, upper, lower]`**三格**，空格子表示"没有这个脚标"，标志位删除。新增 `math::script_cell(up) -> usize` 作为唯一的格索引来源。
+
+| 位置 | 原先 | 现在 |
+| --- | --- | --- |
+| `script_idx(up)` | 按 `cells.len()` 分三种情况 + 比标志 | 常量格索引 + 判空 |
+| `ensure_script(up)` | 处理 1→2、2→3 的插入，方向不符时用 `mem::take` 搬格子 | **删除**，调用方直接用 `script_cell(up)` |
+| `remove_script(idx)` | 3→2 时回头改标志 | 清空该格 |
+| `parse_atom` 的 `MathAttach` | 按需 push，长度随源文变化 | 恒定三格，按 `script_cell` 落位 |
+| `view_atom` 的 `Script` | 合成 `absent` 补齐 | **无需改动**——`script_idx` 的判空让原式产出不变 |
+
+### 可观察变化（实测，两处，均为预期）
+
+真机 release 二进制（`--desktop-core` 管道）逐条探针：
+
+| 探针 | 改动前 | 改动后 |
+| --- | --- | --- |
+| `$ x_1 $` 右、右、下 | `c0p0 → c0p1 →` **`c1`**`p1` | `c0p0 → c0p1 →` **`c2`**`p1` |
+| `$ x^2 $` 右、右、上 | `c0p0 → c0p1 → c1p1` | **不变** |
+| `$ x^2 $` 右、Tab×3 | `c0 → c1 → c0` | `c0 →` **`c1 → c2`** `→ c0` |
+
+**视图结构一字未变**（这是前后端协议，必须不变）：
+
+| 源文 | 视图 |
+| --- | --- |
+| `$ x $` | `cell stop char stop` |
+| `$ x^2 $` | `script [cell(x), cell(2), absent]` |
+| `$ x_1 $` | `script [cell(x), absent, cell(1)]` |
+| `$ x_1^2 $` | `script [cell(x), cell(2), cell(1)]` |
+
+两处变化都是预期的：下标固定在第三格；Tab 多停在一个空脚标格上（按 Tab 进空格再打字即可补脚标）。`tests/caret_navigation.rs::an_attachment_lives_in_a_fixed_cell_and_tab_visits_both` 把两者钉住。
+
+### 声明表与存储从此一致
+
+自洽性测试 `the_schema_covers_exactly_the_cells_a_kind_stores` **原先按名字排除 `Script`** 并注明"整形时会被逼着回来删掉这个例外"。本次整形后该例外已删除——`Script` 现在和其余 15 个 `Kind` 一样，槽位数必须等于真实格子数。
+
+## `view` 携带 role、前端按角色分派 · 2026-09-11
+
+### 后端
+
+`View` 新增 `role: Option<&'static str>`（带 `skip_serializing_if`，所以是可选的纯增量字段）。值来自父节点的 `Decl::role_at(cell_index)`，经 `Role::name()` 映射为 `"numerator"`/`"denominator"`/`"base"`/`"upper"`/`"lower"`/`"radicand"`/`"index"`/`"inner"`/`"cell"`/`"arg"`。
+
+线上实测形状（真实 release 二进制）：
+
+| 源文 | 视图 |
+| --- | --- |
+| `frac(a, b)` | `fraction` → `cell[numerator]`, `cell[denominator]` |
+| `root(3, x)` | `root` → `cell[radicand]`, `cell[index]` |
+| `x_1` | `script` → `cell[base]`, `absent[upper]`, `cell[lower]` |
+| `mat(1, 2; 3, 4)` | `grid` → 4× `cell[cell]` |
+| `hat(x)` | `decoration` → `cell[inner]` |
+
+`x_1` 那条值得注意：**空附件也是一个槽**，所以合成出来的 `absent` 也带 role——否则前端按角色查会查不到它。
+
+### 前端
+
+`mathview.py` 三处按角色取子节点：`fraction`（numerator/denominator）、`sqrt`/`root`（radicand/index）、`script`（base/upper/lower）。`Typesetter.slot(children, role, index)` 先按 role 找，找不到才回退到位置——回退让**旧内核也能驱动新前端**。`grid`/`aligned` 的 role 全是 `cell`，位置就是唯一信息，保持不变。
+
+另外加了 `Typesetter.ARRANGEMENTS`：本前端实现的 25 个排布名的白名单。`kind` 不在其中时**报告一次**（经 `Typesetter.warn`，由 `window.py` 接到状态栏），而不是静默按横排画——将来加新排布时能立刻看出来，而不是画错了没人知道。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **119 通过 / 5 忽略** |
+| `python -m unittest desktop.test_desktop` | **72 通过**（71 + 新增 1） |
+| 线上 role 形状 | 5 个公式逐一比对，见上表 |
+
+### 新增用例的"牙齿"是补出来的
+
+`test_a_fraction_places_its_slots_by_role_not_by_position` 把 role 分派钉住：反转 `fraction` 的 children 数组，几何必须不变（按位置就会换掉分子分母）。
+
+**第一版没有牙齿。** 它用 `frac(a+b, c)`，而 `a+b` 与 `c` 都是单行、盒子度量完全相同，所以"调换分子分母"在几何上看不出来——把角色查找禁用后它**仍然通过**。换成 `frac(frac(a, b), c)`（两槽高度不同）后，禁用角色查找立即失败：`AssertionError: 46.4 != 32.2275`，正是基线被调换的差值；还原后通过。用例里保留了这个前提的注释：**两个槽的盒子必须不同，这个测试才成立**。
+
+改动文件（本轮三节合计）：`src/slots.rs`（新增）、`src/math.rs`、`src/cursor.rs`、`src/typst.rs`、`src/view.rs`、`src/lib.rs`、`desktop/mathview.py`、`desktop/window.py`、`desktop/test_desktop.py`、`tests/round_trip.rs`（新增）、`tests/caret_navigation.rs`（新增）、`docs/validation.md`。
+
+## `Kind` 变体名向 Typst `MathKind` 对齐（第一步：纯改名 + 记下对应关系） · 2026-09-11
+
+### 改了什么
+
+`Kind` 的五个变体改名，让它们与 Typst `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）同名：
+
+| 原名 | 新名 | Typst 对应 |
+| --- | --- | --- |
+| `Kind::Frac` | `Kind::Fraction` | `MathKind::Fraction` |
+| `Kind::Script` | `Kind::Scripts` | `MathKind::Scripts` |
+| `Kind::Delim` | `Kind::Fenced` | `MathKind::Fenced` |
+| `Kind::Grid` | `Kind::Table` | `MathKind::Table` |
+| `Kind::Aligned` | `Kind::Multiline` | `MathKind::Multiline` |
+
+`Write::{Grid, Aligned}` 同步改为 `Write::{Matrix, Rows}`：它们命名的**不是** `Kind`，而是"`mat(…)` 拼法"与"用 `&`/`\` 分行"两种写法，跟着 `Kind` 一起叫 Grid/Aligned 只会让人以为它们是一回事。
+
+**没有动 `view` 名。** 线上前端看到的排布名仍是 `fraction`/`script`/`delim`/`grid`/`aligned`——排布名是给前端的绘图契约，只在画法变化时才需要改；变体名是给读代码的人的。这两件事本来就该解耦，本轮正是靠这一点做到了"改名不动协议"。
+
+`Decl` 新增第 9 项 `typst: &'static [&'static str]`，逐条记下这个 `Kind` 认领哪些 `MathKind`：0 个（编辑器专有 `MacroCall`/`TemplateCall`/`Parameter`/`Unknown`）、1 个、或几个（`Raw` → `Box`/`Mathml`/`External`；`Sqrt` 与 `Root` 都 → `Radical`；`Decoration` → `Accent`+`Line`；`Char` → `Glyph`+`Number`）。
+
+### 怎么让"对齐"可查而不是靠印象
+
+核心 crate 只依赖 `typst-syntax`，**不依赖编译器**（这是刻意的：编辑器核心不链接 Typst 编译器），所以两套词汇表不能靠类型系统绑定。代替它的两条测试：
+
+1. `the_math_kinds_are_read_correctly_from_the_vendored_source` 用 `include_str!` 读 vendor 里那份 `item.rs`，从 `pub enum MathKind<'a> {` 扫出变体名，断言**恰好 18 个**并逐个点名核对。Typst 增删改名一个变体会让它失败——而且它是下面那条的**自检**：扫描坏掉若返回空表，下面那条会"什么都没说"地通过。
+2. `the_typst_vocabulary_is_covered_exactly_once` 断言每个 `Kind` 声明的名字都是真实存在的变体，并且**没被任何 `Kind` 认领的变体恰好等于** `slots::UNMODELLED`。
+
+于是对齐的剩余工作量成了一个常量，写在 `src/slots.rs`：
+
+```rust
+pub const UNMODELLED: &[&str] = &["Cancel", "Group", "Primes", "SkewedFraction"];
+```
+
+四项性质不同，注释里写清了：`Group` **不是缺口**（编辑器的一个格子就是一个 group，不需要哪个 `Kind` 去代表它）；`SkewedFraction`(`a/b`)、`Cancel`(`cancel(x)`/`strike(x)`)、`Primes`(`x'`) 是**真缺口**，目前都退化成 `Raw` 源码片段。认领掉一项就必须改这个常量——改的时候正是写下"其余几项为什么还没做"的地方。同一条测试还钉住"被两个 `Kind` 共同认领"的只有 `Glyph`（`Char` 与 `Symbol`）和 `Radical`（`Sqrt` 与 `Root`），因为共享是一次决定而不是巧合。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **121 通过 / 5 忽略**（119 + 新增 2） |
+| `python -m unittest desktop.test_desktop` | **72 通过** |
+| 线上视图逐字节比对 | **21 个公式全部 identical**（见下） |
+
+线上比对用的是真实 release 二进制：改名前先把 21 个公式的 `view` JSON 全量导出（`x^2`/`x_1`/`x_1^2`/`frac(a,b)`/`frac(frac(a,b),c)`/`a/b`/`sqrt(x)`/`root(3,x)`/`abs(x)`/`norm(x)`/`mat(1,2;3,4)`/`a &= 1 \ b &= 2`/`hat(x)`/`overline(x)`/`underline(x)`/`vec(x)`/`"text"`/`dif x`/`(a+b)`/`unknown_thing(x)`/`frac(x^(2+), cal(A))`），改名后重新导出并**按 JSON 全等**比较：`raw identical: True`，形状差异 0 处。
+
+### 新测试的牙齿（四次变异）
+
+| 变异 | 结果 |
+| --- | --- |
+| `Decoration` 的 `typst` 改成 `K_NONE` | 失败：未认领多出 `Accent`、`Line` |
+| 扫描器 `.take(17)` 少读一个变体 | 两条都失败：自检报 `left: 17, right: 18` |
+| `K_TEXT` 拼成 `"Tex"` | 失败：`声明对应 MathKind::Tex，但 vendored 枚举里没有这个变体` |
+| `UNMODELLED` 删掉 `Primes` | 失败：`未建模的 MathKind 清单变了` |
+
+四次都还原后全绿。变异一律用文件工具写回（会刷新 mtime），不用 `Copy-Item` 还原——上一轮就是 `Copy-Item` 保留旧时间戳、cargo 判定"无需重建"，测的是变异后的旧产物，得出了错误结论。
+
+### 顺带修掉的两处失配
+
+`slots.rs` 的模块注释还写着"视图名与回写模板**尚未**进声明表"，并列出理由——但上一轮已经把它们放进去了，是上一轮改完没删的陈旧注释。另外两份教学文档引用的 `Kind::Frac`/`Kind::Delim`/`Kind::Grid` 代码片段同步更新（`docs/rust-for-cpp.md` §4.8、`docs/rust-book-walkthrough.md` 第 6 章）。
+
+`docs/validation.md` 里旧条目中的 `Kind::Script { cell_1_is_up: bool }` 等**保留原样**：那是当日实测记录，不是当前代码说明。
+
+### 本轮发现、需要决定的三件事
+
+这一步只做"改名 + 记账"，因为下面三件的**代价不是改名字**，写在下一轮之前先报：
+
+1. **`Sqrt` + `Root` → `Radical`（合并）**：Typst 是一个 `Radical{radicand, index: Option}`。合并后 `sqrt(x)` 就是"根指数格为空"的根式，但两处会变：线上 `sqrt`/`root` 两个排布名要合成一个（前端要画"没有指数的钩子"）；更实际的是**光标**——今天 `sqrt(x)` 只有一格，合并后多出一个空的指数格，Tab/上下键会走到它，这是可观察的行为变化。另外 LyX 自己是分开的（`InsetMathSqrt` 与 `InsetMathRoot` 是两个 inset），合并会与"对照 LyX"这条线分叉。
+2. **`Decoration` → `Accent` + `Line`（拆分）**：本身是纯词汇改动（两者的槽位与拼写都一样，`view` 可继续共用 `decoration`，前端不用动）。真正的收益在它能给 `Cancel` 一个家：`cancel(x)`/`strike(x)` 今天退化成 `Raw`，Typst 的 `CancelItem` 还有 `angle`/`inverted` 两个参数。
+3. **`SkewedFraction`（新增）**：`$ a/b $` 今天和 `frac(a, b)` **合成同一个 `Kind::Fraction`**，回写时被规范化成 `frac(a, b)`——这是既有行为，`src/document.rs` 的注释里就写着"`$ a/b $` 序列化为 `frac(a, b)`"，`tests/structured_input.rs::fraction_slash_uses_typst_precedence_and_keeps_nested_fallbacks` 还把 `write_cell(&e.root) == "frac(x, 2)"` 钉成了预期。要保真就得新增 `SkewedFraction` 并改那条既有预期，同时前端要有"斜杠分式"的排布。
+
+改动文件：`src/slots.rs`、`src/math.rs`、`src/cursor.rs`、`src/typst.rs`、`src/view.rs`、`tests/command_mode.rs`、`tests/structured_input.rs`、`docs/architecture.md`、`docs/rust-for-cpp.md`、`docs/rust-book-walkthrough.md`、`docs/validation.md`。
+
+
 
 

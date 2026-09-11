@@ -140,6 +140,26 @@ class NativeTest(unittest.TestCase):
         self.assertEqual(self.window.source,before)
         self.assertTrue(any(image.pixelColor(x,y)!=Qt.white for x in range(10,min(200,int(box.width)+10)) for y in range(10,min(200,int(box.height)+10))))
 
+    def test_a_fraction_places_its_slots_by_role_not_by_position(self):
+        """Each cell carries the role its parent declared, so order cannot move it.
+
+        Reversing a fraction's children must not swap the numerator and the
+        denominator: the layout asks for the child whose role is `numerator`,
+        not for the first one. The two slots deliberately have different
+        heights -- a nested fraction over a single letter -- because the
+        baseline is what exposes a swap, and equal-height slots would hide it.
+        """
+        self.load("$ frac(frac(a, b), c) $")
+        view=self.window.analysis['formulas'][0]['view']
+        fraction=next(node for node in self.window.view_nodes(view) if node['kind']=='fraction')
+        self.assertEqual([child.get('role') for child in fraction['children']],['numerator','denominator'])
+        direct=self.window.typesetter.layout(view)
+        fraction['children'].reverse()
+        reordered=self.window.typesetter.layout(view)
+        self.assertAlmostEqual(direct.width,reordered.width)
+        self.assertAlmostEqual(direct.height,reordered.height)
+        self.assertAlmostEqual(direct.baseline,reordered.baseline)
+
     def service(self,route,body,client=None):
         result=[];loop=QEventLoop();timer=QTimer();timer.setSingleShot(True);timer.timeout.connect(loop.quit)
         def receive(value,error):result.append((value,error));loop.quit()

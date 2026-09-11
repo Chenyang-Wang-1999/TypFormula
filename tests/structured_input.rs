@@ -9,7 +9,7 @@ fn raw(a:&MathAtom,s:&str){assert!(matches!(&a.kind,Kind::Raw{source} if source=
 #[test]
 fn nested_raw_keeps_its_editable_fraction_and_source() {
     let mut e=command("frac(dif x, 2 pi)");
-    assert!(matches!(e.root[0].kind,Kind::Frac));raw(&e.root[0].cells[0][0],"dif");
+    assert!(matches!(e.root[0].kind,Kind::Fraction));raw(&e.root[0].cells[0][0],"dif");
     assert!(matches!(e.root[0].cells[1][1].kind,Kind::Symbol{..}));
     assert_eq!(e.root,load("frac(dif x, 2 pi)").root);
     key(&mut e,"Home");key(&mut e,"ArrowRight");key(&mut e,"ArrowRight");
@@ -98,9 +98,9 @@ fn definitions_keep_source_and_supported_calls_expand_only_in_view() {
 
 #[test]
 fn fraction_slash_uses_typst_precedence_and_keeps_nested_fallbacks() {
-    let e=command("(dif x)/ (2 pi)");assert!(matches!(e.root[0].kind,Kind::Frac));
+    let e=command("(dif x)/ (2 pi)");assert!(matches!(e.root[0].kind,Kind::Fraction));
     assert_eq!(typst::write_cell(&e.root),"frac(dif x, 2 pi)");
-    assert!(matches!(command("/").root[0].kind,Kind::Frac));
+    assert!(matches!(command("/").root[0].kind,Kind::Fraction));
     let mut e=Editor::default();input(&mut e,"x/2");
     assert_eq!(typst::write_cell(&e.root),"frac(x, 2)");
     assert_eq!(e.cursor.slices[0].cell,1);
@@ -110,13 +110,13 @@ fn fraction_slash_uses_typst_precedence_and_keeps_nested_fallbacks() {
 fn alignment_preserves_empty_columns_ragged_rows_and_linebreaks() {
     let src="a &= 1 && \"given\" \\\nbb &= 2 & \"why\"";
     let e=command(src);
-    assert!(matches!(&e.root[0].kind,Kind::Aligned{columns:4,row_lengths} if row_lengths==&vec![4,3]));
+    assert!(matches!(&e.root[0].kind,Kind::Multiline{columns:4,row_lengths} if row_lengths==&vec![4,3]));
     assert!(e.root[0].cells[2].is_empty());assert!(e.root[0].cells[7].is_empty());
     let serialized=typst::write_cell(&e.root);
     assert_eq!(serialized,"a & = 1 &  & \"given\" \\\nbb & = 2 & \"why\"");
     assert_eq!(load(&serialized).root,e.root);
     assert_eq!(load(src).root,e.root);
-    assert!(matches!(command("a \\ b").root[0].kind,Kind::Aligned{columns:1,..}));
+    assert!(matches!(command("a \\ b").root[0].kind,Kind::Multiline{columns:1,..}));
     assert_eq!(command("\\").root[0].cells.len(),2);
     assert_eq!(command("&").root[0].cells.len(),2);
     assert_eq!(command("a \\ \\ b").root[0].cells.len(),3);
@@ -125,11 +125,11 @@ fn alignment_preserves_empty_columns_ragged_rows_and_linebreaks() {
 #[test]
 fn markers_only_split_their_own_math_level() {
     let e=command("frac(a & b \\ c & d, 2)");
-    assert!(matches!(e.root[0].kind,Kind::Frac));
-    assert!(matches!(e.root[0].cells[0][0].kind,Kind::Aligned{columns:2,..}));
+    assert!(matches!(e.root[0].kind,Kind::Fraction));
+    assert!(matches!(e.root[0].cells[0][0].kind,Kind::Multiline{columns:2,..}));
     let e=command(r#""a & b \\ c" + \&"#);
     assert!(matches!(e.root[0].kind,Kind::Text));raw(e.root.last().unwrap(),r"\&");
-    assert!(!e.root.iter().any(|a|matches!(a.kind,Kind::Aligned{..})));
+    assert!(!e.root.iter().any(|a|matches!(a.kind,Kind::Multiline{..})));
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn paste_opens_draft_and_copy_preserves_typst_source() {
     key(&mut e,"End");e.apply(Action::Paste{text:selected}).unwrap();
     assert!(e.pending().is_some());key(&mut e,"Enter");assert_eq!(e.root.len(),2);
     e.apply(Action::Paste{text:"$ 1/2 $".into()}).unwrap();key(&mut e,"Enter");
-    assert!(matches!(e.root[2].kind,Kind::Frac));
+    assert!(matches!(e.root[2].kind,Kind::Fraction));
     e.apply(Action::Paste{text:"frac(".into()}).unwrap();key(&mut e,"Enter");assert!(e.pending().is_some());
 }
 

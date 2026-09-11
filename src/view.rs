@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Build the display tree from editable atoms and their cursor positions.
 use crate::{cursor::Editor, math::*, typst};
+use crate::slots::{view::MACRO_COLLAPSED, Role};
 use serde::Serialize;
 
 #[derive(Clone, Serialize)]
 pub struct View {
     pub kind: String,
     pub text: String,
+    // Which slot of its parent this node fills. `kind` names the arrangement
+    // this node is laid out by; `role` names its position in the parent's
+    // arrangement, so a future kind that reuses an arrangement is placed by role
+    // and needs no frontend change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_glyph: Option<String>,
     pub children: Vec<View>,
@@ -29,7 +36,7 @@ pub struct View {
 }
 impl View {
     fn new(kind: &str, text: impl Into<String>, children: Vec<View>) -> Self {
-        Self { kind: kind.into(), text: text.into(), display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None, origin: None, source_range: None }
+        Self { kind: kind.into(), text: text.into(), role: None, display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, edit: None, attachment: None, definitions: None, origin: None, source_range: None }
     }
 }
 #[derive(Serialize)]
@@ -104,6 +111,9 @@ impl Editor {
     }
     fn view_atom(&self, atom: &MathAtom, path: Option<&[CursorSlice]>, pos: usize, occurrence: &str) -> View {
         let child_path = |idx| path.map(|p| { let mut p = p.to_vec(); p.push(CursorSlice { atom: pos, cell: idx }); p });
+        // The layout strategy is declared per kind (`slots::Decl::view`); only
+        // the fields that a strategy reads are filled in below.
+        let view_kind = atom.decl().view;
         if let Kind::MacroCall { name, function } = &atom.kind {
             let registry = typst::macro_registry(&self.definitions);
             let definition = registry.get(name).filter(|d| d.expandable);
@@ -121,7 +131,7 @@ impl Editor {
                 let mut template = self.view_cell(&def.template, None, occurrence);
                 self.bind_template(&mut template, def, &registry, &args);
                 Self::locate_projection(&mut template, &format!("{occurrence}.macro"));
-                return View::new("macro", name, vec![template]);
+                return View::new(view_kind, name, vec![template]);
             }
             // Bounded projection: retain editable call slots for very large
             // expansions and for calls that no longer match their definition.
@@ -132,24 +142,30 @@ impl Editor {
                 children.push(self.view_cell(arg, child_path(i).as_deref(), &format!("{occurrence}.c{i}")));
             }
             if *function { children.push(View::new("symbol", ")", vec![])); }
-            return View::new("macro-collapsed", message, children);
+            return View::new(MACRO_COLLAPSED, message, children);
         }
-        let children: Vec<_> = atom.cells.iter().enumerate().map(|(idx, data)| self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"))).collect();
+        // Every cell is a slot of this node, and its role comes from the node's
+        // own declaration, so the frontend can place it without counting cells.
+        let children: Vec<_> = atom.cells.iter().enumerate().map(|(idx, data)| {
+            let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"));
+            child.role = atom.decl().role_at(idx).map(Role::name);
+            child
+        }).collect();
         match &atom.kind {
             Kind::MacroCall { .. } => unreachable!(),
-            Kind::TemplateCall { definition } => { let mut view = View::new("template-call", "", children); view.columns = *definition; view }
-            Kind::Parameter { index } => { let mut view = View::new("parameter", "", vec![]); view.columns = *index; view }
+            Kind::TemplateCall { definition } => { let mut view = View::new(view_kind, "", children); view.columns = *definition; view }
+            Kind::Parameter { index } => { let mut view = View::new(view_kind, "", vec![]); view.columns = *index; view }
             Kind::Char { value } => {
-                let mut view = View::new("char", value.to_string(), vec![]);
+                let mut view = View::new(view_kind, value.to_string(), vec![]);
                 // A Char contains exactly one Unicode scalar. Lookup only this
                 // character, never its neighbors; editing/source remain Char.
                 // The painter bypasses this display hint inside text cells.
                 view.display_glyph = symbol(&view.text).map(str::to_string);
                 view
             }
-            Kind::Symbol { glyph, .. } => View::new("symbol", glyph, vec![]),
+            Kind::Symbol { glyph, .. } => View::new(view_kind, glyph, vec![]),
             Kind::Raw { source } => {
-                let mut view = View::new("raw", source, vec![]);
+                let mut view = View::new(view_kind, source, vec![]);
                 view.edit = path.map(|path| Cursor {slices:path.to_vec(),pos,occurrence:format!("{occurrence}.edit")});
                 view
             }
@@ -165,15 +181,20 @@ impl Editor {
                     parts.push(part);
                 }
                 if *caret == name.len() { parts.push(View::new("draft-caret", "", vec![])); }
-                View::new("unknown", "", parts)
+                View::new(view_kind, "", parts)
             }
-            Kind::Frac => View::new("fraction", "", children),
-            Kind::Sqrt => View::new("sqrt", "", children),
-            Kind::Root => View::new("root", "", children),
-            Kind::Script { .. } => {
+            Kind::Fraction | Kind::Sqrt | Kind::Root => View::new(view_kind, "", children),
+            Kind::Scripts => {
                 let mut slots = vec![children[0].clone_view()];
-                for up in [true, false] { slots.push(atom.script_idx(up).map(|i| children[i].clone_view()).unwrap_or_else(|| View::new("absent", "", vec![]))); }
-                let mut view = View::new("script", "", slots);
+                for up in [true, false] {
+                    let index = script_cell(up);
+                    let mut slot = match atom.script_idx(up) { Some(i) => children[i].clone_view(), None => View::new("absent", "", vec![]) };
+                    // An empty attachment is a slot too, so it carries the role
+                    // of the cell it stands in for.
+                    slot.role = atom.decl().role_at(index).map(Role::name);
+                    slots.push(slot);
+                }
+                let mut view = View::new(view_kind, "", slots);
                 fn has_draft(atom: &MathAtom) -> bool {
                     matches!(atom.kind, Kind::Unknown { .. }) || atom.cells.iter().flatten().any(has_draft)
                 }
@@ -184,11 +205,11 @@ impl Editor {
                 }
                 view
             }
-            Kind::Text => View::new("text", "", children),
-            Kind::Delim { left, right } => View::new("delim", format!("{left}\n{right}"), children),
-            Kind::Decoration { name } => View::new("decoration", name, children),
-            Kind::Grid { columns } => { let mut v = View::new("grid", "", children); v.columns = *columns; v }
-            Kind::Aligned { columns, .. } => { let mut v = View::new("aligned", "", children); v.columns = *columns; v }
+            Kind::Text => View::new(view_kind, "", children),
+            Kind::Fenced { left, right } => View::new(view_kind, format!("{left}\n{right}"), children),
+            Kind::Decoration { name } => View::new(view_kind, name, children),
+            Kind::Table { columns } => { let mut v = View::new(view_kind, "", children); v.columns = *columns; v }
+            Kind::Multiline { columns, .. } => { let mut v = View::new(view_kind, "", children); v.columns = *columns; v }
         }
     }
     fn bind_template(&self, view: &mut View, def: &typst::MacroDefinition, registry: &typst::MacroRegistry, args: &[View]) {

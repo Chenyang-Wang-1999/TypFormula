@@ -336,18 +336,19 @@ if children.iter().any(|n| matches!(n.kind(), SyntaxKind::Linebreak | SyntaxKind
 ### 4.8 match guard 与字段简写
 
 ```rust
-pub fn script_idx(&self, up: bool) -> Option<usize> {
-    let Kind::Script { cell_1_is_up } = self.kind else { return None; };
-    match self.cells.len() {
-        3 => Some(if up { 1 } else { 2 }),
-        2 if cell_1_is_up == up => Some(1),
-        _ => None,
-    }
-}
+let kind = match (name.as_str(), args.len()) {
+    ("frac", 2) => Kind::Fraction, ("sqrt", 1) => Kind::Sqrt, ("root", 2) => Kind::Root,
+    ("abs", 1) => Kind::Fenced { left: "|".into(), right: "|".into() },
+    ("overline" | "underline" | "hat" | "vec", 1) => Kind::Decoration { name },
+    ("mat", n) if n > 0 && widths.iter().all(|w| *w == widths[0]) => Kind::Table { columns: widths[0] },
+    _ => return vec![MathAtom::from_source(node.full_text())],
+};
 ```
-（`math.rs:77-80`）
+（`typst.rs:552-559`）
 
-`2 if cell_1_is_up == up` 是 **match guard**：先匹配 `2`，再检查附加条件。C++ 的 `switch` 没有这个，得写嵌套 `if`。
+`("mat", n) if n > 0 && ...` 里的 `if` 是 **match guard**：先按元组匹配名字与参数个数，再检查附加条件（各行列数一致才当矩阵，否则落到 `_` 退化成 Raw）。C++ 的 `switch` 没有这个，得写嵌套 `if`。
+
+注意 `->` 后面跟 `return`：分支的**类型必须一致**，`_` 分支用 `return` 发散（类型 `!`）才能和其余分支产出的 `Kind` 共存——这是第 20 章 never type 的实际用处。
 
 `Self { kind, cells: vec![...] }`（`math.rs:51`）是**字段初始化简写**：变量名和字段同名时可省 `kind: kind`。
 
@@ -425,14 +426,14 @@ pub display_glyph: Option<String>,
 pub enum Kind {
     Char { value: char },
     Raw { source: String },
-    Script { cell_1_is_up: bool },
+    Script,
     Grid { columns: usize },
     ...
 }
 ```
-（`math.rs:21-40`）
+（`math.rs` 里的 `Kind`）
 
-这是 C++ 里要 `std::variant` + `std::visit` 才能表达的东西。Rust 里 enum 的每个变体可以带不同的数据，`match` 时精确解构。你项目的 `Kind`、`Action`（`cursor.rs:16-35`）、`Binding`（`typst.rs:54`）全是这个模式。
+这是 C++ 里要 `std::variant` + `std::visit` 才能表达的东西。Rust 里 enum 的每个变体可以带不同的数据，`match` 时精确解构——也可以不带数据（如 `Script`）。你项目的 `Kind`、`Action`（`cursor.rs:16-35`）、`Binding`（`typst.rs:54`）全是这个模式。
 
 **这也是为什么加一个 `Kind` 会编译报错直到你补全所有 match**——穷尽性检查在替你守契约。
 

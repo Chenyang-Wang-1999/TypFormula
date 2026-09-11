@@ -54,6 +54,18 @@ class Box:
         self.raws += [(QRectF(rect).translated(x,y), node) for rect,node in other.raws]
 
 class Typesetter:
+    # The arrangements this frontend knows how to draw. `kind` is the name the
+    # backend declares for a node (`slots::Decl::view`), and everything in this
+    # set has a branch in `layout`. A name outside it is a frontend/backend
+    # mismatch, not a node to guess at.
+    ARRANGEMENTS = frozenset({
+        "char", "symbol", "raw", "text", "unknown", "parameter",
+        "draft-text", "draft-placeholder", "draft-caret", "absent", "stop",
+        "cell", "empty-cell", "fraction", "sqrt", "root", "script",
+        "grid", "aligned", "delim", "decoration",
+        "macro", "macro-argument", "macro-collapsed", "template-call",
+    })
+
     def __init__(self, settings, cache=None):
         self.settings = settings
         self.cache = cache if cache is not None else {}
@@ -70,6 +82,10 @@ class Typesetter:
         self.math_family = ""
         # Bumped whenever the Raw/attachment results that layout reads change.
         self.version = 0
+        # Arrangements already reported as unknown, so one mismatch is said once
+        # instead of once per formula. `warn` is set by the window.
+        self.unknown = set()
+        self.warn = None
 
     def touch(self):
         """Invalidate cached boxes after Raw SVGs or attachment placements move."""
@@ -155,10 +171,31 @@ class Typesetter:
                 return self.cache[key]
         return None
 
+    def note_unknown(self, kind):
+        """Report an arrangement this frontend does not implement, once per kind."""
+        if kind in self.unknown: return
+        self.unknown.add(kind)
+        if self.warn: self.warn(f"未知的排布 {kind!r}：已按横排显示，前后端可能不同步")
+
+    @staticmethod
+    def slot(children, role, index):
+        """The child that fills `role`, falling back to its position.
+
+        The backend declares every cell's role, so a layout strategy finds its
+        children by meaning rather than by cell order -- a kind that reuses an
+        arrangement is then placed correctly without touching this file. The
+        positional fallback keeps an older core driving a newer frontend.
+        """
+        for child in children:
+            if child.get("role") == role: return child
+        if index < len(children): return children[index]
+        return {"kind": "absent", "children": []}
+
     def layout(self, node, factor=1.0, text_mode=False):
         font, metrics, em, ascent, descent = self.line(factor)
         kind = node.get("kind", "cell")
         children = node.get("children", [])
+        if kind not in self.ARRANGEMENTS: self.note_unknown(kind)
         if kind == "absent":
             return Box(0,0,0)
         if kind == "empty-cell":
@@ -205,23 +242,25 @@ class Typesetter:
             box = Box(width,em,ascent,[("text",0,ascent,(glyph,draw_font,kind))])
             if kind == "raw": box.raws.append((QRectF(0,0,width,em),node))
         elif kind == "fraction":
-            numerator,denominator = [self.layout(child,factor*.9) for child in children[:2]]
+            numerator,denominator = [self.layout(self.slot(children,role,index),factor*.9)
+                                     for role,index in (("numerator",0),("denominator",1))]
             width = max(numerator.width,denominator.width)+8
             box = Box(width,numerator.height+denominator.height+6,numerator.height+5+denominator.baseline*.45)
             box.add(numerator,(width-numerator.width)/2)
             box.add(denominator,(width-denominator.width)/2,numerator.height+6)
             box.operations.append(("line",2,numerator.height+3,(width-4,0)))
         elif kind in ("sqrt","root"):
-            body=self.layout(children[0],factor)
-            index=self.layout(children[1],factor*.55) if kind=="root" else Box(0,0,0)
+            body=self.layout(self.slot(children,"radicand",0),factor)
+            index=self.layout(self.slot(children,"index",1),factor*.55) if kind=="root" else Box(0,0,0)
             lead=max(em*.6,index.width+4);top=max(3,index.height-body.height*.4)
             box=Box(lead+body.width+3,body.height+top+3,top+body.baseline)
             box.add(body,lead,top);box.add(index,0,0)
             points=[(lead-em*.6,top+body.height*.6),(lead-em*.45,top+body.height*.5),(lead-em*.22,top+body.height),(lead,top),(box.width,top)]
             for (x,y),(xx,yy) in zip(points,points[1:]):box.operations.append(("line",x,y,(xx-x,yy-y)))
         elif kind == "script":
-            base = self.layout(children[0],factor)
-            up,down = [self.layout(child,factor*.7) for child in children[1:3]]
+            base = self.layout(self.slot(children,"base",0),factor)
+            up,down = [self.layout(self.slot(children,role,index),factor*.7)
+                       for role,index in (("upper",1),("lower",2))]
             placement=node.get("_placement") or {}
             centered_up=placement.get("upper")=="limits";centered_down=placement.get("lower")=="limits"
             if not (centered_up or centered_down):
