@@ -4,7 +4,7 @@
 //! `Kind` carries instance data (how many columns, which script exists); this
 //! module says what a node's cells *mean* and how the caret moves between them.
 //! The accessors that used to switch on `Kind` with a `_ =>` catch-all now read
-//! `Kind::decl()`, so a new kind is one exhaustive match arm instead of a hunt
+//! `Kind::shape()` / `Kind::grammar()`, so a new kind is two exhaustive match arms instead of a hunt
 //! for silent fallbacks scattered across `math.rs` and `cursor.rs`.
 //!
 //! `Decl` also records the three things that are *not* about slots but that
@@ -104,8 +104,6 @@ pub enum Horiz {
     /// Never: a fraction and an attachment deliberately block the caret at
     /// their cell boundary (`InsetMathFrac`/`InsetMathScript` do the same).
     Locked,
-    /// Only between two cells (`root`).
-    Pair,
     /// Linear, but stopping at a column boundary (grid, alignment).
     Column,
     /// Linear.
@@ -130,11 +128,11 @@ pub enum Vertical {
 /// How a node's cells become its Typst spelling.
 ///
 /// Most kinds are a call over their cells, and for those the template states the
-/// argument order: `"root({1}, {0})"` is where the reverse of Typst's own
-/// `root(index, radicand)` becomes visible, instead of hiding in a hand-written
-/// `c(1), c(0)` that has to stay in step with the `args.swap(0, 1)` on the parse
-/// side. Placeholders are `{0}`, `{1}`… for cells and `{name}` for the node's
-/// stored name.
+/// order those cells are written in — `"frac({0}, {1})"`, `"sqrt({0})"`. A cell
+/// order that differs from the spelling would be stated here rather than hidden in
+/// a hand-written `c(1), c(0)`; after `Root` was changed to store its cells in the
+/// order `root(index, radicand)` writes them, no kind needs that any more.
+/// Placeholders are `{0}`, `{1}`… for cells and `{name}` for the node's stored name.
 #[derive(Clone, Copy)]
 pub enum Write {
     Template(&'static str),
@@ -167,9 +165,35 @@ pub enum Write {
     TemplateOnly,
 }
 
-/// The schema of one `Kind`.
+/// How a node spells itself back into the document. Taken by `Kind`, **not** by
+/// shape: the spelling says what the tree holds, and a call spells itself as a
+/// call whatever shape it borrows for drawing.
+///
+/// That is the split `frac(a, b)` makes visible. It is stored as
+/// `MacroCall { name: "frac" }`, so its spelling is `Named` — `frac(args)` — and
+/// nothing about the `fraction` shape enters it. The shape is what the *slots*
+/// and the *drawing* come from.
 #[derive(Clone, Copy)]
-pub struct Decl {
+pub struct Grammar {
+    pub write: Write,
+}
+
+/// What a node looks like and how the caret moves inside it: its slots and their
+/// roles, the arrangement the frontend draws it with, where the caret enters, how
+/// it walks, and the spacing class.
+///
+/// Taken by **shape name**, which is why a configured command can borrow one:
+/// `frac(a, b)` is stored as a `MacroCall`, and `config/commands.json` says its
+/// shape is `fraction`, so its two cells get the `numerator`/`denominator` roles
+/// and the up/down rule of a fraction — exactly as if it were a stored
+/// `Kind::Fraction`.
+///
+/// The name is the *shape* name, not necessarily the wire name: `view_atom` is
+/// free to merge several shapes under one wire kind and does (`Sqrt`, `Fenced`,
+/// `Accent` and `Line` all travel as `decorated`). `grid`/`aligned`/`script` are
+/// likewise shape names whose wire kinds are `table`/`multiline`/`scripts`.
+#[derive(Clone, Copy)]
+pub struct Shape {
     /// The frontend's layout strategy for this node. `view_atom` reads it; a
     /// kind that needs a second shape for a fallback names that one separately
     /// (`MacroCall`'s collapsed form).
@@ -202,10 +226,9 @@ pub struct Decl {
     /// Math spacing class for kinds whose class is fixed. `Char` derives its
     /// class from the character itself, so its entry here is never read.
     pub class: u8,
-    pub write: Write,
 }
 
-impl Decl {
+impl Shape {
     /// The role of cell `index`, or `None` when the schema has no such cell.
     pub fn role_at(&self, index: usize) -> Option<Role> {
         match self.arity {
@@ -217,6 +240,14 @@ impl Decl {
     pub fn index_of(&self, role: Role) -> Option<usize> {
         self.slots.iter().position(|slot| slot.role == role)
     }
+    /// Whether this shape is a radical. The degree is drawn to the **left** of the
+    /// radicand, so the radicand is met from its right — which is what makes the caret
+    /// land at the end of the cell it is entered from the right.
+    pub fn is_radical(&self) -> bool { self.typst == K_RADICAL }
+    /// Whether this is the font-variant shape. It is the one shape applied by
+    /// substituting codepoints, so it only applies to a body that is a run of
+    /// characters (`typst::has_glyph_run`).
+    pub fn is_font_variant(&self) -> bool { self.view == "style" }
 }
 
 // The command names live in `config/commands.json`, which `build.rs` turns into the
@@ -230,30 +261,37 @@ pub fn command_spec(name: &str) -> Option<&'static configured::Command> {
     configured::COMMANDS.iter().find(|command| command.name == name)
 }
 
-/// The kind a Typst call means, from `config/commands.json`.
-pub fn command_kind(name: &str) -> Option<Kind> {
-    kind_for_view(command_spec(name)?.shape)
+/// The shape a configured command name borrows, from `config/commands.json`.
+///
+/// This is the whole "borrow a shape" step: the file names a shape, the table
+/// below answers it. A `MacroCall` then draws, navigates and places its cells by
+/// that shape while staying a `MacroCall` in the tree.
+pub fn configured_shape(name: &str) -> Option<Shape> {
+    shape_named(command_spec(name)?.shape)
 }
 
-/// The kind a command name means, **with the data its own name supplies**.
+/// The **drawing data** a command name carries, as a descriptor `Kind`.
 ///
-/// This is the one place a name becomes a complete shape. Three kinds carry data in
-/// their variant that only the name can say — `abs` is the `|` pair, `hat` the accent
-/// called `hat`, `overline` the line above — so `kind_for_view` answers them blank and
-/// someone has to fill them in. That used to be `parse_atom`, which meant anything
-/// *else* asking "what shape is `hat`?" (the view projection, the writer) got the blank
-/// and drew an accent with no name. Consolidating it here is what lets a `MacroCall`
-/// borrow a shape without the call site having to know how the shape is spelled.
+/// Not stored, and no longer consulted for spelling: a configured call writes back
+/// through `Grammar`/`Write::Named`, which needs nothing but its own name. What is
+/// left here is the data only the name can supply and only the *drawing* reads —
+/// `abs` is the `|` pair, `hat` the accent called `hat`, `overline` the line above.
+/// `view_atom` reads it; `configured_shape` answers the slots and navigation.
+///
+/// It goes away when `config/commands.json` carries those view fields itself.
 pub fn configured_kind(name: &str) -> Option<Kind> {
-    Some(match command_kind(name)? {
-        Kind::Accent { .. } => Kind::Accent { name: name.to_string() },
-        Kind::Style { .. } => Kind::Style { name: name.to_string() },
-        Kind::Line { .. } => Kind::Line { above: name == "overline" },
-        Kind::Fenced { .. } => match name {
+    Some(match shape_named(command_spec(name)?.shape)?.view {
+        "delim" => match name {
             "abs" => Kind::Fenced { left: "|".into(), right: "|".into() },
             _ => Kind::Fenced { left: "‖".into(), right: "‖".into() },
         },
-        other => other,
+        "decoration" => Kind::Accent { name: name.to_string() },
+        "line" => Kind::Line { above: name == "overline" },
+        "style" => Kind::Style { name: name.to_string() },
+        "fraction" => Kind::Fraction,
+        "sqrt" => Kind::Sqrt,
+        "root" => Kind::Root,
+        _ => return None,
     })
 }
 
@@ -263,38 +301,34 @@ pub fn command_names() -> Vec<&'static str> {
     names.sort_unstable(); names.dedup(); names
 }
 
-/// The kind a view name stands for.
+/// The shape a name in `config/commands.json` stands for.
 ///
-/// A command names its kind by the arrangement the frontend draws it with, because
-/// that is the name stable enough to write in a file: a `Kind` variant can be renamed
-/// (as `Frac` became `Fraction`) without the command changing meaning, and `view` is
-/// already the editor's contract with the frontend.
+/// A command names its shape by the arrangement the frontend draws it with,
+/// because that is the name stable enough to write in a file: a `Kind` variant
+/// can be renamed (as `Frac` became `Fraction`) without the command changing
+/// meaning, and the arrangement is already the editor's contract with the
+/// frontend.
 ///
-/// Only the kinds a command can build **from its name alone** are listed. Two kinds
+/// Only the shapes a command can build **from its name alone** are listed. Two
 /// are deliberately absent:
 ///
 /// * `grid` is not here. A table's shape is its source's, not its name's — the
-///   columns come from how many cells share a row, which only the argument list says
-///   — so `parse_atom` builds one from the source it reads (`mat`'s own branch). A
-///   placeholder `columns: 0` here used to be the answer for any *other* name a
+///   columns come from how many cells share a row, which only the argument list
+///   says — so `parse_atom` builds one from the source it reads (`mat`'s own
+///   branch). A placeholder here used to be the answer for any *other* name a
 ///   config file pointed at `grid`, and writing such a table reached
 ///   `cells.chunks(0)` and panicked. Refusing the name instead leaves it as source.
-/// * `multiline` is not here. `&` and `\\` are not a call at all: they split the
+/// * `aligned` is not here. `&` and `\\` are not a call at all: they split the
 ///   math level into rows before any name is looked at.
-///
-/// The three kinds that carry data in their own variant are answered with a blank
-/// value, which the parser then fills from the source it is reading — the command's
-/// name is what says which: `abs` is the `|` pair, `hat` the accent called `hat`,
-/// `overline` the line above.
-fn kind_for_view(view: &str) -> Option<Kind> {
+fn shape_named(view: &str) -> Option<Shape> {
     Some(match view {
-        "fraction" => Kind::Fraction,
-        "sqrt" => Kind::Sqrt,
-        "root" => Kind::Root,
-        "delim" => Kind::Fenced { left: String::new(), right: String::new() },
-        "line" => Kind::Line { above: false },
-        "decoration" => Kind::Accent { name: String::new() },
-        "style" => Kind::Style { name: String::new() },
+        "fraction" => FRACTION_SHAPE,
+        "sqrt" => SQRT_SHAPE,
+        "root" => ROOT_SHAPE,
+        "delim" => DELIM_SHAPE,
+        "line" => LINE_SHAPE,
+        "decoration" => DECORATION_SHAPE,
+        "style" => STYLE_SHAPE,
         _ => return None,
     })
 }
@@ -302,7 +336,7 @@ fn kind_for_view(view: &str) -> Option<Kind> {
 /// Command names whose kind the parser builds from the source, not from a name.
 ///
 /// A table's shape is its argument list's, so these names get a branch in `parse_atom`
-/// rather than an answer from `kind_for_view` — which is why `kind_for_view` refuses
+/// rather than an answer from `shape_named` — which is why `shape_named` refuses
 /// `grid` outright: a name with no such branch would be handed a placeholder table and
 /// write it with a column count nobody filled in.
 ///
@@ -329,8 +363,16 @@ const ARGS: &[Slot] = &[Slot::full(Role::Arg)];
 const CELL: &[Slot] = &[Slot::full(Role::Cell)];
 const FRACTION: &[Slot] = &[Slot::scaled(Role::Numerator, 900), Slot::scaled(Role::Denominator, 900)];
 const RADICAND: &[Slot] = &[Slot::full(Role::Radicand)];
-/// Cells are `[radicand, index]`, the reverse of Typst's `root(index, radicand)`.
-const ROOT: &[Slot] = &[Slot::full(Role::Radicand), Slot::scaled(Role::Index, 550)];
+/// Cells are `[index, radicand]` — the order Typst's own `root(index, radicand)`
+/// takes them, and the order they are read in, the degree standing to the left of
+/// the radicand.
+///
+/// This used to be stored reversed, with an `args.swap(0, 1)` at parse time to
+/// make it so and a `root({1}, {0})` template to undo it on the way out. Every
+/// reader of the tree then had to know about the reversal: the entry roles, the
+/// vertical swap, the horizontal pair rule, `∛x`'s own construction, and a
+/// `radical` special case in the caret. Storing the source order removes all six.
+const ROOT: &[Slot] = &[Slot::scaled(Role::Index, 550), Slot::full(Role::Radicand)];
 /// The shape a script's cells always have: base, upper, lower.
 const ATTACH: &[Slot] = &[Slot::full(Role::Base), Slot::blank(Role::Upper, 700), Slot::blank(Role::Lower, 700)];
 
@@ -361,6 +403,95 @@ const K_LINE: &[&str] = &["Line"];
 /// mark), but they are not commands the editor accepts, so they arrive as `Raw`.
 const K_ACCENT: &[&str] = &["Accent", "Cancel"];
 const K_NONE: &[&str] = &[];
+
+// One `Shape` per arrangement. They are constants rather than inline literals
+// because two tables read them: `Kind::shape` (what a stored node looks like) and
+// `shape_named` (what a name in `config/commands.json` borrows).
+const CHAR_SHAPE: Shape = Shape {
+    view: "char", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const SYMBOL_SHAPE: Shape = Shape {
+    view: "symbol", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const NUMBER_SHAPE: Shape = Shape {
+    view: "number", typst: K_NUMBER, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const RAW_SHAPE: Shape = Shape {
+    view: "raw", typst: K_OPAQUE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const UNKNOWN_SHAPE: Shape = Shape {
+    view: "unknown", typst: K_NONE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const PARAMETER_SHAPE: Shape = Shape {
+    view: "parameter", typst: K_NONE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const TEXT_SHAPE: Shape = Shape {
+    view: "text", typst: K_TEXT, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const MACRO_SHAPE: Shape = Shape {
+    view: "macro", typst: K_NONE, slots: ARGS, arity: Arity::Repeat, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const TEMPLATE_CALL_SHAPE: Shape = Shape {
+    view: "template-call", typst: K_NONE, slots: ARGS, arity: Arity::Repeat, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const FRACTION_SHAPE: Shape = Shape {
+    view: "fraction", typst: K_FRACTION, slots: FRACTION, arity: Arity::Exact,
+    entry: Entry::Role { forward: Role::Numerator, backward: Role::Denominator },
+    horizontal: Horiz::Locked,
+    vertical: Vertical::Swap { up: Role::Numerator, down: Role::Denominator, end_up: false },
+    class: 7,
+};
+const SQRT_SHAPE: Shape = Shape {
+    view: "sqrt", typst: K_RADICAL, slots: RADICAND, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const ROOT_SHAPE: Shape = Shape {
+    view: "root", typst: K_RADICAL, slots: ROOT, arity: Arity::Exact,
+    // Forward enters the degree, which now stands in cell 0 because the cells are
+    // stored in the order they are read.
+    entry: Entry::Role { forward: Role::Index, backward: Role::Radicand },
+    horizontal: Horiz::Linear,
+    vertical: Vertical::Swap { up: Role::Index, down: Role::Radicand, end_up: true },
+    class: 0,
+};
+const SCRIPTS_SHAPE: Shape = Shape {
+    view: "script", typst: K_SCRIPTS, slots: ATTACH, arity: Arity::Exact,
+    entry: Entry::Role { forward: Role::Base, backward: Role::Base },
+    horizontal: Horiz::Locked, vertical: Vertical::Attach, class: 0,
+};
+const DELIM_SHAPE: Shape = Shape {
+    view: "delim", typst: K_FENCED, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const GRID_SHAPE: Shape = Shape {
+    view: "grid", typst: K_TABLE, slots: CELL, arity: Arity::Repeat, entry: Entry::GridMiddle,
+    horizontal: Horiz::Column, vertical: Vertical::Column, class: 7,
+};
+const ALIGNED_SHAPE: Shape = Shape {
+    view: "aligned", typst: K_MULTILINE, slots: CELL, arity: Arity::Repeat, entry: Entry::Edge,
+    horizontal: Horiz::Column, vertical: Vertical::Column, class: 0,
+};
+const DECORATION_SHAPE: Shape = Shape {
+    view: "decoration", typst: K_ACCENT, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const LINE_SHAPE: Shape = Shape {
+    view: "line", typst: K_LINE, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
+const STYLE_SHAPE: Shape = Shape {
+    view: "style", typst: K_GLYPH, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
+    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+};
 
 /// The Typst `MathKind` variants no `Kind` stands for.
 ///
@@ -413,143 +544,101 @@ pub fn char_class(value: char) -> u8 {
 }
 
 impl Kind {
-    /// The slot schema. Exhaustive on purpose: the compiler will not accept a
-    /// new `Kind` until its cells, its spelling, its entry rule, its navigation
-    /// and the Typst construct it models are all stated.
+    /// What this node looks like and how the caret moves inside it.
     ///
-    /// Key order below is `view`, `typst`, `commands`, `slots`, `arity`, `entry`,
-    /// `horizontal`, `vertical`, `class`, `write` — the same order as `Decl`,
-    /// so the table reads as one column per obligation.
-    pub fn decl(&self) -> Decl {
+    /// Exhaustive on purpose: the compiler will not accept a new `Kind` until its
+    /// slots, its entry rule, its navigation and the Typst construct it models are
+    /// all stated.
+    ///
+    /// Leaves have no cells of their own, so nothing to enter or walk; each is
+    /// shown under its own arrangement.
+    pub fn shape(&self) -> Shape {
         match self {
-            // Leaves: no cells of their own, so nothing to enter or walk. Each is
-            // spelled by its own stored text but shows up under its own view.
-            Kind::Char { .. } => Decl {
-                view: "char", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::OwnText,
-            },
-            Kind::Symbol { .. } => Decl {
-                view: "symbol", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::OwnText,
-            },
+            Kind::Char { .. } => CHAR_SHAPE,
+            Kind::Symbol { .. } => SYMBOL_SHAPE,
             // A number is a run of digits in one cell, like a text run: the caret
             // can sit between the digits, and the cell is written as one piece so
             // the run stays one token.
-            Kind::Number => Decl {
-                view: "number", typst: K_NUMBER, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::Run,
-            },
+            Kind::Number => NUMBER_SHAPE,
             // Whatever the editor does not model structurally is one opaque
             // fragment of Typst source, whichever MathKind it resolves into.
-            Kind::Raw { .. } => Decl {
-                view: "raw", typst: K_OPAQUE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::OwnText,
-            },
-            Kind::Unknown { .. } => Decl {
-                view: "unknown", typst: K_NONE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::OwnText,
-            },
-            Kind::Parameter { .. } => Decl {
-                view: "parameter", typst: K_NONE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::Marker,
-            },
+            Kind::Raw { .. } => RAW_SHAPE,
+            Kind::Unknown { .. } => UNKNOWN_SHAPE,
+            Kind::Parameter { .. } => PARAMETER_SHAPE,
             // A text run holds its characters in one cell, but is written as one
             // quoted string rather than as those characters.
-            Kind::Text => Decl {
-                view: "text", typst: K_TEXT, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::Quoted,
-            },
+            Kind::Text => TEXT_SHAPE,
             // Macro calls: one cell per argument, entered at the first and left
             // at the last. `delete` and the projection rules are separate
             // obligations and still live with the caller. A call that cannot be
             // expanded shows up as `view::MACRO_COLLAPSED`, not as this view.
-            Kind::MacroCall { .. } => Decl {
-                view: "macro", typst: K_NONE, slots: ARGS, arity: Arity::Repeat, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::Named,
-            },
+            Kind::MacroCall { .. } => MACRO_SHAPE,
             // Template edges exist only inside an expanded macro template.
-            Kind::TemplateCall { .. } => Decl {
-                view: "template-call", typst: K_NONE, slots: ARGS, arity: Arity::Repeat, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::TemplateOnly,
-            },
-            Kind::Fraction => Decl {
-                view: "fraction", typst: K_FRACTION, slots: FRACTION, arity: Arity::Exact,
-                entry: Entry::Role { forward: Role::Numerator, backward: Role::Denominator },
-                horizontal: Horiz::Locked,
-                vertical: Vertical::Swap { up: Role::Numerator, down: Role::Denominator, end_up: false },
-                class: 7, write: Write::Template("frac({0}, {1})"),
-            },
+            Kind::TemplateCall { .. } => TEMPLATE_CALL_SHAPE,
+            Kind::Fraction => FRACTION_SHAPE,
             // Typst has one `Radical` with an optional index; the editor keeps
             // the index as a cell of its own, so a square root is a radical
             // whose index cell is empty. Which of the two kinds a node is comes
             // from how many cells it stores, and the two tags below are how the
             // wire tells the frontend to draw a hook or a degree.
-            Kind::Sqrt => Decl {
-                view: "sqrt", typst: K_RADICAL, slots: RADICAND, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::Template("sqrt({0})"),
-            },
-            // The stored cells are `[radicand, index]` while Typst writes
-            // `root(index, radicand)`. The template below is where that reversal
-            // is stated; `parse_atom` swaps the parsed arguments to match it.
-            Kind::Root => Decl {
-                view: "root", typst: K_RADICAL, slots: ROOT, arity: Arity::Exact,
-                entry: Entry::Role { forward: Role::Index, backward: Role::Radicand },
-                horizontal: Horiz::Pair,
-                vertical: Vertical::Swap { up: Role::Index, down: Role::Radicand, end_up: true },
-                class: 0, write: Write::Template("root({1}, {0})"),
-            },
+            Kind::Sqrt => SQRT_SHAPE,
+            Kind::Root => ROOT_SHAPE,
             // Storage is always `[base, upper, lower]`; an empty cell is an
             // attachment the source does not have (`math::script_cell`). Typst's
             // `ScriptsItem` has six attachment fields because it separates
             // limits from scripts and keeps the left ones; which of the two a
             // cell is, is decided by the compiler and asked for separately
             // (`native-adapter`), not stored here.
-            Kind::Scripts => Decl {
-                view: "script", typst: K_SCRIPTS, slots: ATTACH, arity: Arity::Exact,
-                entry: Entry::Role { forward: Role::Base, backward: Role::Base },
-                horizontal: Horiz::Locked, vertical: Vertical::Attach, class: 0, write: Write::Attach,
-            },
+            Kind::Scripts => SCRIPTS_SHAPE,
             // The delimiters are the two characters the source spelled, not
             // items as in Typst's `FencedItem`, and the one cell is the body
             // between them.
-            Kind::Fenced { .. } => Decl {
-                view: "delim", typst: K_FENCED, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::Delimited,
-            },
-            Kind::Table { .. } => Decl {
-                view: "grid", typst: K_TABLE, slots: CELL, arity: Arity::Repeat, entry: Entry::GridMiddle,
-                horizontal: Horiz::Column, vertical: Vertical::Column, class: 7, write: Write::Matrix,
-            },
-            Kind::Multiline { .. } => Decl {
-                view: "aligned", typst: K_MULTILINE, slots: CELL, arity: Arity::Repeat, entry: Entry::Edge,
-                horizontal: Horiz::Column, vertical: Vertical::Column, class: 0, write: Write::Rows,
-            },
+            Kind::Fenced { .. } => DELIM_SHAPE,
+            Kind::Table { .. } => GRID_SHAPE,
+            Kind::Multiline { .. } => ALIGNED_SHAPE,
             // A mark above or below the base; its name is the callee and the cell
             // is its body. Typst's `AccentItem` derives above/below from the mark
             // itself, so nothing here stores it.
-            Kind::Accent { .. } => Decl {
-                view: "decoration", typst: K_ACCENT, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0, write: Write::Template("{name}({0})"),
-            },
+            Kind::Accent { .. } => DECORATION_SHAPE,
             // A rule above or below the base. Only the position is stored, because
-            // that is all `LineItem` has; the template pair below spells it.
-            Kind::Line { .. } => Decl {
-                view: "line", typst: K_LINE, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
-                write: Write::Positioned { above: "overline({0})", below: "underline({0})" },
-            },
+            // that is all `LineItem` has.
+            Kind::Line { .. } => LINE_SHAPE,
             // A base drawn in a font variant. Its slots are a decoration's — one inner
             // cell, entered at the edge, linear, no vertical move — because the variant
             // changes how the body is *drawn*, not how it is edited. What it does not
             // have is a glyph: Typst substitutes codepoints, and that table is out of the
-            // kernel's reach, so the frontend asks the engine (`Decl::typst` records the
+            // kernel's reach, so the frontend asks the engine (`Shape::typst` records the
             // `Glyph`s it stands for, once the substitution has happened).
-            Kind::Style { .. } => Decl {
-                view: "style", typst: K_GLYPH, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-                horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
-                write: Write::Template("{name}({0})"),
-            },
+            Kind::Style { .. } => STYLE_SHAPE,
         }
+    }
+
+    /// How this node spells itself back into the document.
+    ///
+    /// The second half of the split, and the half that does **not** follow a
+    /// borrowed shape: a call is spelled as a call (`Write::Named`), whatever
+    /// arrangement it borrows for drawing. `frac(a, b)` is `MacroCall`, so it
+    /// writes back through its own name and no `fraction` template is involved.
+    pub fn grammar(&self) -> Grammar {
+        Grammar { write: match self {
+            Kind::Char { .. } | Kind::Symbol { .. } | Kind::Raw { .. } | Kind::Unknown { .. } => Write::OwnText,
+            Kind::Number => Write::Run,
+            Kind::Text => Write::Quoted,
+            Kind::Parameter { .. } => Write::Marker,
+            Kind::MacroCall { .. } => Write::Named,
+            Kind::TemplateCall { .. } => Write::TemplateOnly,
+            Kind::Fraction => Write::Template("frac({0}, {1})"),
+            Kind::Sqrt => Write::Template("sqrt({0})"),
+            // Stored order is Typst's own `root(index, radicand)`, so the
+            // template reads in the same order and no reversal is stated here.
+            Kind::Root => Write::Template("root({0}, {1})"),
+            Kind::Scripts => Write::Attach,
+            Kind::Fenced { .. } => Write::Delimited,
+            Kind::Table { .. } => Write::Matrix,
+            Kind::Multiline { .. } => Write::Rows,
+            Kind::Accent { .. } | Kind::Style { .. } => Write::Template("{name}({0})"),
+            Kind::Line { .. } => Write::Positioned { above: "overline({0})", below: "underline({0})" },
+        } }
     }
 }
 
@@ -595,7 +684,7 @@ mod tests {
 
     #[test]
     fn every_kind_has_a_representative_here() {
-        // `Kind::decl` makes a new kind fail to compile; this count is what
+        // `Kind::shape` makes a new kind fail to compile; this count is what
         // makes a new kind fail to be *covered* by this file.
         assert_eq!(representatives().len(), 19, "新增 Kind 后请在这里补一条代表实例");
     }
@@ -603,14 +692,14 @@ mod tests {
     #[test]
     fn named_roles_exist_in_the_schema_that_names_them() {
         for (label, kind, _) in representatives() {
-            let decl = kind.decl();
-            if let Entry::Role { forward, backward } = decl.entry {
-                assert!(decl.index_of(forward).is_some(), "{label}：入口角色 {forward:?} 不在槽位表里");
-                assert!(decl.index_of(backward).is_some(), "{label}：入口角色 {backward:?} 不在槽位表里");
+            let shape = kind.shape();
+            if let Entry::Role { forward, backward } = shape.entry {
+                assert!(shape.index_of(forward).is_some(), "{label}：入口角色 {forward:?} 不在槽位表里");
+                assert!(shape.index_of(backward).is_some(), "{label}：入口角色 {backward:?} 不在槽位表里");
             }
-            if let Vertical::Swap { up, down, .. } = decl.vertical {
-                assert!(decl.index_of(up).is_some(), "{label}：上移角色 {up:?} 不在槽位表里");
-                assert!(decl.index_of(down).is_some(), "{label}：下移角色 {down:?} 不在槽位表里");
+            if let Vertical::Swap { up, down, .. } = shape.vertical {
+                assert!(shape.index_of(up).is_some(), "{label}：上移角色 {up:?} 不在槽位表里");
+                assert!(shape.index_of(down).is_some(), "{label}：下移角色 {down:?} 不在槽位表里");
             }
         }
     }
@@ -618,20 +707,20 @@ mod tests {
     #[test]
     fn the_schema_covers_exactly_the_cells_a_kind_stores() {
         for (label, kind, cells) in representatives() {
-            let decl = kind.decl();
-            match decl.arity {
+            let shape = kind.shape();
+            match shape.arity {
                 Arity::Exact => {
-                    for index in 0..decl.slots.len() {
-                        assert!(decl.role_at(index).is_some(), "{label}：第 {index} 格没有角色");
+                    for index in 0..shape.slots.len() {
+                        assert!(shape.role_at(index).is_some(), "{label}：第 {index} 格没有角色");
                     }
-                    assert!(decl.role_at(decl.slots.len()).is_none(), "{label}：定长图式多出了一格");
-                    assert_eq!(decl.slots.len(), cells, "{label}：槽位数与真实格子数不符");
+                    assert!(shape.role_at(shape.slots.len()).is_none(), "{label}：定长图式多出了一格");
+                    assert_eq!(shape.slots.len(), cells, "{label}：槽位数与真实格子数不符");
                 }
                 Arity::Repeat => {
-                    assert!(!decl.slots.is_empty(), "{label}：重复图式必须有模式");
-                    assert!(cells >= decl.slots.len(), "{label}：重复图式的模式比格子还多");
+                    assert!(!shape.slots.is_empty(), "{label}：重复图式必须有模式");
+                    assert!(cells >= shape.slots.len(), "{label}：重复图式的模式比格子还多");
                     for index in 0..cells.max(8) {
-                        assert!(decl.role_at(index).is_some(), "{label}：第 {index} 格没有角色");
+                        assert!(shape.role_at(index).is_some(), "{label}：第 {index} 格没有角色");
                     }
                 }
             }
@@ -684,7 +773,7 @@ mod tests {
     ///
     /// A command whose kind needs the source to know its *shape* is listed here too,
     /// because the file still has to say the name is one the editor knows — it is
-    /// `kind_for_view` that cannot answer it, not the file that is wrong. `mat` is
+    /// `shape_named` that cannot answer it, not the file that is wrong. `mat` is
     /// the only one: its columns are its argument list's.
     #[test]
     fn the_command_file_names_kinds_that_exist_and_are_commands() {
@@ -697,9 +786,9 @@ mod tests {
             // because `parse_atom` has a branch for `mat`, and that says nothing about
             // whether some other name may claim `grid` — a name that did would reach the
             // writer with a `Table { columns: 0 }` and panic.
-            if let Some(kind) = command_kind(name) {
-                assert_eq!(kind.decl().view, view, "{name} 指向 {view}，但建出来的是 {}", kind.decl().view);
-                assert!(command_views().contains(&view), "{view} 不是一个命令能建出来的 Kind");
+            if let Some(shape) = configured_shape(name) {
+                assert_eq!(shape.view, view, "{name} 指向 {view}，但建出来的是 {}", shape.view);
+                assert!(command_views().contains(&view), "{view} 不是一个命令能建出来的形状");
             } else {
                 assert!(source_built_commands().contains(&name),
                         "config/commands.json 里的 {name} 指向 {view}，但解析器既查不到这个名字、也没有从源码建它的分支");
@@ -720,7 +809,7 @@ mod tests {
         // that shape needs and stops with `unreachable!` if the kind has none.
         // This test is what makes those arms unreachable rather than a guess.
         for (label, kind, _) in representatives() {
-            let agrees = match kind.decl().write {
+            let agrees = match kind.grammar().write {
                 Write::OwnText => matches!(kind, Kind::Char { .. } | Kind::Symbol { .. } | Kind::Raw { .. } | Kind::Unknown { .. }),
                 Write::Marker => matches!(kind, Kind::Parameter { .. }),
                 Write::TemplateOnly => matches!(kind, Kind::TemplateCall { .. }),
@@ -741,8 +830,8 @@ mod tests {
     #[test]
     fn a_template_only_names_placeholders_that_exist() {
         for (label, kind, cells) in representatives() {
-            assert!(!kind.decl().view.is_empty(), "{label}：没有声明视图名");
-            let Write::Template(template) = kind.decl().write else { continue };
+            assert!(!kind.shape().view.is_empty(), "{label}：没有声明形状名");
+            let Write::Template(template) = kind.grammar().write else { continue };
             let mut used = 0;
             let mut rest = template;
             while let Some(open) = rest.find('{') {
@@ -805,7 +894,7 @@ mod tests {
         let all = typst_math_kinds();
         let mut claimed: Vec<&str> = vec![];
         for (label, kind, _) in representatives() {
-            for name in kind.decl().typst {
+            for name in kind.shape().typst {
                 assert!(all.contains(name), "{label}：声明对应 MathKind::{name}，但 vendored 枚举里没有这个变体");
                 claimed.push(name);
             }

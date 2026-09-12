@@ -20,7 +20,7 @@ fn failed_block_enters_from_either_side_at_the_corresponding_caret() {
     key(&mut e,"ArrowLeft");assert_eq!(e.command_context().unwrap().draft_caret,"undefinedname".len());
     e.apply(Action::Key{key:"a".into(),ctrl:true,shift:false}).unwrap();
     e.apply(Action::Input{text:"sqrt(3)".into()}).unwrap();key(&mut e,"Enter");
-    assert_eq!(e.root[0].decl().view, "sqrt", "粘贴的调用应当成为根式形状的节点");
+    assert_eq!(e.root[0].shape().view, "sqrt", "粘贴的调用应当成为根式形状的节点");
     assert_eq!(typst::write_cell(&e.root),"sqrt(3)");
 }
 

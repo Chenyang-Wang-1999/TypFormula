@@ -14,7 +14,7 @@ fn run(a:&MathAtom)->String{
 #[test]
 fn nested_raw_keeps_its_editable_fraction_and_source() {
     let mut e=command("frac(dif x, 2 pi)");
-    assert_eq!(e.root[0].decl().view,"fraction","命令写法借用分式的形状");raw(&e.root[0].cells[0][0],"dif");
+    assert_eq!(e.root[0].shape().view,"fraction","命令写法借用分式的形状");raw(&e.root[0].cells[0][0],"dif");
     assert!(matches!(e.root[0].cells[1][1].kind,Kind::Symbol{..}));
     assert_eq!(e.root,load("frac(dif x, 2 pi)").root);
     key(&mut e,"Home");key(&mut e,"ArrowRight");key(&mut e,"ArrowRight");
@@ -230,7 +230,7 @@ fn fraction_slash_uses_typst_precedence_and_keeps_nested_fallbacks() {
     // Both project as a fraction and both write `frac(…)`.
     let e=command("(dif x)/ (2 pi)");assert!(matches!(e.root[0].kind,Kind::Fraction));
     assert_eq!(typst::write_cell(&e.root),"frac(dif x, 2 pi)");
-    assert_eq!(command("/").root[0].decl().view,"fraction");
+    assert_eq!(command("/").root[0].shape().view,"fraction");
     let mut e=Editor::default();input(&mut e,"x/2");
     assert_eq!(typst::write_cell(&e.root),"frac(x, 2)");
     assert_eq!(e.cursor.slices[0].cell,1);
@@ -255,7 +255,7 @@ fn alignment_preserves_empty_columns_ragged_rows_and_linebreaks() {
 #[test]
 fn markers_only_split_their_own_math_level() {
     let e=command("frac(a & b \\ c & d, 2)");
-    assert_eq!(e.root[0].decl().view,"fraction","命令写法借用分式的形状");
+    assert_eq!(e.root[0].shape().view,"fraction","命令写法借用分式的形状");
     assert!(matches!(e.root[0].cells[0][0].kind,Kind::Multiline{columns:2,..}));
     let e=command(r#""a & b \\ c" + \&"#);
     assert!(matches!(e.root[0].kind,Kind::Text));raw(e.root.last().unwrap(),r"\&");

@@ -2,7 +2,7 @@
 // Translated branches from upstream/src/Cursor.cpp and
 // upstream/src/mathed/InsetMathNest.cpp, InsetMathScript.cpp, InsetMathFrac.cpp.
 // Authors of original algorithms are listed in docs/LYX-CREDITS.
-use crate::{math::*, slots::{self, Vertical, Write}, typst};
+use crate::{math::*, slots::{self, Vertical}, typst};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -77,17 +77,16 @@ const NEW_MATRIX_ROWS: usize = 2;
 /// thing: slots to type into, which is what the factory used to build. A node the
 /// parser already gave cells to is left alone, so `frac(a, b)` is never grown.
 ///
-/// The count comes from the **spelling**, so there is no second list of arities:
-/// `frac({0}, {1})` fills two cells, `overline({0})` one, a matrix one row of its
-/// column count, and a delimiter pair the body between its characters.
+/// The count comes from the **shape**, so there is no second list of arities:
+/// the `fraction` shape has two slots, `decoration` one, and a grid repeats its
+/// one-cell pattern up to the default matrix the editor has always built. A leaf
+/// has no slots, so it is left empty.
 fn fill_command_cells(atom: &mut MathAtom) {
     if !atom.cells.is_empty() { return; }
-    let want = match atom.decl().write {
-        Write::Template(template) => typst::placeholder_indices(template).len(),
-        Write::Positioned { above, .. } => typst::placeholder_indices(above).len(),
-        Write::Matrix => NEW_MATRIX_COLUMNS * NEW_MATRIX_ROWS,
-        Write::Delimited => 1,
-        _ => 0,
+    let shape = atom.shape();
+    let want = match shape.arity {
+        slots::Arity::Exact => shape.slots.len(),
+        slots::Arity::Repeat => NEW_MATRIX_COLUMNS * NEW_MATRIX_ROWS,
     };
     for _ in 0..want { atom.cells.push(vec![]); }
 }
@@ -718,13 +717,12 @@ impl Editor {
             let idx = self.cursor.slices.last().unwrap().cell;
             if !shift && let Some(next) = owner.idx_horizontal(idx, forward) {
                 // Which shapes land at the END of the cell they are entered backward
-                // into: a radical (its degree reads first, so the radicand is met from
-                // its right) and a grid (a row is met from its last column). The
-                // radical has to be asked through `command_shape`, because a
-                // `root(...)` call is stored as a `MacroCall` and only the command file
-                // says it is a radical at all — testing `Kind::Root` here silently
-                // changed where the caret landed.
-                let radical = matches!(owner.command_shape(), Some(Kind::Root));
+                // into: a radical (its degree is drawn to the left, so the radicand is
+                // met from its right) and a grid (a row is met from its last column).
+                // The radical is asked of the **shape**, because a `root(...)` call is
+                // stored as a `MacroCall` and only the command file says it is a radical
+                // at all — testing `Kind::Root` here silently changed where the caret landed.
+                let radical = owner.command_shape().is_some_and(|descriptor| descriptor.shape().is_radical());
                 let root_back = !forward && (radical || matches!(owner.kind, Kind::Table { .. } | Kind::Multiline { .. }));
                 self.cursor.slices.last_mut().unwrap().cell = next; self.cursor.pos = if root_back { self.data().len() } else { 0 };
             } else { self.pop(forward); }
@@ -776,9 +774,10 @@ impl Editor {
             let idx = self.cursor.slices.last().unwrap().cell;
             let mut target = None;
             let mut end = false;
-            match owner.decl().vertical {
+            let shape = owner.shape();
+            match shape.vertical {
                 Vertical::Swap { up: up_role, down: down_role, end_up } => {
-                    if let Some(t) = owner.decl().index_of(if up { up_role } else { down_role }) {
+                    if let Some(t) = shape.index_of(if up { up_role } else { down_role }) {
                         if idx != t { target = Some(t); end = up && end_up; }
                     }
                 }

@@ -12,9 +12,9 @@
 
 ## 一、主表
 
-「视图名」这一列是 **`Decl::view`，也就是*形状*名**——它是 `config/commands.json` 写的那个名字，每个 `Kind` 唯一且稳定。**它不一定是线上的名字**：`view_atom` 可以把几个形状合并成一个线 kind，八处形状名与线名不同——`Sqrt`/`Fenced`/`Accent`/`Line` 都走 `decorated`（靠 `marker` 区分画法）：
+「视图名」这一列是 **`Shape::view`，也就是*形状*名**——它是 `config/commands.json` 写的那个名字，每个 `Kind` 唯一且稳定。**它不一定是线上的名字**：`view_atom` 可以把几个形状合并成一个线 kind，八处形状名与线名不同——`Sqrt`/`Fenced`/`Accent`/`Line` 都走 `decorated`（靠 `marker` 区分画法）：
 
-| 形状名（`Decl::view`） | 线名（`view_atom`） |
+| 形状名（`Shape::view`） | 线名（`view_atom`） |
 | --- | --- |
 | `sqrt`、`delim`、`decoration`、`line` | `decorated` |
 | `script` | `scripts` |
@@ -37,7 +37,7 @@
 | `TemplateCall` | `definition` | `arg`，可重复 | 边界 | 线性 | 无 | `template-call` | 模板专用（写入时 `unreachable!`） | **不上线**（见第五节） |
 | `Fraction` | 无 | `numerator`(90%)、`denominator`(90%) | 分子 / 分母 | **锁定** | 互换，落格首 | `fraction` | `frac({0}, {1})` | children 2×`cell@numerator`/`cell@denominator` |
 | `Sqrt` | 无 | `radicand`(100%) | 边界 | 线性 | 无 | `sqrt` | `sqrt({0})` | 线上是 `decorated`/`marker="radical"` + children 1×`cell@radicand`；`√x` 也走这里（折成 `MacroCall`） |
-| `Root` | 无 | `radicand`(100%)、`index`(55%) | `index` / `radicand` | 两格互走 | 互换，落格尾 | `root` | `root({1}, {0})` | `root`/`marker="radical"` + children 2×`cell@radicand`/`cell@index` |
+| `Root` | 无 | `index`(55%)、`radicand`(100%) | `index` / `radicand` | 线性 | 互换，落格尾 | `root` | `root({0}, {1})` | `root`/`marker="radical"` + children 2×`cell@index`/`cell@radicand`。存储顺序即 `root(index, radicand)` 的书写顺序 |
 | `Scripts` | 无 | `base`(100%)、`upper`(70%,可空)、`lower`(70%,可空) | `base` / `base` | **锁定** | 附件专用 | `script` | 自己拼 `^(…)`/`_(…)` | 线名是 **`scripts`**；**`attachment`**（仅顶层根分支）+ children 3：`cell@base`、`cell@upper`、`cell@lower`；缺席的脚标是 `absent`，**也带同一个 role** |
 | `Fenced` | `left`, `right` | `inner`(100%) | 边界 | 线性 | 无 | `delim` | `abs()`/`norm()`/字面定界符 | 线上是 `decorated`/`marker="delim"`，字符仍在 `text`（`"左\n右"`）+ children 1×`cell@inner` |
 | `Table` | `columns`, `row_lengths`, `name` | `cell`(100%)，可重复 | 中行首/末格 | 列内 | 列运算 | `grid` | `name(…)`：`mat` 行用 `;`，`vec`/`cases` 一个参数一行 | 线名是 **`table`**；`columns` + `row_lengths` + `N×cell@cell`，另带 `border`/`is_mat`（由 `name` 查配置得到） |
@@ -123,7 +123,7 @@
 9. **数字串是一个"像 text 一样的容器"。** `Number` 有一个格，里面是逐字的 `Char`，所以光标**能停在数字之间**（`12|34` 插一个 `9` 得到 `12934`），这是叶子模型根本表达不了的。前端仍然只多一个排布名（`number`），通用"有子节点"分支会把那个格画出来；名字必须在 `ARRANGEMENTS` 白名单里，否则整篇带数字的公式都会报"不认识的排布"（`desktop/test_desktop.py::test_a_number_run_is_a_container_with_a_known_arrangement` 守着）。
 10. **普通模式敲出的小数与读进来的小数不是同一棵树**（有意）：读 `12.5` 是一个 `Number`，逐键敲 `1` `2` `.` `5` 是 `Number(12) Char(.) Number(5)`，写出 `12 . 5`。实测四种写法两两渲染完全相同（见下），所以是纯表示差异；命令模式走解析器，得到的是一个 `Number`。
 11. **一个"字符"是一个字形簇，不是一个 Unicode 标量。** 词法把 `e`+U+0301、`👍🏽`、ZWJ 家庭 emoji 各收成一个 `MathText` 节点，而 `GlyphItem.text` 也是一个字形簇；编辑器原先按标量拆成多个 `Char`，于是**回写会在字形簇中间插入分隔符**，敲一个键就把 `é` 变成 `e` + 空格 + 飘在后面的重音符（实测码位 `0x65 0x20 0x7a 0x20 0x301`）。对齐载荷为一个字形簇之后：`0x65 0x301 0x20 0x7a`，字形簇完好。这是"回写义务"那一类缺陷，会改坏文档内容。
-12. **前端"有分支但后端到不了"的名字，一共九个，已全部删除。** 逐个对照命令表（`config/commands.json`）与 `Decl::view`：`decoration` 里的 `widehat`/`dot`/`ddot`/`dddot`/`arrow`/`underline`/`underbrace`/`underbracket`/`underparen` 都不可能出现在线上——后端只产生 `hat` 与 `cancel`（`Accent`，线上都是 `decorated`）以及 `overline`/`underline`（`Line`，线上也是 `decorated`），其余名字会落成 `Raw` 由引擎自己画。反向的检查也做了：`multiline` 的左右交替对齐、`scripts` 的 `_placement`（`limits`/`scripts`）、`unknown` 的 `_string_mode` 都是真的到得了的；`ARRANGEMENTS` 白名单里多出的 `draft-*`/`absent`/`stop`/`cell`/`macro-argument` 是前端自造或后端合成的节点，不在 `Decl` 里，属于白名单该有的成员。后来 View 词汇整体重划（`sqrt`/`delim`/`decoration`/`line` 合并成 `decorated`，`grid`/`aligned`/`script`/`macro-collapsed` 改名），这张白名单也随之换过一遍；`decorated` 内部改用 `marker` 分派，同样只收后端真能产生的记号。
+12. **前端"有分支但后端到不了"的名字，一共九个，已全部删除。** 逐个对照命令表（`config/commands.json`）与 `Shape::view`：`decoration` 里的 `widehat`/`dot`/`ddot`/`dddot`/`arrow`/`underline`/`underbrace`/`underbracket`/`underparen` 都不可能出现在线上——后端只产生 `hat` 与 `cancel`（`Accent`，线上都是 `decorated`）以及 `overline`/`underline`（`Line`，线上也是 `decorated`），其余名字会落成 `Raw` 由引擎自己画。反向的检查也做了：`multiline` 的左右交替对齐、`scripts` 的 `_placement`（`limits`/`scripts`）、`unknown` 的 `_string_mode` 都是真的到得了的；`ARRANGEMENTS` 白名单里多出的 `draft-*`/`absent`/`stop`/`cell`/`macro-argument` 是前端自造或后端合成的节点，不在 `Shape` 里，属于白名单该有的成员。后来 View 词汇整体重划（`sqrt`/`delim`/`decoration`/`line` 合并成 `decorated`，`grid`/`aligned`/`script`/`macro-collapsed` 改名），这张白名单也随之换过一遍；`decorated` 内部改用 `marker` 分派，同样只收后端真能产生的记号。
 
     这次靠人眼逐个对照，**所以后来把它变成了机器检查**：`tools/kind_inventory.py` 现在把 32 个用例里**实际发出的线名**与 `mathview.py` 的 `ARRANGEMENTS` 做双向对照，任一边多出来就打印并**以非零码退出**。实测两个方向都对齐——23 个真发出的线名 + `parameter`/`template-call`（第五节：只存在于宏模板里，上线前就被 `bind_template_inner` 换掉，但必须有画法与 `Decl`）+ `absent`/`symbol`（前端自造）= 全部 25 个。检查本身也验过有牙：往 `ARRANGEMENTS` 里塞一个 `bogus-arm` 立刻报「后端发不出来的排布名」，退出码 1。
 

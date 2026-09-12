@@ -111,9 +111,11 @@ fn the_parser_stores_only_the_kinds_that_carry_their_own_data() {
 /// 源码能把它们存进树——`Sqrt`/`Root` 的两种写法都折进了 `MacroCall`，`Accent`/`Line`
 /// 的命令名由配置供给。
 ///
-/// 它们仍然必须存在：`configured_kind` 拿它们当形状返回，`Decl` 描述它们的槽位，
-/// `view_atom` 按它们画。所以这不是"该删没删"，而是**这个 `Kind` 变体身兼两职**的
-/// 证据——这也是为什么 `command_shape()` 与 `is_macro()` 必须存在。
+/// 它们仍然必须存在：`configured_kind` 拿它们当**取图数据**返回（`abs` 是哪对定界符、
+/// `hat` 是哪个记号），`Shape` 描述它们的槽位，`view_atom` 按它们画。所以这不是"该删没
+/// 删"，而是**这个 `Kind` 变体身兼两职**的证据——这也是为什么 `command_shape()` 与
+/// `is_macro()` 必须存在。拼写已经不靠它们了：`Grammar` 按 `Kind` 取，一个调用永远是
+/// `Write::Named`。
 #[test]
 fn four_kinds_are_shape_descriptors_that_are_never_stored() {
     for (name, shape) in [

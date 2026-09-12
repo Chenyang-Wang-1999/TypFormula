@@ -19,7 +19,7 @@ fn only_enter_parses_spaces_and_parentheses() {
     }
     key(&mut e, "Enter");
     assert!(e.pending().is_none());
-    assert_eq!(e.root[0].decl().view, "fraction", "草稿应当成为一个分式形状的节点");
+    assert_eq!(e.root[0].shape().view, "fraction", "草稿应当成为一个分式形状的节点");
     assert_eq!(typst::write_cell(&e.root), "frac(a, b) + alpha beta");
 }
 
@@ -85,7 +85,7 @@ fn completion_buttons_and_toolbar_fill_without_confirming() {
     assert_eq!(e.pending(), Some("frac"));
     key(&mut e, " "); assert_eq!(e.pending(), Some("frac "));
     key(&mut e, "Enter");
-    assert_eq!(e.root[0].decl().view, "fraction", "草稿应当成为一个分式形状的节点");
+    assert_eq!(e.root[0].shape().view, "fraction", "草稿应当成为一个分式形状的节点");
     assert_eq!(e.cursor.slices[0].cell, 0);
 }
 

@@ -243,7 +243,7 @@ fn a_mark_that_only_the_command_file_names_is_structured() {
         "cancel 应当由 commands.json 建成调用节点，实际是 {:?}",
         editor.root[0].kind
     );
-    assert_eq!(editor.root[0].decl().view, "decoration", "并且借到重音的形状");
+    assert_eq!(editor.root[0].shape().view, "decoration", "并且借到重音的形状");
     assert_eq!(editor.root[0].cells.len(), 1, "cancel 的正文是一格");
     assert_eq!(typst::write_cell(&editor.root), "cancel(x)");
 }
@@ -274,7 +274,7 @@ fn style_atoms_round_trip() {
             "{source} 应当由 commands.json 建成借形状的调用，实际是 {:?}",
             editor.root[0].kind
         );
-        assert_eq!(editor.root[0].decl().view, "style", "{source} 借到的是样式的形状");
+        assert_eq!(editor.root[0].shape().view, "style", "{source} 借到的是样式的形状");
     }
     // 正文不是**一行字形**时内核不建样式节点（`typst::has_glyph_run`），于是同一个
     // 命令落回普通调用：它照样往返，但借到的是 `macro` 而不是 `style`。这一对
@@ -282,7 +282,7 @@ fn style_atoms_round_trip() {
     for source in ["upright(alphabets)", "bold(frac(a, b))"] {
         round_trips(source);
         let editor = load(source);
-        assert_eq!(editor.root[0].decl().view, "macro", "{source} 没有字形串，应当是普通调用");
+        assert_eq!(editor.root[0].shape().view, "macro", "{source} 没有字形串，应当是普通调用");
     }
 }
 
@@ -309,8 +309,8 @@ fn a_call_naming_a_command_borrows_that_shapes_slots_and_spelling() {
         let mut atom = call(name, cells);
         for cell in &mut atom.cells { cell.push(MathAtom::character('x')); }
         if cells == 2 { atom.cells[1] = vec![MathAtom::character('y')]; }
-        assert_eq!(atom.decl().view, shape, "{name} 应当借用 {shape} 的槽位图式");
-        assert_eq!(atom.decl().slots.len(), cells, "{name} 的格子数应与形状一致");
+        assert_eq!(atom.shape().view, shape, "{name} 应当借用 {shape} 的槽位图式");
+        assert_eq!(atom.shape().slots.len(), cells, "{name} 的格子数应与形状一致");
         assert_eq!(typst::write_atom(&atom), spelling, "{name} 的拼写应由形状给出");
     }
     // A name the command file does not know keeps the generic call schema: one
@@ -318,8 +318,8 @@ fn a_call_naming_a_command_borrows_that_shapes_slots_and_spelling() {
     let mut plain = MathAtom::nest(Kind::MacroCall { name: "f".into(), function: true }, 2);
     plain.cells[0] = vec![MathAtom::character('x')];
     plain.cells[1] = vec![MathAtom::character('y')];
-    assert_eq!(plain.decl().view, "macro");
-    assert_eq!(plain.decl().slots.len(), 1, "未配置的名字沿用参数格图式");
+    assert_eq!(plain.shape().view, "macro");
+    assert_eq!(plain.shape().slots.len(), 1, "未配置的名字沿用参数格图式");
     assert_eq!(typst::write_atom(&plain), "f(x, y)");
 }
 

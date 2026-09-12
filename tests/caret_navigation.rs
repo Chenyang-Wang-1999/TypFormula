@@ -10,8 +10,7 @@
 //! Covered here, one declaration field each:
 //!
 //! * `Frac`     — `entry` (Roles), `vertical` swap, `end_up: false`
-//! * `Root`     — `entry` (Roles, the reverse of Typst's argument order),
-//!                `end_up: true`, `horizontal: Pair`
+//! * `Root`     — `entry` (Roles), `end_up: true`, `horizontal: Linear`
 //! * `Script`   — `entry` (Base), `vertical: Attach`
 //! * `Grid`     — `entry: GridMiddle`, `horizontal`/`vertical: Column`
 //! * `Aligned`  — `entry: Edge`
@@ -57,23 +56,24 @@ fn a_fraction_entered_from_the_right_reaches_its_denominator() {
 }
 
 #[test]
-fn a_radical_enters_its_degree_which_is_not_typsts_first_argument() {
-    // Cells are `[radicand, index]`, the reverse of Typst's `root(index,
-    // radicand)`: entering forward must reach the degree, not the radicand.
+fn a_radical_enters_its_degree_which_is_written_first() {
+    // Cells are `[index, radicand]` — the order `root(index, radicand)` writes them,
+    // and the order they are read: the degree is drawn to the left of the radicand.
+    // Entering forward therefore reaches the degree, which is cell 0.
     let mut editor = load("root(3, x + 1)");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![1], 0), "向右进入根式应落在根指数");
+    assert_eq!(caret(&editor), (vec![0], 0), "向右进入根式应落在根指数");
     key(&mut editor, "ArrowDown");
-    assert_eq!(caret(&editor).0, vec![0], "下键应换到被开方式");
+    assert_eq!(caret(&editor).0, vec![1], "下键应换到被开方式");
     key(&mut editor, "ArrowUp");
-    // `end_up: true` here: the degree reads before the radicand, so the caret
-    // lands at the END of the degree cell (length 1).
-    assert_eq!(caret(&editor), (vec![1], 1), "上键换到根指数并落在格尾");
+    // `end_up: true` here: the degree stands to the left of the radicand, so coming
+    // up from the radicand the caret lands at the END of the degree cell (length 1).
+    assert_eq!(caret(&editor), (vec![0], 1), "上键换到根指数并落在格尾");
 }
 
 #[test]
 fn a_radical_walks_its_two_cells_and_then_leaves() {
-    // `horizontal: Pair`: the two cells are reachable from each other, but a
+    // `horizontal: Linear`: the two cells are reachable from each other, but a
     // move first traverses whatever the current cell already holds, so the walk
     // is: degree, its content, back to the radicand, its content, then out.
     //
@@ -82,26 +82,26 @@ fn a_radical_walks_its_two_cells_and_then_leaves() {
     // its first position, out at its last, and only then on to the radicand.
     let mut editor = load("root(3, x)");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![1], 0), "先到根指数");
+    assert_eq!(caret(&editor), (vec![0], 0), "先到根指数");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![1, 0], 0), "再进数字串的首位");
+    assert_eq!(caret(&editor), (vec![0, 0], 0), "再进数字串的首位");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![1, 0], 1), "走完数字串的内容");
+    assert_eq!(caret(&editor), (vec![0, 0], 1), "走完数字串的内容");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![1], 1), "出数字串，停在根指数格尾");
+    assert_eq!(caret(&editor), (vec![0], 1), "出数字串，停在根指数格尾");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![0], 0), "再从根指数折回被开方式");
+    assert_eq!(caret(&editor), (vec![1], 0), "再从根指数折回被开方式");
     key(&mut editor, "ArrowRight");
-    assert_eq!(caret(&editor), (vec![0], 1), "走完被开方式的内容");
+    assert_eq!(caret(&editor), (vec![1], 1), "走完被开方式的内容");
     key(&mut editor, "ArrowRight");
     assert!(editor.cursor.slices.is_empty(), "成对的两个格子走完就离开根式");
 }
 
 #[test]
 fn a_radical_is_entered_backward_at_the_end_of_its_radicand() {
-    // A radical's cells are stored `[radicand, index]` while the degree is drawn to
-    // the LEFT, so walking left out of the radicand reaches the index cell from its
-    // right and the caret lands at that cell's END.
+    // The cells are stored in the order they are read, and the degree is drawn to the
+    // LEFT of the radicand, so walking left out of the radicand reaches the degree
+    // cell from its right and the caret lands at that cell's END.
     //
     // This is `move_horizontal`'s `root_back`, not `entry_cell`: entering the node
     // from outside goes through the entry role and lands at the end either way, which
@@ -111,13 +111,13 @@ fn a_radical_is_entered_backward_at_the_end_of_its_radicand() {
     let mut editor = load("root(3, x + 1)");
     key(&mut editor, "End");
     key(&mut editor, "ArrowLeft");
-    // Backward entry is the radicand, met from its right, so the caret lands at the
-    // end of `x + 1` (3 atoms).
-    assert_eq!(caret(&editor), (vec![0], 3), "向左进入根式落在被开方式末尾");
+    // Backward entry is the radicand, cell 1, met from its right, so the caret lands
+    // at the end of `x + 1` (3 atoms).
+    assert_eq!(caret(&editor), (vec![1], 3), "向左进入根式落在被开方式末尾");
     key(&mut editor, "Home");
-    assert_eq!(caret(&editor), (vec![0], 0), "先回到被开方式开头");
+    assert_eq!(caret(&editor), (vec![1], 0), "先回到被开方式开头");
     key(&mut editor, "ArrowLeft");
-    assert_eq!(caret(&editor), (vec![1], 1), "向左跨格到根指数，从右侧进入所以落在格尾");
+    assert_eq!(caret(&editor), (vec![0], 1), "向左跨格到根指数，从右侧进入所以落在格尾");
 }
 
 #[test]

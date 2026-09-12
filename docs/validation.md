@@ -1838,6 +1838,93 @@ x           {"width": 13.728, "height": 10.872, "baseline": 10.608}
 
 改动文件：`Cargo.toml`、`crates/core/Cargo.toml`、`native-adapter/Cargo.toml`、`Cargo.lock`、`native-adapter/Cargo.lock`、`src/{lib,main,document,desktop,services}.rs`、`native-adapter/src/render.rs`、`native-adapter/engine-patches.json`、`vendor/typst/crates/{typst-eval/src/math,typst-layout/src/lib,typst-layout/src/math/mod,typst-library/src/math/ir/resolve,typst-realize/src/lib}.rs`、`desktop/{__init__,__main__,bridge,model,rawcache,window,test_desktop}.py`、`tools/{engine_boxes,kind_inventory}.py`、`tests/*.rs`（13 个）、`build-desktop.cmd`、`start-desktop.cmd`、`AGENTS.md`、`README.md`、`docs/{architecture,desktop,kind-inventory,lyx-desktop-rendering-study,rust-book-walkthrough,validation}.md`。
 
+## 拆 `Decl`：`Grammar`（语法）+ `Shape`（排布与编辑），并让 root 按书写顺序存 · 2026-09-12
+
+### 为什么要拆
+
+`Decl` 一个结构体装了**三家的活**，九个字段的消费者数出来是这样的：
+
+| 字段 | 谁读 | 归属 |
+| --- | --- | --- |
+| `view` | `view_atom`（选排布） | 渲染 |
+| `entry` / `horizontal` / `vertical` / `class` | `entry_cell` / `idx_horizontal` / `cursor::vertical` / `math_class` | **编辑** |
+| `slots` / `arity` | `view_atom`（盖 role）+ 上面几条 | 语法↔渲染的**接口** |
+| `write` | `write_atom`、`fill_command_cells` | **语法** |
+| `typst` | 只有那条词表对账测试 | 对账标签 |
+
+后果不是"代码长"，而是**同一件事存在两处、必须手工同步**。最清楚的一处是 root：
+
+```rust
+// 解析期（typst.rs）
+if let slots::Write::Template(template) = shape.decl().write {
+    if placeholder_indices(template).first() == Some(&1) && args.len() == 2 {
+        args.swap(0, 1);        // ← "怎么写"决定了"树里存什么"
+    }
+}
+```
+
+存储顺序是 `[被开方式, 根指数]`（与 Typst 的 `root(index, radicand)` 相反），靠写模板 `root({1}, {0})` 反回来，解析期再 swap 配合。同一个事实写在两处，还牵动另外四处：入口角色、`Vertical::Swap{end_up}`、`Horiz::Pair` 的硬编码下标、`∛x` 的 `MathRoot` 构造。
+
+### 拆成什么
+
+| 表 | 取用键 | 声明 | 读它的地方 |
+| --- | --- | --- | --- |
+| `Grammar` | **`Kind`** | `write` | `write_atom` |
+| `Shape` | **形状名** | `view`、`typst`、`slots`、`arity`、`entry`、`horizontal`、`vertical`、`class` | `entry_cell`、`math_class`、`idx_horizontal`、`cursor::vertical`、`view_atom` |
+
+分界是**"这个节点是什么"**与**"它长什么样、光标怎么走"**。所以：
+
+- **拼写不跟着借来的形状走**。`frac(a, b)` 存成 `MacroCall`，拼写就是 `MacroCall` 自己的 `Write::Named`。这正是`Write::Delimited` 与 `Write::Positioned` 里那两条 `Kind::MacroCall` 分支消失的原因——它们存在的唯一理由就是拼写曾被借走。
+- **槽位与导航按形状名取**，配置命令借的就是它。
+
+### 顺带删掉的
+
+| 删掉 | 为什么 |
+| --- | --- |
+| `Horiz::Pair` 整个变体 | 它硬编码的下标编码的是"反着存"这件事；按书写顺序存之后，它与 `Horiz::Linear` **完全等价** |
+| 解析期 `args.swap(0, 1)` | 不再需要 |
+| `Write::Template("root({1}, {0})")` | 改成 `root({0}, {1})`，读作书写顺序 |
+| `Write::Delimited` / `Write::Positioned` 里的 `Kind::MacroCall` 分支 | 拼写不再借形状 |
+| `fill_command_cells` 对 `Write` 的依赖 | 格子数改问 `Shape::slots`（`Arity::Exact`）或矩阵默认值（`Repeat`），回写与"敲几个格子"彻底分开 |
+| `MathAtom::decl()` | 换成 `shape()` + `grammar()` |
+
+`configured_kind` 保留，但**职责缩小到"取图数据"**：`abs` 是哪对定界符、`hat` 是哪个记号、`overline` 在上还是在下。拼写、槽位、导航三样都不再经过它。它会在配置自己带 view 字段那一轮消失。
+
+### root 的实测（真二进制 + 真前端）
+
+存储改序后，线上视图的角色顺序跟着变，**前端不用改**——`mathview.slot()` 按 role 找孩子，位置只作回退：
+
+```
+$ root(3, x + 1) $
+  [root] marker=radical
+    [cell] role=index      ← 3
+    [cell] role=radicand   ← x + 1
+  PAGE ops: '𝑥', '+', '1', '3', line×4      ← 被开方式与根指数都画对
+```
+
+### 测试改了三条（都是预期的，不是回归）
+
+| 测试 | 原断言 | 新断言 | 为什么 |
+| --- | --- | --- | --- |
+| `a_radical_enters_its_degree_which_is_not_typsts_first_argument` | `([1], 0)` | `([0], 0)` | 根指数现在是第 0 格；**语义没变**（向前仍落在根指数），改名去掉"not typst's first argument" |
+| `a_radical_walks_its_two_cells_and_then_leaves` | `([1],…)`/`([0],…)` | 对调 | 同上 |
+| `a_radical_is_entered_backward_at_the_end_of_its_radicand` | `([0], 3)` | `([1], 3)` | 被开方式是第 1 格 |
+| `root_cell_zero_is_nucleus_and_index_is_one` | cell 1 → cell 0 | 改名 `root_cell_zero_is_the_index_and_one_is_the_nucleus`，cell 0 → cell 1 | 同上 |
+
+**行为本身一条都没变**：向前进入仍落在根指数、向后仍落在被开方式且落格尾。变的只是格子的下标，而这正是这次改动的**目的**——下标不再需要被记住。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **137 通过 / 0 失败** |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过** |
+| `python -m unittest desktop.test_desktop` | **87 通过** |
+| `python tools/kind_inventory.py` | 退出码 0，两个方向都对齐 |
+| root 的线上视图与绘制 | role 顺序 `index`→`radicand`，页面画出 `x + 1` 与 `3`（真二进制 + 真前端实测） |
+
+改动文件：`crates/core/src/{slots,math,typst,cursor,view}.rs`、`crates/core/build.rs`、`tests/{caret_navigation,lyx_traces,command_mode,failed_block,round_trip,stored_kinds,structured_input}.rs`、`docs/{architecture,kind-inventory,validation}.md`。
+
 
 
 

@@ -75,7 +75,7 @@ impl Spec {
 
 /// `config/commands.json`: a command name to the shape it declares.
 ///
-/// The shape names are the same strings `slots::Decl::view` uses, so the file can be
+/// The shape names are the same strings `slots::Shape::view` uses, so the file can be
 /// read against the tables in `docs/kind-inventory.md` without a lookup.
 fn commands() -> String {
     let entries: BTreeMap<String, Spec> = serde_json::from_str(&read("commands.json"))

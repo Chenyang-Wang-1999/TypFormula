@@ -558,8 +558,8 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
         // written `sqrt(x)` (the shape's spelling is what decides, not the source).
         Some(ast::Expr::MathRoot(r)) => {
             let radicand = parse_cell(r.radicand().to_untyped(), ctx);
-            // A radical's slots are `[radicand, index]` — the reverse of Typst's
-            // `root(index, radicand)`, which is what the shape's write template says.
+            // A radical's cells are `[index, radicand]`, the order Typst's own
+            // `root(index, radicand)` takes and the order the two are read in.
             //
             // The degree is built as the `Number` that `root(3, x)` parses to, not from
             // its characters: `MathRoot::index` hands back a literal `u8`, and spelling
@@ -567,7 +567,7 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             // the same maths — which `round_trip.rs` caught the moment anything covered
             // this branch at all.
             let (name, cells) = match r.index() {
-                Some(degree) => ("root", vec![radicand, vec![MathAtom::number(&degree.to_string())]]),
+                Some(degree) => ("root", vec![vec![MathAtom::number(&degree.to_string())], radicand]),
                 None => ("sqrt", vec![radicand]),
             };
             MathAtom { kind: Kind::MacroCall { name: name.into(), function: true }, cells }
@@ -663,23 +663,19 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
                 }
                 return vec![MathAtom { kind: Kind::Table { columns, row_lengths, name: name.clone() }, cells }];
             }
-            // The name is part of the spelling the table records, and it is also what
-            // fills a kind whose own data is a name or a position — so the whole
-            // name→shape step lives in `slots::configured_kind`. What is left here is
-            // the one thing about the *argument list* rather than the name: cells are
-            // stored in the order the shape's slots are walked, which is not always the
-            // order Typst writes them (`root(index, radicand)` is stored reversed, and
-            // the write template is what says so).
-            let Some(shape) = slots::configured_kind(&name) else {
+            // The name is what says whether the editor has a shape for this call at
+            // all — `slots::configured_shape` answers that, and the shape itself is
+            // looked up again whenever the node is drawn or navigated.
+            //
+            // Nothing else about the argument list depends on the shape: the cells
+            // are stored in the order they are written, which is why `root(3, x)`
+            // keeps `3` first. (It used to be stored reversed, with a swap here
+            // driven by the write template's `{1}` — see `slots::ROOT`.)
+            if slots::configured_shape(&name).is_none() {
                 return vec![MathAtom::from_source(node.full_text())];
-            };
-            if let slots::Write::Template(template) = shape.decl().write {
-                if placeholder_indices(template).first() == Some(&1) && args.len() == 2 {
-                    args.swap(0, 1);
-                }
             }
-            // The node stores the **call**, not the shape: slots, view and spelling are
-            // looked up from `config/commands.json` when it is drawn or written, and
+            // The node stores the **call**, not the shape: slots, view and navigation are
+            // looked up from `config/commands.json` when it is drawn or edited, and
             // never kept in it. That is what lets the file decide what is structured —
             // and what keeps a node from holding a shape the file no longer declares.
             //
@@ -838,7 +834,7 @@ fn fill_template(template: &str, atom: &MathAtom) -> String {
 pub fn write_atom(atom: &MathAtom) -> String {
     let cell = |index: usize| atom.cells.get(index).map(write_cell).unwrap_or_default();
     let joined = |cells: &[MathData]| cells.iter().map(write_cell).collect::<Vec<_>>().join(", ");
-    match atom.decl().write {
+    match atom.grammar().write {
         Write::OwnText => match &atom.kind {
             Kind::Char { text } => text.clone(),
             Kind::Symbol { name, .. } | Kind::Raw { source: name } | Kind::Unknown { name, .. } => name.clone(),
@@ -862,9 +858,6 @@ pub fn write_atom(atom: &MathAtom) -> String {
         Write::Positioned { above, below } => fill_template(match &atom.kind {
             Kind::Line { above: true } => above,
             Kind::Line { above: false } => below,
-            // A configured call borrows the shape, so the position is not in the
-            // node: the name is what says which side the rule goes.
-            Kind::MacroCall { name, .. } => if name == "overline" { above } else { below },
             other => unreachable!("{other:?} 声明为按位置拼写，但它没有位置"),
         }, atom),
         Write::Named => match &atom.kind {
@@ -882,12 +875,6 @@ pub fn write_atom(atom: &MathAtom) -> String {
             Kind::Fenced { left, right } if left == "|" && right == "|" => format!("abs({})", cell(0)),
             Kind::Fenced { left, right } if left == "‖" && right == "‖" => format!("norm({})", cell(0)),
             Kind::Fenced { left, right } => format!("{left}{}{right}", cell(0)),
-            // A configured call borrows the shape, so the pair is not in the node
-            // either: `abs` and `norm` are written by name, the way they were read.
-            Kind::MacroCall { name, .. } => match name.as_str() {
-                "abs" => format!("abs({})", cell(0)),
-                _ => format!("norm({})", cell(0)),
-            },
             other => unreachable!("{other:?} 声明为定界包裹"),
         },
         Write::Matrix => match &atom.kind {

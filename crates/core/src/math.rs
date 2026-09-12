@@ -2,7 +2,7 @@
 // Ports MathData/MathAtom and InsetMathNest/Script cell conventions.
 // Original authors: Alejandro Aguilar Sierra, André Pönitz,
 // Lars Gullik Bjønnes, Stefan Schimanski. See docs/LYX-CREDITS.
-use crate::slots::{self, char_class, Decl, Entry, Horiz};
+use crate::slots::{self, char_class, Entry, Grammar, Horiz, Shape};
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -55,7 +55,7 @@ pub struct MathAtom {
 /// The variant names follow Typst's `MathKind`
 /// (`vendor/typst/crates/typst-library/src/math/ir/item.rs`) wherever the two
 /// describe the same construct, so the vocabularies can be compared item by
-/// item. Where they differ, `Kind::decl`'s `typst` field says so in the open
+/// item. Where they differ, `Kind::shape`'s `typst` field says so in the open
 /// instead of leaving the reader to guess:
 ///
 /// * an *editor-only* kind has no `MathKind` (`MacroCall`, `TemplateCall`,
@@ -176,6 +176,12 @@ impl MathAtom {
     /// `sqrt`, `hat`, `overline` and the rest are calls whose shape only
     /// `config/commands.json` knows. The node stores the *name*; the shape is looked
     /// up, never stored, so changing the file cannot leave a node holding a stale one.
+    /// The descriptor a configured command call borrows, if it names one.
+    ///
+    /// A **drawing** token, not the node's own kind: the node stays `MacroCall`.
+    /// `view_atom` reads the delimiters or the mark off it, and `shape` derives the
+    /// slots and navigation from it. The spelling does not come from here — that is
+    /// `grammar`, and for a call it is always `Write::Named`.
     pub fn command_shape(&self) -> Option<Kind> {
         match &self.kind {
             Kind::MacroCall { name, .. } => {
@@ -212,16 +218,23 @@ impl MathAtom {
     pub fn is_macro(&self) -> bool {
         matches!(self.kind, Kind::MacroCall { .. }) && self.command_shape().is_none()
     }
-    /// The slot schema of this atom's kind. See `crate::slots`.
+    /// The shape this atom is drawn, navigated and placed by. See `crate::slots`.
     ///
-    /// A configured call takes the schema of the shape it names, because editing is a
-    /// property of the shape: `sqrt(x)` and the `sqrt` node a `∛` produces answer the
-    /// same slots, reach their cell the same way, and take the same class. A call
-    /// whose name the file does not know keeps `MacroCall`'s own schema — one linear
-    /// cell per argument.
-    pub fn decl(&self) -> Decl {
-        self.command_shape().map_or_else(|| self.kind.decl(), |shape| shape.decl())
+    /// A configured call takes the shape it names, because *that* is what a shape is
+    /// for: `frac(a, b)` and a stored `Kind::Fraction` answer the same slots, reach
+    /// their cells the same way, and take the same class. A call whose name the file
+    /// does not know keeps `MacroCall`'s own shape — one linear cell per argument.
+    ///
+    /// The *spelling* is not here: it comes from `grammar`, which is the node's own.
+    pub fn shape(&self) -> Shape {
+        self.command_shape().map_or_else(|| self.kind.shape(), |descriptor| descriptor.shape())
     }
+    /// How this atom spells itself back into the document. See `crate::slots`.
+    ///
+    /// Never borrowed from a shape: a call spells itself as a call. That is what
+    /// makes `root(3, x)` write back as `root(3, x)` with no reversal stated
+    /// anywhere — the cells are stored in the order they are read.
+    pub fn grammar(&self) -> Grammar { self.kind.grammar() }
     /// The column count of a table or an alignment. Never zero: only a table
     /// with at least one column is ever built, and both navigation and layout
     /// divide by this.
@@ -229,10 +242,10 @@ impl MathAtom {
         match self.kind { Kind::Table { columns, .. } | Kind::Multiline { columns, .. } => columns.max(1), _ => 1 }
     }
     pub fn entry_cell(&self, forward: bool) -> usize {
-        let decl = self.decl();
-        match decl.entry {
+        let shape = self.shape();
+        match shape.entry {
             // The roles named here are present in the same declaration.
-            Entry::Role { forward: f, backward: b } => decl.index_of(if forward { f } else { b }).unwrap_or(0),
+            Entry::Role { forward: f, backward: b } => shape.index_of(if forward { f } else { b }).unwrap_or(0),
             // Saturating rather than `len() - 1`: a leaf has no cell to enter,
             // and the expression this replaces underflowed if one was asked.
             Entry::Edge => if forward { 0 } else { self.cells.len().saturating_sub(1) },
@@ -248,7 +261,7 @@ impl MathAtom {
         // answered before the table is consulted. For a cluster the first scalar
         // decides, the way `GlyphItem` reads `default_math_class` off it.
         if let Kind::Char { text } = &self.kind { return text.chars().next().map_or(0, char_class); }
-        self.decl().class
+        self.shape().class
     }
     // InsetMathScript::idxOfScript, ensure, removeScript (same cell ordering).
     /// The cell holding an attachment, or `None` when that cell is empty.
@@ -269,9 +282,8 @@ impl MathAtom {
     // InsetMathFrac and InsetMathScript deliberately DO NOT walk cells on Right.
     pub fn idx_horizontal(&self, idx: usize, forward: bool) -> Option<usize> {
         let step = |forward: bool| if forward { (idx + 1 < self.cells.len()).then_some(idx + 1) } else { idx.checked_sub(1) };
-        match self.decl().horizontal {
+        match self.shape().horizontal {
             Horiz::Locked => None,
-            Horiz::Pair => if forward { (idx == 1).then_some(0) } else { (idx == 0).then_some(1) },
             Horiz::Column => {
                 let columns = self.columns();
                 if forward && idx % columns + 1 == columns || !forward && idx % columns == 0 { None } else { step(forward) }

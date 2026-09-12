@@ -153,9 +153,9 @@ impl Editor {
         // a `MacroCall` is not drawn as a call.
         let shape = atom.command_shape();
         let kind = shape.as_ref().unwrap_or(&atom.kind);
-        // The layout strategy is declared per kind (`slots::Decl::view`); only
+        // The layout strategy is declared per kind (`slots::Shape::view`); only
         // the fields that a strategy reads are filled in below.
-        let view_kind = kind.decl().view;
+        let view_kind = kind.shape().view;
         if shape.is_none() && let Kind::MacroCall { name, function } = &atom.kind {
             let registry = typst::macro_registry(&self.definitions);
             let definition = registry.get(name).filter(|d| d.expandable);
@@ -199,7 +199,7 @@ impl Editor {
         // own declaration, so the frontend can place it without counting cells.
         let children: Vec<_> = atom.cells.iter().enumerate().map(|(idx, data)| {
             let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"));
-            child.role = kind.decl().role_at(idx).map(Role::name);
+            child.role = kind.shape().role_at(idx).map(Role::name);
             child
         }).collect();
         match kind {
@@ -248,7 +248,7 @@ impl Editor {
                     let mut slot = match atom.script_idx(up) { Some(i) => children[i].clone_view(), None => View::new("absent", "", vec![]) };
                     // An empty attachment is a slot too, so it carries the role
                     // of the cell it stands in for.
-                    slot.role = atom.decl().role_at(index).map(Role::name);
+                    slot.role = atom.shape().role_at(index).map(Role::name);
                     slots.push(slot);
                 }
                 let mut view = View::new("scripts", "", slots);
