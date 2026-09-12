@@ -2011,6 +2011,180 @@ AssertionError: True is not false : $bold(frac(a, b))$ 的结构化主体不该�
 
 改动文件：`crates/core/src/{slots,math,typst,cursor,view}.rs`、`crates/core/build.rs`、`tests/{caret_navigation,lyx_traces,command_mode,failed_block,round_trip,stored_kinds,structured_input}.rs`、`docs/{architecture,kind-inventory,validation}.md`。
 
+## 编辑模型独立出来 + 模板改存视图树 · 2026-09-12
+
+按 [editing-model.md](editing-model.md) 实施。两件事一起做，因为它们互相是对方的前提：编辑层要能说"哪一格是洞"，而"洞"只有在模板那条路上才真的吃紧（同一形状的同一实例里，分子可达、分母不可达）。
+
+### 一、`Shape` 缩到 box，编辑规则搬到 `editing.rs`
+
+新增 `crates/core/src/editing.rs`。`Shape` 从 8 个字段减到 5 个（`view`/`typst`/`slots`/`arity`/`class`），`entry`/`horizontal`/`vertical` 搬去一张**按形状名取**的规则表：
+
+```rust
+const RULES: &[(&str, Rules)] = &[ ("fraction", FRACTION_RULES), ("root", ROOT_RULES), … ];
+pub fn rules(shape: &str) -> Rules
+```
+
+`MathAtom::entry_cell` / `idx_horizontal` 也从 `math.rs` 搬走（`math.rs` 是模型，`cursor.rs` 是编辑层），`Editor::vertical` 里那段 `match` 抽成纯函数 `editing::vertical(atom, index, up, at_cell_end) -> Option<Landing>`，光标自己那套几何（`target_x`、`geometry`）留在原地——那是测量，不是规则。
+
+顺带把一条**没有名字的判断**变成了规则：**从左右走到相邻格时，进入的那一格光标落在末尾**。它原来写作
+
+```rust
+let radical = owner.command_shape().is_some_and(|shape| shape.is_radical());
+let root_back = !forward && (radical || matches!(owner.kind, Kind::Table { .. } | Kind::Multiline { .. }));
+```
+
+——一条规则靠一个词汇表字段加一个 `Kind` 匹配拼出来，`Shape::is_radical()` 也随之删掉。现在是 `Rules::back_lands_at_end`，`sqrt`/`root`/`grid`/`aligned` 为真。
+
+规则表按**名字**查，编译器管不到它，所以加了两条对账测试（都在 `editing.rs`）：
+
+- `every_shape_declares_its_editing_rules`——**两个方向**：每个形状都有规则、每条规则都指着一个真实形状。没有它，漏一条的形状会静默按 `PLAIN` 导航。
+- `named_roles_exist_in_the_schema_that_names_them`——`slots.rs` 那条闸跨两表继续生效：规则里写的 `Role` 必须在那个形状的 `slots` 里存在。
+
+两条都从 `slots::fixtures::every_shape()` 取样本（`#[cfg(test)] pub(crate) mod fixtures`），**同一个清单**是"跨两表"能成立的前提。另有 `vertical_landings_stay_inside_the_node`（新）与恢复的 `entry_cells_stay_inside_the_cells_they_describe`、`horizontal_neighbours_stay_inside_the_cells_too`。
+
+`Slot.optional` 删除，`Slot::blank` 并入 `Slot::scaled`（见 editing-model.md 第四节：零读者）。
+
+`class` **没有**跟着搬，理由写在 editing-model.md 第五节：它的数据来源是 Typst 的数学间距类，前端既不读也不上线，只是恰好被 `move_word` 用了。
+
+### 二、模板改存视图树
+
+`MacroDefinition.template` 从 `Arc<MathData>`（原子树）改成 `Arc<ViewTemplate>`（**显示树**）。定义体只解析一次，投影之后原子树丢掉——两份表示会漂移，而显示树才是每个读者要的那份。
+
+```rust
+pub enum ViewTemplate {
+    Node(ViewNode),                                        // 一个显示节点
+    Hole { index: usize },                                 // 洞：绑定时换成实参视图
+    Edge { definition: usize, cells: Vec<ViewTemplate> },  // 边：绑定时递归展开
+}
+```
+
+三处关键：
+
+1. **注册期的投影没有会话。** `Projector { registry, session: None }` —— 注册期没有光标、没有选区、没有历史、没有几何，**没有东西可传**。所以"存下来的模板不带光标"是调用事实，不是要记住的纪律（`ViewTemplate::of` 里那句 `debug_assert!` 是防止这条悄悄失效）。
+2. **绑定是全函数。** 原来的 `bind_template_inner` 按 `view.kind == "parameter"` / `== "template-call"` 两个**名字**判断；现在 `Projector::material` 按**变体**分派，洞一定变成实参视图、边一定变成被调宏的展开。嵌套时实参先在**调用方**语境里绑定（`docs/editing-model.md` §8 拒绝的"来源旁挂表"因此不需要）。
+3. **`View` 拆出一个 `ViewNode`。** 前者是上线节点（19 字段 = 结构 + 会话 + 归属），后者是模板能存的那一半（11 字段）。会话字段（`cursor`/`active`/`selected`/`edit`/`attachment`）和归属字段（`definitions`/`origin`/`source_range`，由绑定者按定义写出）都不在模板树里。
+
+`Projector` 的字段也从 `definitions: &str` 改成 `registry: &MacroRegistry`：注册期没有前缀字符串可传，而 `view_atom` 本来每次都要 `macro_registry(&self.definitions)` 查一遍——现在整次投影只查一次。
+
+### 三、`#parameter0`：先看到它红，再看到它绿
+
+这一条**先于实现写**（上一轮就以 `#[ignore]` 落进 `tests/editing_model.rs`），当时实测红：
+
+```
+#let mathbf(x) = $bold(upright(#x))$   配   $mathbf(u)$
+  [raw_macro] text='bold(upright(#parameter0))'      ← 同一处漏了两层
+```
+
+现在绿，而**真正修好它的只有一件事**：`Kind::Parameter` 带上参数在定义里的**真名**（`{ index, name }`），`Write::Marker` 拼 `#x` 而不是 `#parameter{index}`。被删掉的是**构造 `#parameter0` 的那行代码**，而且新拼写是可定位的真源码——`raw_macro.text` 现在是 `bold(upright(#x))`，`definition_raw_ranges` 也真能在定义里找到它。`tests/editing_model.rs::template_material_spells_its_hole_the_way_the_definition_writes_it` 把这条直接钉住（构造模板里的那个节点，断言它写出来是定义自己的名字）。
+
+**一处需要更正的说法。** 我起初把"模板改存视图树"也算成 6.2 变绿的原因之一，写成"靠两件独立的事"。**那是不准确的。** 漏点的**起点**是 `write_atom` 的拼写，起点换了，这条路无论模板怎么存都不会再漏出那个字符串。至于"显示树里没有洞这种节点"，它是**控制流**保证、不是类型保证：`View.kind` 仍然是 `String`，`view_atom` 仍然建得出一个 `kind == "parameter"` 的 `View`；拦住它的是"文档树里不可能有 `Kind::Parameter`"（解析期事实，重构前就成立）加上"模板投影的结果总被 `ViewTemplate::of` 消费"（控制流事实）。模板存视图树的价值在别处，见 editing-model.md 第九节。
+
+另一条不变量 `template_material_is_unreachable_from_the_caret` 一直是绿的（构造），本轮未动。
+
+### 四、前端与工具：例外清单消失
+
+`parameter`/`template-call` 是模板内部树的节点，上线前就被换掉，所以 `mathview.py` 那两行画法是死代码，`tools/kind_inventory.py` 还得为它们维护一份 `NEVER_ON_THE_WIRE` 例外清单。改存视图树之后它们在显示树里连节点都不是：
+
+- `mathview.py` 的 `ARRANGEMENTS` 删掉这两个名字（真漏出来会变成"不认识的排布"，报一次）；
+- `kind_inventory.py` 的例外清单整个删掉，双向对照变成**确切**的：23 个真发出的线名 = 23 个声明 − 2 个前端自造的（`symbol`/`absent`）。
+
+### 五、恢复的测试与改写过的断言
+
+| 用例 | 处理 |
+| --- | --- |
+| `source_modes.rs::macro_edits_reclassify_…` | 恢复。原来用 `first_view_kind` **按画法**回答"这个名字还绑着可展宏吗"；改成 `expands(&e, "ratio")` 直接问注册表——画法是显示层的事，这个问题是模型的 |
+| `macro_scope.rs::lexical_blocks_shadow_…` / `function_parameters_and_later_bindings_…` | 恢复。原来 `write_cell(&def.template)` 读原子树（改存视图树后**编译都过不了**），改成走视图树的小助手 `material()` |
+| `source_modes.rs::dependency_graphs_…` | `d.template.len() <= 3` 改成"根节点的孩子 ≤ 3"——同样材料的同一个计数，读的是注册表真存的那棵树 |
+
+### 六、验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **142 通过 / 0 失败 / 6 忽略**。6 条忽略都需要本机环境、与改动无关（5 条要真 Tinymist、1 条要构建好的原生渲染器）。用例数 148，比上一轮多 9：`editing.rs` 新增 5 条、后补的拼写断言 1 条，另 3 条从 `cfg(any())` 摘除状态恢复 |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过** |
+| `python -m unittest desktop.test_desktop` | **87 通过** |
+| `python tools/kind_inventory.py` | 退出码 0；23 对 23，`parameter`/`template-call` 上线次数 0 |
+| `tests/editing_model.rs` | 两条不变量全绿（第二条从红转绿） |
+
+行为零变化的部分：`$ dbl(y) $`（`#let dbl(x) = $#x + 1$`）的视图逐字段与改前相同；`frac(a, b)`、`mat`、`x^2`、`a/b` 等 32 个盘点用例的输出未变。
+
+### 七、分开记账、本轮不解决的
+- **`Style` 的重新定形**：`bold(upright(#x))` 里那两层 `raw_macro` 仍在——`has_glyph_run` 在**绑定之前**问，那时洞还没填，`bold` 借不到 `style` 形状。介入点是"绑定之后要有一次重新定形"，与编辑层拆分无关（editing-model.md §9）。
+- **两个命令模式缺陷**（上一轮已记）：`\bold`/`\mat` + Enter 建出 4 格而不是 1 格——`command_shape()` 对空主体答 `None`，退回 `MacroCall` 的重复模式。测试缺口在 `command_mode.rs` 的"空括号可写"清单里没有这两个名字。
+- **`Style` 的重新定形**：已在下一节修好。
+- 光标越界 panic（`cursor.rs` 的 `valid()` 不覆盖 `Action::Key`）与多格溶解丢内容，均未动。
+
+改动文件：`crates/core/src/{editing.rs（新）,slots,math,typst,cursor,view,lib}.rs`、`desktop/mathview.py`、`tools/kind_inventory.py`、`tests/{editing_model,source_modes,macro_scope,stored_kinds}.rs`、`docs/{architecture,editing-model,kind-inventory,validation}.md`、`AGENTS.md`。
+
+## 字体变体的定形挪到实例侧 · 2026-09-12
+
+修的是上一次记下的那条待办（editing-model.md §9）。症状：
+
+```
+#let mathbf(x) = $bold(upright(#x))$   配   $mathbf(u)$
+  [macro] mathbf
+    [raw_macro] text='bold(upright(#x))'      ← 一整段调用的图，而不是字体变体
+```
+
+### 一、先量清楚：判据没错，只是问得太早
+
+把这几个主体**绑定之后**再喂给 `has_glyph_run`，答案全部正确：
+
+| 绑定后的主体 | `has_glyph_run` | 借到的形状 | |
+| --- | --- | --- | --- |
+| `bold(upright(u))` | `true` | `style` | ✅ |
+| `bold(a + 1)`（`#x` → `a`） | `true` | `style` | ✅ |
+| `bold(frac(a, b))` | `false` | — | ✅ 仍退图 |
+| `bold(x^2)` | `false` | — | ✅ 仍退图 |
+
+而**直接写**的 `$bold(upright(a))$` 一直是好的——所以缺陷的边界不是"嵌套"，是"**主体里有洞**":注册期问这个问题时，主体是 `Parameter`，而洞不是字符。
+
+### 二、修法：注册期不下结论，调用点重投影
+
+被否掉的第一版给 `ViewTemplate` 加了 `Deferred` 变体。**设计评审时指出它不必要**，而且对：折叠节点自带的 `text` 就是那句**带洞的拼写**，所以"未定"本来就有地方放。
+
+最终改动只用四处，`ViewTemplate` 一个字段都没动：
+
+| 改动 | 做什么 |
+| --- | --- |
+| `MathAtom::command_shape_ignoring_body()` | 只按**名字**借形状，不看主体。模板里那个变体调用因此有形状可借 |
+| `MathAtom::shaped_by_body()` | 把原来内联在 `command_shape` 里的主体判定提成有名字的查询 |
+| `Shape::needs_binding()` | 哪种形状的适用性依赖主体——只有 `style` |
+| `Projector::material` 的折叠分支 | 绑完拼写、重解析、**用普通的 `view_atom` 再投影一次** |
+
+最后一条是全部要点：**判据一个字符都没改**，只是终于拿到了主体。`spelled()` 把模板里那句带洞的拼写按实参填好（洞的位置来自 `ViewTemplate::Hole`，实参的拼写来自实参视图），`parse_document` 把它读回原子，然后走的就是画文档里任何节点的那条路。
+
+### 三、实测（真后端）
+
+| 输入 | 视图 |
+| --- | --- |
+| `#let mathbf(x) = $bold(upright(#x))$` + `$mathbf(u)$` | `style{text:"bold(upright(u))", style_name:"bold"}` ✅ |
+| `#let plus(x) = $bold(#x + 1)$` + `$plus(a)$` | `style{text:"bold(a + 1)"}` ✅ |
+| `#let fracx(x) = $bold(frac(#x, 2))$` + `$fracx(a)$` | `raw_macro{text:"bold(frac(#x, 2))"}` ✅ 不降级 |
+| `$bold(frac(a, b))$` 直接写 | `raw_macro{text:"bold(frac(a, b))"}` ✅ 不变 |
+| 未知名字的调用（宏内） | 折叠不变 ✅ |
+
+**字形请求的键跟着变成绑完之后的拼写**（`bold(upright(u))`）——它本来就是唯一能被引擎编译的表达式，原先那把带 `#x` 的钥匙打不开门，正是整块退成图的原因。前端一行没改。
+
+### 四、新用例与变异检查
+
+`tests/editing_model.rs::a_variant_a_template_built_around_a_hole_is_shaped_once_it_is_bound`，三条断言：形态是 `style`、命令名是 `bold`、**`text` 是绑完之后的拼写**（最后这条是字形请求的键，最要紧），外加一条反例（分式主体仍该退图）。
+
+变异检查：把 `settled_by_binding` 那道关短路成"永远不重投影"，用例立刻红在第一条断言上——**它有牙**。
+
+### 五、验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **143 通过 / 0 失败 / 6 忽略**（+1 新用例） |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过** |
+| `python -m unittest desktop.test_desktop` | **87 通过** |
+| `python tools/kind_inventory.py` | 退出码 0 |
+
+改动文件：`crates/core/src/{math,slots,view}.rs`、`tests/editing_model.rs`、`docs/{editing-model,validation}.md`。
+
+**仍然不解决的（分开记账）**：`bold(frac(a, b))` 这类结构体**仍然是整段调用的图**——这是设计决定，不是遗留缺陷（本地排版画不出引擎的分数线与根号钩子）。要让结构体也换成字形，得走当时讨论过的 (C) 路：让引擎逐叶子回答字形，结构仍由引擎的图或本地排版负责。本次做的是 (A)，即"变体套普通字符"这一类的定形。
+
 
 
 

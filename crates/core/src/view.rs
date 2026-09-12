@@ -1,8 +1,143 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Build the display tree from editable atoms and their cursor positions.
-use crate::{cursor::Editor, math::*, typst};
-use crate::slots::{self, view::MACRO_COLLAPSED, Role};
+// Build the display tree from editable atoms and their cursor positions, and store a
+// definition's body as the display tree it expands into.
+use crate::{cursor::Editor, math::*, slots::{self, view::MACRO_COLLAPSED, Role}, typst::{self, MacroDefinition, MacroRegistry}};
 use serde::Serialize;
+use std::collections::HashMap;
+
+/// Everything about one display node that is a fact about **the node**.
+///
+/// `View` is the wire node: the structure below plus the session looking at it (a
+/// caret, a selection, an edit point, a source range). Splitting the two is what lets
+/// a macro template be **stored as a display tree** (`ViewTemplate`) with no session
+/// in it at all: a template is a fact about the document, not about who is editing it,
+/// so "a stored template carries no cursor" is a property of the type rather than a
+/// rule someone has to remember.
+///
+/// The session fields are not here, and the *bind-time* ones are not either:
+/// `definitions`/`origin`/`source_range` say where a fragment of a **template** lives
+/// in the definition text, so they are written by the binder, which is the only place
+/// that knows which definition a fragment came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewNode {
+    pub kind: String,
+    pub text: String,
+    pub role: Option<&'static str>,
+    pub display_glyph: Option<String>,
+    /// Which decoration this node is, for the view kinds whose drawing is chosen
+    /// by a name rather than by the shape: `decorated` (radical, delimiter pair,
+    /// accent, rule) and `root`. The vocabulary is a contract with the frontend,
+    /// which dispatches on it, so a marker the frontend does not know is a
+    /// frontend/backend mismatch rather than data.
+    pub marker: Option<String>,
+    /// The font variant a `style` node is drawn in (`bold`, `upright`, …). The glyphs
+    /// that variant produces are **not** on the wire: Typst applies a variant by
+    /// substituting codepoints through a table the kernel cannot reach, so the frontend
+    /// asks the engine for them and stamps the answer on (`_glyph`).
+    pub style_name: Option<String>,
+    /// A table's delimiters, spelled left-then-right (`"()"`, `"| |"` minus the
+    /// space). The engine's `MatElem` defaults to a parenthesis pair, and the
+    /// frontend used to draw square brackets for every table; carrying the pair
+    /// is what lets the two agree.
+    pub border: Option<String>,
+    /// Whether the cells are grouped the way `mat` spells them (comma per column,
+    /// semicolon per row) rather than one argument per row (`vec`, `cases`).
+    pub is_mat: bool,
+    /// The column count of a table or an alignment. While a template is being built it
+    /// also carries the instance data of the two editor-only kinds — a hole's argument
+    /// index and an edge's definition index — because they are projected as nodes
+    /// before `ViewTemplate::of` turns them into variants.
+    pub columns: usize,
+    /// How many cells each row really has, before the flat list was padded to
+    /// `columns`. `mat(a, b; c)` and `a & b \ c` both pad a short row, so without this
+    /// the frontend would draw a cell the source does not have.
+    pub row_lengths: Vec<usize>,
+    pub children: Vec<ViewTemplate>,
+}
+
+/// A macro template, **stored as the display tree it expands into**.
+///
+/// A definition's body is projected once, at registration, and kept in this form; a
+/// call site is then that material with the arguments bound into its holes. Nothing
+/// here is a spelling of the definition: the template is never written back, because
+/// what gets written back is the *call* (`Write::Named`), which is what makes
+/// "expansion is only visual" a fact about the grammar rather than a discipline.
+///
+/// The two editor-only nodes are **variants**, not view kinds. That is the whole
+/// point of the type: a hole cannot reach the frontend, because the display tree has
+/// no variant for one — `docs/editing-model.md` §6.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ViewTemplate {
+    /// A display node: drawn, and possibly a parent.
+    Node(ViewNode),
+    /// A parameter hole: the argument view is substituted here, and nothing else is.
+    Hole { index: usize },
+    /// An edge to an earlier definition: embed that definition's template with these
+    /// cells as its arguments. The cells are bound in the **caller's** context first,
+    /// which is how a nested expansion keeps each hole pointing at the call site it
+    /// really came from — no side table of origins is needed.
+    Edge { definition: usize, cells: Vec<ViewTemplate> },
+}
+
+impl ViewTemplate {
+    /// The template of a definition the editor does not expand.
+    ///
+    /// It is what an **empty cell** projects to, not a special case: `view_cell(&[])`
+    /// has always answered `empty-cell`, and a definition whose body never became a
+    /// template is exactly a definition with no material. Nothing reads it — only an
+    /// expandable definition is ever bound, and only expandable definitions are named
+    /// by `ViewTemplate::Edge` — so it exists to keep the field total rather than to
+    /// be drawn.
+    pub fn empty() -> Self {
+        Self::Node(ViewNode {
+            kind: "empty-cell".into(), text: String::new(), role: None, display_glyph: None,
+            marker: None, style_name: None, border: None, is_mat: false, columns: 0,
+            row_lengths: vec![], children: vec![],
+        })
+    }
+    /// Turn one session-free projection into a stored template.
+    ///
+    /// This is the **one** place the two editor-only view kinds are recognised, and
+    /// they are recognised where a node is *read back into the model* — the same kind
+    /// of step as the parser reading source into atoms. Everything downstream
+    /// (`ViewTemplate::Hole`, `ViewTemplate::Edge`) is structure, so no later pass can
+    /// mistake a hole for a node to draw.
+    ///
+    /// A variant written around a hole projects as `raw_macro` here — the projection
+    /// cannot borrow a body-dependent shape without a body — and that is left alone: the
+    /// stored template is a *description* of what the definition expands to, and where it
+    /// cannot say, the honest description is the arrangement the projection produced. The
+    /// call site re-projects the bound body instead (`Projector::material`), which settles
+    /// it exactly.
+    ///
+    /// The session fields are dropped rather than copied, which is exactly what they
+    /// are: the projection that builds a template is run with no session, so there is
+    /// nothing to drop. The `debug_assert` is what keeps that true if the projection
+    /// ever learns to fill one of them without a caret.
+    fn of(view: &View) -> Self {
+        debug_assert!(
+            view.cursor.is_none() && view.edit.is_none() && view.attachment.is_none() && !view.active && !view.selected,
+            "模板是用无会话的投影建的，不该带上光标或编辑点：{}", view.kind,
+        );
+        match view.kind.as_str() {
+            // A hole carries which argument it stands for in `columns`, the field the
+            // editor-only kinds have always used for their own instance data.
+            "parameter" => return Self::Hole { index: view.columns },
+            "template-call" => return Self::Edge {
+                definition: view.columns,
+                cells: view.children.iter().map(Self::of).collect(),
+            },
+            _ => {}
+        }
+        Self::Node(ViewNode {
+            kind: view.kind.clone(), text: view.text.clone(), role: view.role,
+            display_glyph: view.display_glyph.clone(), marker: view.marker.clone(),
+            style_name: view.style_name.clone(), border: view.border.clone(), is_mat: view.is_mat,
+            columns: view.columns, row_lengths: view.row_lengths.clone(),
+            children: view.children.iter().map(Self::of).collect(),
+        })
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub struct View {
@@ -21,31 +156,13 @@ pub struct View {
     pub active: bool,
     pub selected: bool,
     pub columns: usize,
-    // Which decoration this node is, for the view kinds whose drawing is chosen
-    // by a name rather than by the shape: `decorated` (radical, delimiter pair,
-    // accent, rule) and `root`. The vocabulary is a contract with the frontend,
-    // which dispatches on it, so a marker the frontend does not know is a
-    // frontend/backend mismatch rather than data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marker: Option<String>,
-    // The font variant a `style` node is drawn in (`bold`, `upright`, …). The glyphs
-    // that variant produces are **not** on the wire: Typst applies a variant by
-    // substituting codepoints through a table the kernel cannot reach, so the frontend
-    // asks the engine for them and stamps the answer on (`_glyph`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style_name: Option<String>,
-    // A table's delimiters, spelled left-then-right (`"()"`, `"| |"` minus the
-    // space). The engine's `MatElem` defaults to a parenthesis pair, and the
-    // frontend used to draw square brackets for every table; carrying the pair
-    // is what lets the two agree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub border: Option<String>,
-    // Whether the cells are grouped the way `mat` spells them (comma per column,
-    // semicolon per row) rather than one argument per row (`vec`, `cases`).
     pub is_mat: bool,
-    // How many cells each row really has, before the flat list was padded to
-    // `columns`. `mat(a, b; c)` and `a & b \ c` both pad a short row, so without this
-    // the frontend would draw a cell the source does not have.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub row_lengths: Vec<usize>,
     pub edit: Option<Cursor>,
@@ -65,6 +182,15 @@ impl View {
     fn new(kind: &str, text: impl Into<String>, children: Vec<View>) -> Self {
         Self { kind: kind.into(), text: text.into(), role: None, display_glyph: None, children, cursor: None, active: false, selected: false, columns: 0, marker: None, style_name: None, border: None, is_mat: false, row_lengths: vec![], edit: None, attachment: None, definitions: None, origin: None, source_range: None }
     }
+    /// One display node, from the structure a template stored for it.
+    fn of(node: &ViewNode, children: Vec<View>) -> Self {
+        Self { kind: node.kind.clone(), text: node.text.clone(), role: node.role, display_glyph: node.display_glyph.clone(),
+               children, cursor: None, active: false, selected: false, columns: node.columns, marker: node.marker.clone(),
+               style_name: node.style_name.clone(), border: node.border.clone(), is_mat: node.is_mat,
+               row_lengths: node.row_lengths.clone(), edit: None, attachment: None, definitions: None, origin: None, source_range: None }
+    }
+    /// A cell that holds nothing: the answer for a hole whose argument is missing.
+    fn absent() -> Self { Self::new("absent", "", vec![]) }
     /// One `decorated` node: a single inner cell with a decoration whose drawing
     /// the frontend chooses by `marker`. `sqrt`, a delimiter pair, an accent and
     /// a rule share this kind because their *editing* is identical (one cell,
@@ -96,7 +222,17 @@ pub struct Response {
 }
 impl Editor {
     pub fn response(&mut self) -> Response {
-        let mut view = self.view_cell(&self.root, Some(&[]), "root");
+        // The projection is scoped: it borrows the definition registry and the caret,
+        // and the caret is touched again below (`self.cursor.occurrence` is rewritten
+        // once the view exists).
+        let registry = typst::macro_registry(&self.definitions);
+        let mut view = {
+            let projector = Projector {
+                registry: &registry,
+                session: Some(Session { slices: &self.cursor.slices, selection: self.selection() }),
+            };
+            projector.view_cell(&self.root, Some(&[]), "root")
+        };
         let mut candidates = vec![];
         fn collect(view: &View, cursor: &Cursor, out: &mut Vec<Cursor>) {
             if let Some(c) = &view.cursor {
@@ -129,6 +265,45 @@ impl Editor {
             macros: typst::macro_registry(&self.definitions).entries.clone(),
         }
     }
+}
+
+/// One projection's session state: where the caret is and what is selected **right now**.
+///
+/// Passing `None` instead is how a *template* view is built. At registration there is no
+/// caret, no selection, no history and no geometry, so there is nothing to pass — which
+/// is what makes "a stored template carries no cursor" a fact about the call rather than
+/// a rule someone has to remember.
+#[derive(Clone, Copy)]
+pub struct Session<'a> {
+    pub slices: &'a [CursorSlice],
+    pub selection: Option<(usize, usize)>,
+}
+
+/// The projection: an editable tree (or a template tree) in, a display tree out.
+///
+/// Reads only the macro registry plus an optional [`Session`], and deliberately holds
+/// no `Editor`. Two things follow from that, and both are `docs/editing-model.md`:
+///
+/// * registration can build a template's display tree, because building one needs no
+///   caret, no selection, no history and no geometry — there is nothing to pass, so
+///   "a stored template carries no session" is a fact about the call rather than a
+///   rule someone has to remember;
+/// * the whole document's registry is looked up **once** per projection rather than
+///   once per call node, which is what `Editor::response` used to do.
+pub struct Projector<'a> {
+    pub registry: &'a MacroRegistry,
+    pub session: Option<Session<'a>>,
+}
+
+impl Projector<'_> {
+    /// The caret's path, when there is a session.
+    fn slices(&self) -> &[CursorSlice] {
+        self.session.map_or(&[][..], |session| session.slices)
+    }
+    /// The selection, when there is a session.
+    fn selection(&self) -> Option<(usize, usize)> {
+        self.session.and_then(|session| session.selection)
+    }
     fn view_cell(&self, data: &MathData, path: Option<&[CursorSlice]>, occurrence: &str) -> View {
         let mut children = vec![];
         for p in 0..=data.len() {
@@ -139,7 +314,7 @@ impl Editor {
             }
             if let Some(atom) = data.get(p) {
                 let mut view = self.view_atom(atom, path, p, &format!("{occurrence}.a{p}"));
-                view.selected = path == Some(self.cursor.slices.as_slice()) && self.selection().is_some_and(|(a,b)| a <= p && p < b);
+                view.selected = path == Some(self.slices()) && self.selection().is_some_and(|(a,b)| a <= p && p < b);
                 children.push(view);
             }
         }
@@ -169,21 +344,20 @@ impl Editor {
                 }).collect();
                 return Self::view_configured(atom, name, draw, children, path, pos, occurrence);
             }
-            let registry = typst::macro_registry(&self.definitions);
+            let registry = self.registry;
             let definition = registry.get(name).filter(|d| d.expandable);
             // A call is only bound while its argument count still matches the
             // definition it resolves to. Definitions can be adopted mid-edit (a
             // #let typed inside a formula), which leaves older calls behind, so
             // this is checked here and never assumed.
             let bound = definition.filter(|def| def.params.len() == atom.cells.len());
-            if let Some(def) = bound.filter(|_| typst::projection_size(atom, &registry, typst::PROJECTION_LIMIT) <= typst::PROJECTION_LIMIT) {
+            if let Some(def) = bound.filter(|_| typst::projection_size(atom, self.registry, typst::PROJECTION_LIMIT) <= typst::PROJECTION_LIMIT) {
                 let args: Vec<_> = atom.cells.iter().enumerate().map(|(i, arg)| {
                     let mut view = View::new("macro-argument", def.params.get(i).map_or("", String::as_str), vec![self.view_cell(arg, child_path(i).as_deref(), occurrence)]);
                     view.columns = i;
                     view
                 }).collect();
-                let mut template = self.view_cell(&def.template, None, occurrence);
-                self.bind_template(&mut template, def, &registry, &args);
+                let mut template = self.expand(def, &args, occurrence);
                 Self::locate_projection(&mut template, &format!("{occurrence}.macro"));
                 return View::new(view_kind, name, vec![template]);
             }
@@ -217,7 +391,7 @@ impl Editor {
         match &atom.kind {
             Kind::MacroCall { .. } => unreachable!(),
             Kind::TemplateCall { definition } => { let mut view = View::new(view_kind, "", children); view.columns = *definition; view }
-            Kind::Parameter { index } => { let mut view = View::new(view_kind, "", vec![]); view.columns = *index; view }
+            Kind::Parameter { index, .. } => { let mut view = View::new(view_kind, "", vec![]); view.columns = *index; view }
             Kind::Char { text } => {
                 let mut view = View::new(view_kind, text, vec![]);
                 // A Char is one grapheme cluster, the unit the lexer and the engine
@@ -342,34 +516,130 @@ impl Editor {
             }
         }
     }
-    fn bind_template(&self, view: &mut View, def: &typst::MacroDefinition, registry: &typst::MacroRegistry, args: &[View]) {
-        self.bind_template_inner(view,def,registry,args,&mut std::collections::HashMap::new());
-    }
-    fn bind_template_inner(&self, view: &mut View, def: &typst::MacroDefinition, registry: &typst::MacroRegistry, args: &[View], counts: &mut std::collections::HashMap<String,usize>) {
-        if view.kind == "parameter" {
-            *view = args.get(view.columns).cloned().unwrap_or_else(|| View::new("absent", "", vec![]));
-            return;
-        }
-        if view.kind == "raw" {
+    /// Bind a stored node's children, leaving the node itself as stored.
+    fn bind_children(&self, node: &ViewNode, def: &MacroDefinition, args: &[View], occurrence: &str, counts: &mut HashMap<String, usize>) -> View {
+        let children = node.children.iter().enumerate()
+            .map(|(i, child)| self.material(child, def, args, &format!("{occurrence}.v{i}"), counts))
+            .collect();
+        let mut view = View::of(node, children);
+        // A fragment of a template has no `edit` cursor — that is the session's, and there
+        // is no session in a definition — so where it sits is said by the definition's own
+        // range instead: the fragment's image is asked for at the text the **definition**
+        // writes, and the call site is what compiles it (`document::annotate` reads these
+        // three fields).
+        if node.kind == "raw" {
             view.definitions = Some(def.context.as_ref().clone()); view.origin = Some(def.source.clone());
             let ranges=typst::definition_raw_ranges(def,&view.text);
             let ordinal=counts.entry(view.text.clone()).or_default();
             view.source_range=ranges.get(*ordinal).map(|(a,b)|[*a,*b]);*ordinal+=1;
         }
-        for child in &mut view.children {
-            self.bind_template_inner(child, def, registry, args, counts);
-        }
-        if view.kind == "template-call" {
-            let Some(callee) = registry.entries.get(view.columns) else {
-                *view = View::new("absent", "", vec![]);
-                return;
-            };
-            let mut template = self.view_cell(&callee.template, None, "");
-            self.bind_template(&mut template, callee, registry, &view.children);
-            *view = template;
+        view
+    }
+    /// Expand one call: the definition's stored template in, this call's display
+    /// tree out.
+    ///
+    /// A **total** function of the template and the arguments. That is the whole
+    /// construction behind `docs/editing-model.md` §6:
+    ///
+    /// * a hole has no display of its own — it *is* the argument view, so the caret
+    ///   inside it points at the call site, because that is the view the argument
+    ///   projection brought along;
+    /// * material that has no hole in it is material, and was projected with no
+    ///   cursor, so it carries no `stop` and the caret cannot reach it;
+    /// * nothing here tests a view *kind* to decide any of that, because `Hole` and
+    ///   `Edge` are variants of the stored type rather than names a node might have.
+    fn expand(&self, def: &MacroDefinition, args: &[View], occurrence: &str) -> View {
+        // One ordinal table per level, counting how many times this level's text
+        // spells the same `Raw`: one definition that writes the same fragment twice
+        // has two ranges, and the occurrence is what tells them apart.
+        self.material(&def.template, def, args, occurrence, &mut HashMap::new())
+    }
+    fn material(&self, template: &ViewTemplate, def: &MacroDefinition, args: &[View], occurrence: &str, counts: &mut HashMap<String, usize>) -> View {
+        match template {
+            ViewTemplate::Hole { index } => args.get(*index).cloned().unwrap_or_else(View::absent),
+            // The arguments of a nested call are the **caller's** material, so they are
+            // bound in the caller's context first; only then do they become the callee's
+            // arguments. Doing it the other way round would leave an inner hole pointing
+            // at the outer definition, which is the bug the side table of origins that
+            // `docs/editing-model.md` §8 rejects was meant to paper over.
+            ViewTemplate::Edge { definition, cells } => {
+                let Some(callee) = self.registry.entries.get(*definition) else { return View::absent() };
+                let args: Vec<View> = cells.iter().enumerate()
+                    .map(|(i, cell)| self.material(cell, def, args, &format!("{occurrence}.c{i}"), counts))
+                    .collect();
+                self.expand(callee, &args, occurrence)
+            }
+            // A call the registration could not shape: either one that has no shape at
+            // all (an unknown callee, a macro call that is not being expanded), or a font
+            // variant whose body was a **hole** — and a hole is not a character, so the
+            // registration had nothing to decide with.
+            //
+            // The template is not consulted about which it is, and it does not need to
+            // be: the collapsed arrangement keeps the call's **own spelling** in `text`,
+            // holes and all, so binding that text and reparsing it reconstructs the call
+            // as the document has it (`bold(upright(u))`). The node is then projected
+            // again from those atoms — by the ordinary `view_atom`, with its ordinary
+            // shape gate — which is what moves this decision to the instance side
+            // (`docs/editing-model.md` §9) without the template having to store an
+            // undecided state. For a call that simply has no shape, the second projection
+            // lands on the same collapsed arrangement, so nothing changes for it.
+            ViewTemplate::Node(node) if node.kind == MACRO_COLLAPSED => {
+                let spelled = self.spelled(node, def, args, occurrence, counts);
+                let data = typst::parse_document(&format!("$ {spelled} $")).map(|parsed| parsed.root).unwrap_or_default();
+                // Nothing new to decide unless the bound body settles a shape the
+                // registration could not: a call with no shape stays collapsed, and so
+                // does one whose body is still not a glyph run.
+                if !data.iter().any(|atom| self.settled_by_binding(atom)) {
+                    return self.bind_children(node, def, args, occurrence, counts);
+                }
+                self.view_cell(&data, None, occurrence)
+            }
+            ViewTemplate::Node(node) => self.bind_children(node, def, args, occurrence, counts),
         }
     }
-    // Cloned argument projections share canonical cursor paths, but every
+    /// Whether binding the arguments **settled** a shape the registration could not.
+    ///
+    /// The registration could not borrow a body-dependent shape (`Shape::needs_binding`)
+    /// because the body was a hole; the call site has one now, so the same ordinary query
+    /// the drawn tree uses — `command_shape` — is the test. When it answers, the collapsed
+    /// node was only waiting for a body and the real arrangement is available.
+    fn settled_by_binding(&self, atom: &MathAtom) -> bool {
+        atom.command_shape_ignoring_body().is_some_and(|shape| shape.needs_binding())
+            && atom.command_shape().is_some()
+    }
+    /// A collapsed node's spelling **with its holes bound**.
+    ///
+    /// The same rule the ordinary path uses — the stored `text` is the call as written,
+    /// and a hole stands where an argument goes — so this is `write_atom`'s answer for
+    /// those nodes, computed over the stored text with each hole replaced by the argument
+    /// as the document has it. Nothing is reassembled: the parts between the holes are
+    /// kept verbatim, which is what makes `bold(upright(u))` come out byte for byte.
+    fn spelled(&self, node: &ViewNode, def: &MacroDefinition, args: &[View], occurrence: &str, counts: &mut HashMap<String, usize>) -> String {
+        // Where the holes are, in the order the projection met them.
+        let mut holes = vec![];
+        fn collect(children: &[ViewTemplate], out: &mut Vec<usize>) {
+            for child in children {
+                match child {
+                    ViewTemplate::Hole { index } => out.push(*index),
+                    ViewTemplate::Node(node) => collect(&node.children, out),
+                    ViewTemplate::Edge { .. } => out.push(usize::MAX),
+                }
+            }
+        }
+        collect(&node.children, &mut holes);
+        let mut out = node.text.clone();
+        for index in holes {
+            let Some(at) = out.find('#') else { break };
+            let name = args.get(index).and_then(View::spelling).unwrap_or_default();
+            // The hole is spelled `#name` in the stored text; the argument replaces the
+            // whole marker, because that is what stands in the document.
+            let end = out[at..].find(|c: char| !c.is_alphanumeric() && c != '#').map_or(out.len(), |offset| at + offset);
+            out.replace_range(at..end, &name);
+        }
+        let _ = (def, occurrence, counts);
+        out
+    }
+    /// Cloned argument projections share canonical cursor paths, but every
     // displayed occurrence needs a unique, stable identity for the caret.
     fn locate_projection(view: &mut View, occurrence: &str) {
         for (i, child) in view.children.iter_mut().enumerate() {
@@ -381,6 +651,72 @@ impl Editor {
         }
     }
 }
+
+/// Project a definition's body into the display tree the registry stores.
+///
+/// Called from `typst::analyze_macros`, which is why this module and that one refer to
+/// each other: the registry's job is to know what a definition *expands to*, and what
+/// it expands to is a display tree. Passing `session: None` is not a mode — there is no
+/// session at registration, so there is nothing else it could be.
+pub fn template_tree(template: &MathData, registry: &MacroRegistry) -> ViewTemplate {
+    ViewTemplate::of(&Projector { registry, session: None }.view_cell(template, None, ""))
+}
 impl View {
     fn clone_view(&self) -> Self { self.clone() }
+    /// The Typst spelling of a **projected** view, as the document has it.
+    ///
+    /// The projection merges view kinds (`sqrt`, `delim`, `decoration` and `line` all
+    /// travel as `decorated`) and moves data into fields (`display_glyph`, `border`,
+    /// `marker`), so not every node can be written back out. This answers for the ones an
+    /// argument can be made of: the leaves carry their own text, a cell is its children
+    /// joined the way `write_cell` joins them, and the structured nodes spell themselves
+    /// the way `write_atom` does.
+    ///
+    /// It exists for one caller — re-reading a macro template's collapsed body once a
+    /// call site has bound it — and it is deliberately **conservative**: anything it
+    /// cannot spell answers `None`, which leaves that node as the collapsed image it
+    /// already was rather than inventing source nobody wrote.
+    pub fn spelling(&self) -> Option<String> {
+        match self.kind.as_str() {
+            "char" | "symbol" | "raw" => Some(self.text.clone()),
+            // A run of digits and a quoted string are one cell of characters, written
+            // without separators and with quotes respectively.
+            "number" => Some(self.children.iter().filter_map(View::spelling).collect()),
+            "text" => Some(format!("\"{}\"", self.children.iter().filter_map(View::spelling).collect::<String>())),
+            "cell" | "empty-cell" => {
+                let parts: Vec<String> = self.children.iter().filter_map(View::spelling).collect();
+                if self.children.is_empty() { Some("\"\"".into()) } else { Some(parts.join(" ")) }
+            }
+            // `frac(a, b)` — the shape merges into one wire kind, and the spelling is the
+            // call the writer would emit.
+            "fraction" => Some(format!("frac({}, {})", self.cell_spelling(0)?, self.cell_spelling(1)?)),
+            // A radical's two spellings differ by whether a degree is drawn.
+            "decorated" if self.marker.as_deref() == Some("radical") => Some(format!("sqrt({})", self.cell_spelling(0)?)),
+            "root" => Some(format!("root({}, {})", self.cell_spelling(0)?, self.cell_spelling(1)?)),
+            "decorated" if self.marker.as_deref() == Some("delim") => {
+                let (left, right) = self.text.split_once('\n')?;
+                Some(format!("{left}{}{right}", self.cell_spelling(0)?))
+            }
+            // A mark's own name is the command that wrote it (`hat`, `cancel`).
+            "decorated" if self.marker.as_deref() == Some("overline") => Some(format!("overline({})", self.cell_spelling(0)?)),
+            "decorated" if self.marker.as_deref() == Some("underline") => Some(format!("underline({})", self.cell_spelling(0)?)),
+            "decorated" => Some(format!("{}({})", self.marker.as_deref()?, self.cell_spelling(0)?)),
+            // A font variant keeps the command and the body; `text` is already the call.
+            "style" => Some(self.text.clone()),
+            // A call the kernel cannot shape: `text` is its own source, holes and all.
+            "raw_macro" => Some(self.text.clone()),
+            // A macro's argument is a cell by another name.
+            "macro-argument" => self.children.first().and_then(View::spelling),
+            _ => None,
+        }
+    }
+    /// The spelling of one child, as a call argument: `write_cell` of an empty cell is the
+    /// quoted empty string, which is how a text run spells "nothing here".
+    fn cell_spelling(&self, index: usize) -> Option<String> {
+        self.children.get(index).and_then(View::spelling)
+    }
 }
+
+impl View {
+}
+

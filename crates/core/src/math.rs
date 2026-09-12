@@ -2,7 +2,7 @@
 // Ports MathData/MathAtom and InsetMathNest/Script cell conventions.
 // Original authors: Alejandro Aguilar Sierra, André Pönitz,
 // Lars Gullik Bjønnes, Stefan Schimanski. See docs/LYX-CREDITS.
-use crate::slots::{self, char_class, Entry, Grammar, Horiz, Shape};
+use crate::slots::{self, char_class, Grammar, Shape};
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -88,8 +88,21 @@ pub enum Kind {
     MacroCall { name: String, function: bool },
     // Template-only edge to an earlier definition version in the registry.
     TemplateCall { definition: usize },
-    // Template-only reference. Arguments live exclusively in MacroCall.cells.
-    Parameter { index: usize },
+    /// A template-only reference to one of the definition's parameters.
+    ///
+    /// `index` is which argument it stands for — the structural identity, which is
+    /// what `template_size` weights and what the "every parameter is shown" check
+    /// marks. `name` is how the **definition** spells it, and it is what makes the
+    /// hole writable at all: a template fragment that reaches `write_atom` (a font
+    /// variant's expression, a call the editor cannot shape) has to spell the hole
+    /// the way the definition does (`#x`), because there is no such thing as a
+    /// nameless hole in Typst source.
+    ///
+    /// A hole is not a node of the editable document: it exists only inside a
+    /// template, and the template is stored as a *display* tree whose holes are a
+    /// variant of their own (`view::ViewTemplate`), so `Write::Marker` is never
+    /// reached from the document either.
+    Parameter { index: usize, name: String },
     Text,
     Fraction,
     Scripts,
@@ -153,36 +166,50 @@ impl MathAtom {
     /// `sqrt`, `hat`, `overline` and the rest are calls whose shape only
     /// `config/commands.json` knows. The node stores the *name*; the shape is looked
     /// up, never stored, so changing the file cannot leave a node holding a stale one.
-    /// The shape a configured command call borrows, if its name has one.
+    /// The shape a configured command call borrows, if its name has one **and** the
+    /// body can settle it.
     ///
-    /// `config/commands.json` is the only thing consulted: a call is stored as
-    /// `MacroCall { name }`, and everything about how it looks and how the caret moves
+    /// `config/commands.json` is the only thing consulted for the name: a call is stored
+    /// as `MacroCall { name }`, and everything about how it looks and how the caret moves
     /// inside it comes from the shape its name names. Nothing is stored on the node, so
     /// editing the file cannot leave a node holding a stale shape.
+    ///
+    /// `None` therefore means one of two things, and callers that need to tell them apart
+    /// ask [`Self::configured_shape_ignoring_body`] first — a **template** does, because
+    /// "not this shape" and "not decided yet" are different there:
+    ///
+    /// * the name has no shape at all;
+    /// * it names the font-variant shape and the body does not settle it — see
+    ///   [`Self::shaped_by_body`].
     pub fn command_shape(&self) -> Option<Shape> {
+        let shape = self.command_shape_ignoring_body()?;
+        if shape.needs_binding() && !self.shaped_by_body() { return None; }
+        Some(shape)
+    }
+    /// The shape the name alone declares, whether or not the body agrees.
+    ///
+    /// This is the question a *template* asks: a font variant written around a hole has a
+    /// shape, it just cannot be applied yet (`docs/editing-model.md` §9).
+    pub fn command_shape_ignoring_body(&self) -> Option<Shape> {
         match &self.kind {
-            Kind::MacroCall { name, .. } => {
-                let shape = slots::configured_shape(name)?;
-                // A font variant is the one shape whose applicability depends on the
-                // **body**: it is applied by substituting codepoints, so it only exists
-                // while its body is a run of characters. `bold(a)` qualifies; a fraction,
-                // an accent or a picture in the body does not (measured: the engine refuses
-                // to answer for those), and such a call is then drawn as a call — which is
-                // a path that already works rather than a variant that would have to report
-                // "no glyphs" every time it is drawn.
-                //
-                // This is asked here rather than at parse time because a node's cells change
-                // as it is edited: emptying a body, or typing a fraction into one, has to be
-                // able to move the node between the two drawings. `Kind` is what is stored,
-                // and it stays `MacroCall` either way.
-                if shape.is_font_variant() && !crate::typst::has_glyph_run(&self.cells) {
-                    return None;
-                }
-                Some(shape)
-            }
+            Kind::MacroCall { name, .. } => slots::configured_shape(name),
             _ => None,
         }
     }
+    /// Whether this node's body settles a shape that depends on it.
+    ///
+    /// One shape is decided by the body rather than by the name: a font variant is
+    /// applied by substituting codepoints, so it only exists while its body is a run of
+    /// characters. `bold(a)` qualifies; a fraction, an attachment or a picture in the
+    /// body does not (measured: the engine refuses to answer for those), and such a call
+    /// is then drawn as a call — which is a path that already works rather than a variant
+    /// that would have to report "no glyphs" every time it is drawn.
+    ///
+    /// This is asked per **instance**, never at registration: a template's body holds
+    /// holes, and a hole is not a character until the call site's argument has been bound
+    /// into it. Asking it of the unbound tree is what drew
+    /// `$mathbf(u)$` (for `#let mathbf(x) = $bold(upright(#x))$`) as a `raw_macro`.
+    pub fn shaped_by_body(&self) -> bool { crate::typst::has_glyph_run(&self.cells) }
     /// Whether this call's cells are a **macro's parameters** rather than a shape's
     /// slots.
     ///
@@ -218,20 +245,6 @@ impl MathAtom {
     pub fn columns(&self) -> usize {
         match self.kind { Kind::Table { columns, .. } | Kind::Multiline { columns, .. } => columns.max(1), _ => 1 }
     }
-    pub fn entry_cell(&self, forward: bool) -> usize {
-        let shape = self.shape();
-        match shape.entry {
-            // The roles named here are present in the same declaration.
-            Entry::Role { forward: f, backward: b } => shape.index_of(if forward { f } else { b }).unwrap_or(0),
-            // Saturating rather than `len() - 1`: a leaf has no cell to enter,
-            // and the expression this replaces underflowed if one was asked.
-            Entry::Edge => if forward { 0 } else { self.cells.len().saturating_sub(1) },
-            Entry::GridMiddle => {
-                let columns = self.columns();
-                (self.cells.len() / columns).saturating_sub(1) / 2 * columns + if forward { 0 } else { columns - 1 }
-            }
-        }
-    }
     pub fn confirm_deletion(&self) -> bool { self.active() }
     pub fn math_class(&self) -> u8 {
         // A character's class follows the character, not the kind, so it is
@@ -255,18 +268,6 @@ impl MathAtom {
     /// fixed `[base, upper, lower]` shape.
     pub fn remove_script(&mut self, idx: usize) {
         if let Some(cell) = self.cells.get_mut(idx) { cell.clear(); }
-    }
-    // InsetMathFrac and InsetMathScript deliberately DO NOT walk cells on Right.
-    pub fn idx_horizontal(&self, idx: usize, forward: bool) -> Option<usize> {
-        let step = |forward: bool| if forward { (idx + 1 < self.cells.len()).then_some(idx + 1) } else { idx.checked_sub(1) };
-        match self.shape().horizontal {
-            Horiz::Locked => None,
-            Horiz::Column => {
-                let columns = self.columns();
-                if forward && idx % columns + 1 == columns || !forward && idx % columns == 0 { None } else { step(forward) }
-            }
-            Horiz::Linear => step(forward),
-        }
     }
 }
 

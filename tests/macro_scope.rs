@@ -1,15 +1,33 @@
 use typformula_core::typst;
+use typformula_core::view::ViewTemplate;
 use typformula::{document::Document, services::{RawRange, RenderRequest, Services}};
 use serde_json::json;
+
+/// One template's material, read as a line a person can check.
+///
+/// This is a **test's eye**, not a spelling. A spelling is `write_atom`'s job and
+/// happens on the editable atoms; what a definition stores is the display tree its
+/// body projects to (`docs/editing-model.md` §9), so a test that wants to say "this
+/// definition is `1`" has to read that tree. Leaves contribute their text, a hole
+/// contributes `#` and an edge its definition index, so the two editor-only nodes are
+/// visible to an assertion rather than silently skipped.
+fn material(template: &ViewTemplate) -> String {
+    match template {
+        ViewTemplate::Hole { .. } => "#".into(),
+        ViewTemplate::Edge { definition, .. } => format!("<{definition}>"),
+        ViewTemplate::Node(node) if node.children.is_empty() => node.text.clone(),
+        ViewTemplate::Node(node) => node.children.iter().map(material).collect(),
+    }
+}
 
 #[test]
 fn lexical_blocks_shadow_without_leaking_and_definitions_keep_old_bindings() {
     let source = "#let amount = $1$\n#let saved(x) = $amount + #x$\n#[\n#let amount = $2$\n$ saved(z) + amount $\n]\n$ amount $";
     let inside = source.find("$ saved").unwrap();
     let inner = typst::macro_registry(&source[..inside]);
-    assert_eq!(typst::write_cell(&inner.get("amount").unwrap().template), "2");
+    assert_eq!(material(&inner.get("amount").unwrap().template), "2");
     let outer = typst::macro_registry(&source[..source.rfind("$ a").unwrap()]);
-    assert_eq!(typst::write_cell(&outer.get("amount").unwrap().template), "1");
+    assert_eq!(material(&outer.get("amount").unwrap().template), "1");
     let mut doc = Document::default();
     doc.apply(json!({"action":"set_source","source":source})).unwrap();
     doc.apply(json!({"action":"activate_formula","start":inside})).unwrap();
@@ -23,7 +41,7 @@ fn function_parameters_and_later_bindings_do_not_resolve_outer_macros() {
     let prefix = "#let a = $1$\n#let f(a) = ";
     assert!(typst::macro_registry(prefix).get("a").is_none());
     assert!(typst::macro_registry("#let a = $1$\n#{ let a = 3; ").get("a").is_some_and(|d|!d.expandable));
-    assert_eq!(typst::write_cell(&typst::macro_registry("#let a = $1$\n#{ let a = 3; }\n").get("a").unwrap().template),"1");
+    assert_eq!(material(&typst::macro_registry("#let a = $1$\n#{ let a = 3; }\n").get("a").unwrap().template),"1");
 }
 
 #[test]

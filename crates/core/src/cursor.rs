@@ -2,7 +2,7 @@
 // Translated branches from upstream/src/Cursor.cpp and
 // upstream/src/mathed/InsetMathNest.cpp, InsetMathScript.cpp, InsetMathFrac.cpp.
 // Authors of original algorithms are listed in docs/LYX-CREDITS.
-use crate::{math::*, slots::{self, Vertical}, typst};
+use crate::{editing, math::*, slots, typst};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -474,7 +474,7 @@ impl Editor {
                 // factory-built one used to be, so `\frac` + Enter leaves the caret
                 // in the numerator. A longer draft leaves the caret after it.
                 if bare_name && n == 1 && !self.data()[pos].cells.is_empty() {
-                    let entry = self.data()[pos].entry_cell(true);
+                    let entry = editing::entry_cell(&self.data()[pos], true);
                     self.push(pos, entry, false);
                 }
             }
@@ -664,7 +664,7 @@ impl Editor {
                 self.data_mut().splice(pos..pos, data);
                 self.cursor.pos += if active { 1 } else { n };
                 if active {
-                    let entry = self.data()[pos].entry_cell(true);
+                    let entry = editing::entry_cell(&self.data()[pos], true);
                     self.push(pos, entry, false);
                 }
                 self.refresh_definitions(&previous);
@@ -710,22 +710,24 @@ impl Editor {
                 }
             }
             if !shift && self.data()[p].active() {
-                let idx = self.data()[p].entry_cell(forward);
+                // Entering a node backwards lands at the end of the cell it enters:
+                // a fraction is met from its denominator, a grid from its last column.
+                let idx = editing::entry_cell(&self.data()[p], forward);
                 self.push(p, idx, !forward);
             } else if forward { self.cursor.pos += 1; } else { self.cursor.pos -= 1; }
         } else if let Some(owner) = self.owner() {
             let idx = self.cursor.slices.last().unwrap().cell;
-            if !shift && let Some(next) = owner.idx_horizontal(idx, forward) {
+            if !shift && let Some(next) = editing::idx_horizontal(owner, idx, forward) {
                 // Which shapes land at the END of the cell they are entered backward
-                // into: a radical (its degree is drawn to the left, so the radicand is
-                // met from its right) and a grid (a row is met from its last column).
-                // The radical is asked of the **shape**, because a `root(...)` call is
-                // stored as a `MacroCall` and only the command file says it is a radical
-                // at all — asking the atom's own kind here silently changed where the
-                // caret landed, and there is no `Kind::Root` to test for any more.
-                let radical = owner.command_shape().is_some_and(|shape| shape.is_radical());
-                let root_back = !forward && (radical || matches!(owner.kind, Kind::Table { .. } | Kind::Multiline { .. }));
-                self.cursor.slices.last_mut().unwrap().cell = next; self.cursor.pos = if root_back { self.data().len() } else { 0 };
+                // into is an editing rule, not a box property: a radical reads its
+                // degree before its radicand, so the radicand is met from its right,
+                // and a grid meets a row from its last column. Asking it of the shape
+                // name is what makes a `root(...)` call — stored as a `MacroCall` —
+                // behave like a stored `Kind::Root`; asking the atom's own kind here
+                // silently changed where the caret landed.
+                let back_lands_at_end = editing::rules(owner.shape().view).back_lands_at_end;
+                self.cursor.slices.last_mut().unwrap().cell = next;
+                self.cursor.pos = if !forward && back_lands_at_end { self.data().len() } else { 0 };
             } else { self.pop(forward); }
         }
         if shift { self.reduce_selection(); }
@@ -736,7 +738,7 @@ impl Editor {
         self.anchor = None; self.target_x = None;
         let Some(owner) = self.owner() else { self.message = "当前已在公式最外层".into(); return; };
         let n = owner.cells.len();
-        let first = owner.entry_cell(true);
+        let first = editing::entry_cell(owner, true);
         if n == 1 { self.pop(forward); }
         else {
             let s = self.cursor.slices.last_mut().unwrap(); s.cell = if forward { if s.cell + 1 == n { first } else { s.cell+1 } } else { (s.cell + n - 1) % n }; self.cursor.pos = 0;
@@ -773,32 +775,14 @@ impl Editor {
         loop {
             let Some(owner) = self.owner() else { self.cursor = original; break; };
             let idx = self.cursor.slices.last().unwrap().cell;
-            let mut target = None;
-            let mut end = false;
-            let shape = owner.shape();
-            match shape.vertical {
-                Vertical::Swap { up: up_role, down: down_role, end_up } => {
-                    if let Some(t) = shape.index_of(if up { up_role } else { down_role }) {
-                        if idx != t { target = Some(t); end = up && end_up; }
-                    }
-                }
-                // An attachment keeps its own rules: a script is only reachable
-                // from the end of the base, and it returns to the base's start.
-                Vertical::Attach => {
-                    if idx == 0 && self.cursor.pos == self.data().len() { target = owner.script_idx(up); }
-                    else if owner.script_idx(true) == Some(idx) && !up || owner.script_idx(false) == Some(idx) && up { target = Some(0); end = true; }
-                }
-                Vertical::Column => {
-                    let columns = owner.columns();
-                    if up { target = idx.checked_sub(columns); }
-                    else if idx + columns < owner.cells.len() { target = Some(idx + columns); }
-                }
-                Vertical::None => {},
-            }
-            if let Some(target) = target {
-                self.cursor.slices.last_mut().unwrap().cell = target;
+            // Which cell an up/down move lands in is the editing model's answer
+            // (`editing::vertical`); where the caret sits *inside* that cell is a
+            // measurement, so it is taken from the geometry below.
+            let landing = editing::vertical(owner, idx, up, self.cursor.pos == self.data().len());
+            if let Some(landing) = landing {
+                self.cursor.slices.last_mut().unwrap().cell = landing.cell;
                 let candidates: Vec<_> = self.geometry.iter().filter(|s| s.cursor.slices == self.cursor.slices).collect();
-                self.cursor.pos = if end { self.data().len() } else if let (Some(x), Some(best)) = (x, candidates.iter().min_by(|a,b| (a.x-x.unwrap_or(0.0)).abs().total_cmp(&(b.x-x.unwrap_or(0.0)).abs()))) {
+                self.cursor.pos = if landing.end { self.data().len() } else if let (Some(x), Some(best)) = (x, candidates.iter().min_by(|a,b| (a.x-x.unwrap_or(0.0)).abs().total_cmp(&(b.x-x.unwrap_or(0.0)).abs()))) {
                     // The stop's own position is a measurement hint; clamp it to
                     // the cell it was measured in.
                     let _ = x; best.cursor.pos.min(self.data().len())

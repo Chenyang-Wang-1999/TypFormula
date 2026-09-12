@@ -200,7 +200,7 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 | 规则 | 原写法 | 为什么失效 | 修法 |
 | --- | --- | --- | --- |
 | 退格在格首"只拉出当前实参" | `matches!(owner.kind, Kind::MacroCall { .. })` | 借了形状的 `frac(a, b)` 也是 `MacroCall`，于是它继承了**宏实参**的语义，退格再也拉不出实参（`lyx_traces.rs` 抓到） | `MathAtom::is_macro()`：`MacroCall` **且**没有配置形状，即"实参是 `#let` 的形参" |
-| 向左跨格进入根式时落在格尾 | `matches!(owner.kind, Kind::Root)` | `root(...)` 存成 `MacroCall`，这个判断恒为假，光标落到了格首 | 改问 `owner.command_shape()` 的形状是不是 radical（`caret_navigation.rs` 新增用例抓到） |
+| 向左跨格进入根式时落在格尾 | `matches!(owner.kind, Kind::Root)` | `root(...)` 存成 `MacroCall`，这个判断恒为假，光标落到了格首 | 改问形状（`caret_navigation.rs` 新增用例抓到）；现在这条规则叫 `editing::Rules::back_lands_at_end`，与"表格从最后一列接上"是同一条
 
 第二条尤其值得记：**当时没有任何测试覆盖它**，是翻完之后逐条审 `Kind::` 判断才发现的，而补的第一版用例又走的是 `entry_cell` 而不是 `move_horizontal` 那条路，加了变异检查才发现它照样通过。同一个理由让 `is_macro()` 必须存在：`Kind::MacroCall` 现在是一个**过载**的标记，既表示"宏调用"也表示"借了形状的命令"，凡是按它分派的规则都要重新问一遍。
 
@@ -208,7 +208,7 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 一个构造要是自己的 `Kind`，只有两个理由：
 
-1. **它带着名字和配置都给不出的实例数据**——`Table{columns}`、`Fenced{left,right}`、`Multiline{columns,row_lengths}`、`Raw{source}`、`MacroCall{name}`、`TemplateCall{definition}`、`Parameter{index}`、`Unknown{…}`、`Char{text}`、`Symbol{name,glyph}`；
+1. **它带着名字和配置都给不出的实例数据**——`Table{columns}`、`Fenced{left,right}`、`Multiline{columns,row_lengths}`、`Raw{source}`、`MacroCall{name}`、`TemplateCall{definition}`、`Parameter{index,name}`、`Unknown{…}`、`Char{text}`、`Symbol{name,glyph}`；
 2. **它要保住书写形式**——`SkewedFraction`（若采纳）记的是"源码写的是 `a/b`"，这是出处而不是数据，但同样只有节点能记住。
 
 按这条，`Fraction`/`Sqrt`/`Root`/`Accent`/`Line` 都**不该是节点**：它们没有自己的数据，名字加上配置已经说全了。`√x`/`∛x` 也因此与 `sqrt(x)`/`root(3, x)` 折成同一个 `MacroCall`——radical 的形状不带数据，`√x` 该记的只有"它是 sqrt"这一个名字。
@@ -294,33 +294,35 @@ $RR$  →  MathIdent("RR")
 | | 可编辑树 `MathData` | 显示树 `View` |
 | --- | --- | --- |
 | `MacroCall` 是什么 | `{name, cells}`——只有名字和实参 | 展开后的模板 |
-| 模板从哪来 | **不存** | 每次 `response()` 从注册表现取 |
+| 模板从哪来 | **不存** | 注册期投影一次、存进注册表（`ViewTemplate`） |
 | 谁读它回写 | `write_atom` → `Write::Named` | 没人读 |
-| 生命周期 | 作者编辑、撤销、存盘 | 一次回复 |
+| 生命周期 | 作者编辑、撤销、存盘 | 一次回复（模板那棵是进程级缓存） |
 
 ```
 MathData:  MacroCall { name: "twice", cells: [x] }        ← 唯一权威
-                │  view_atom (view.rs:117) 现算
+                │  view_atom (view.rs) 现算
                 ▼
 View:      macro
-             ├─ template = view_cell(&def.template)      ← 从注册表取，不在节点里
-             └─ bind_template: 把 Parameter{index} 换成实参 View 的克隆
+             ├─ 注册表里那份模板的显示树（`ViewTemplate`）   ← 注册期建好，只读
+             └─ expand: 洞换成实参 View 的克隆，边换成被调宏的展开
 ```
 
 四步机制，缺一不可：
 
-1. **回写只认名字和实参**（`typst.rs:776`）：`Write::Named` 拼 `format!("{name}({})", joined(&atom.cells))`；公式常量那种 `function: false` 连括号都不写，直接 `name`。**模板不在节点里**，所以"要不要写出来"这个问题不存在。
-2. **展开是读取时现算**（`view.rs:117`）：`registry.get(name)` 拿定义，节点存名字、注册表存定义——与 `Symbol{name,glyph}`、`Accent{name}` 同一个模式：节点存"指向什么"，内容存在别处。
-3. **绑定就是替换占位符**（`view.rs:226`）：模板里的 `Parameter{index}` 换成调用点实参 View 的 `cloned()`；**克隆一份给显示，原实参仍在 `cells[0]`**。
-4. **嵌套调用递归替换**（`view.rs:239`）：`TemplateCall{definition}` 按**定义版本号**取模板再整体替换，所以后面的同名定义不会改变早先宏的捕获。
+1. **回写只认名字和实参**（`write_atom` 的 `Write::Named`）：拼 `format!("{name}({})", joined(&atom.cells))`；公式常量那种 `function: false` 连括号都不写，直接 `name`。**模板不在节点里**，所以"要不要写出来"这个问题不存在。
+2. **展开是读取时现算**：`registry.get(name)` 拿定义，节点存名字、注册表存定义——与 `Symbol{name,glyph}`、`Accent{name}` 同一个模式：节点存"指向什么"，内容存在别处。
+3. **绑定就是替换洞**：模板里的洞换成调用点实参 View 的 `cloned()`；**克隆一份给显示，原实参仍在 `cells[0]`**。
+4. **嵌套调用递归替换**：边（`ViewTemplate::Edge`）按**定义版本号**取模板再整体展开，所以后面的同名定义不会改变早先宏的捕获。
 
-三个让这件事安全的细节：`def.template` 是 `Arc<MathData>`（`typst.rs:39`），模板只有一份、N 个调用点共享，`View` 那一侧才克隆；**参数个数不符就不展开**（`view.rs:124` 要求 `def.params.len() == atom.cells.len()`），定义中途变了就退化成 `macro-collapsed` 显示原文而不是错位展开；**展开有 4096 的上限**（`PROJECTION_LIMIT`），递归宏退回同样的折叠显示。
+**模板存的是显示树，不是原子树**——这是这条链上唯一一处"两棵树"之外的东西，值得单独说。注册期把定义体投影一次（那次投影**没有会话**：没有光标、没有选区、没有历史，所以"存下来的模板不带光标"是调用事实而不是纪律），存进 `MacroDefinition::template: Arc<ViewTemplate>`。模板树比显示树**多两个变体**：洞（`Hole`）与边（`Edge`），它们是**类型上的变体**而不是两个 `kind` 名字，所以显示树里根本没有这种节点，也就没有一条代码路径能把它们发上线（`tests/editing_model.rs` 守着这两条不变量）。
+
+三个让这件事安全的细节：`def.template` 是 `Arc<ViewTemplate>`，模板只有一份、N 个调用点共享，`View` 那一侧才克隆；**参数个数不符就不展开**（要求 `def.params.len() == atom.cells.len()`），定义中途变了就退化成 `raw_macro` 显示原文而不是错位展开；**展开有 4096 的上限**（`PROJECTION_LIMIT`），递归宏退回同样的折叠显示。
 
 **由此看清三类构造处在三种状态**：
 
 | | 底层存什么 | 显示 | 谁展开 |
 | --- | --- | --- | --- |
-| 可展宏 `twice(x)` | `MacroCall{name, cells}` | 模板 + 实参 | 内核（`view.rs:117`） |
+| 可展宏 `twice(x)` | `MacroCall{name, cells}` | 模板 + 实参 | 内核（`view.rs` 的 `Projector::expand`） |
 | 不可展宏 `foo(x)` | `Raw{"foo(x)"}` | 原文，`edit` 进源码 | 无 |
 | 结构命令 `frac(x,y)` | `Fraction{cells}` | 分数排布 | 不适用（形状直接建出来） |
 
@@ -328,23 +330,29 @@ View:      macro
 
 ## 槽位模型
 
-`math::MathAtom` 只保存实例数据（几列、有哪个脚标）；一个节点的**格子含义、视图名、Typst 拼写、所对应的 Typst 构造与导航规则**集中在 `crates/core/src/slots.rs`，由穷尽 `match` 的**两张表**声明：
+`math::MathAtom` 只保存实例数据（几列、有哪个脚标）；一个节点的**格子含义、视图名、Typst 拼写、所对应的 Typst 构造**集中在 `crates/core/src/slots.rs`，**光标怎么走**集中在 `crates/core/src/editing.rs`，各由穷尽 `match` 或整表对账的**三张表**声明：
 
 | 表 | 取用键 | 声明什么 | 谁读 |
 | --- | --- | --- | --- |
 | `Grammar` | `Kind` | `write`——怎么写回源码 | `write_atom` |
-| `Shape` | **形状名** | `view`、`typst`、`slots`、`arity`、`entry`、`horizontal`、`vertical`、`class` | `entry_cell` / `math_class` / `idx_horizontal` / `cursor::vertical` / `view_atom` |
+| `Shape` | **形状名** | `view`、`typst`、`slots`、`arity`、`class` | `math_class` / `view_atom` |
+| `editing::Rules` | **形状名** | `entry`、`horizontal`、`vertical`、`back_lands_at_end` | `editing::entry_cell` / `idx_horizontal` / `vertical` |
 
-分界是**"这个节点是什么"与"它长什么样、光标怎么走"**：
+分界是**"这个节点是什么"、"它的盒子是什么"与"光标在盒子里怎么走"**：
 
 - `Grammar` 说的是树里这个东西本身，所以它**不跟着借来的形状走**。`frac(a, b)` 存成 `MacroCall`，拼写就是 `MacroCall` 的（`Write::Named`，即 `名(实参…)`），没有任何 `fraction` 模板参与。这也是为什么过去那些"配置命令借形状"的特例（`Write::Delimited` 与 `Write::Positioned` 里各有一条 `Kind::MacroCall` 分支）不再需要——它们存在的唯一理由就是拼写曾被借走。
-- `Shape` 说的是排布与编辑，所以它**按形状名取**，配置命令借的正是它：`frac(a, b)` 的两格因此拿到 `numerator`/`denominator` 角色和分式的上下规则，和一个存储的 `Kind::Fraction` 完全一致。
+- `Shape` 说的是**盒子**：这个节点有哪几个具名 item（`role`）、每个多大（`scale`）、是不是重复模式（`arity`）、用哪种排布（`view`）、排什么间距类（`class`）。它**按形状名取**，配置命令借的正是它：`frac(a, b)` 的两格因此拿到 `numerator`/`denominator` 角色。
+- `editing::Rules` 说的是**光标**：进入时落在哪一格、左右能不能走、上下换到哪一格。它也按形状名取，所以借了 `fraction` 的 `frac(a, b)` 与存储的 `Kind::Fraction` 导航完全一致。
+
+**"编辑"为什么必须与 `Shape` 分开**，见 [editing-model.md](editing-model.md) 第三节：可达性是**实例**的属性，不是形状的属性——`$frac(a, 2)$` 两格都可达，而 `#let foo(x) = $frac(#x, 2)$` 展开后分子可达、分母不可达，两者用的是同一个 `FRACTION_SHAPE`。所以 `Shape` 里写"这一格能编辑"表达不了这件事。依赖方向是 editing → `Shape`：规则**引用** `Shape` 声明的 `role` 名，跨两表的对齐由 `editing::tests::named_roles_exist_in_the_schema_that_names_them` 守着。
+
+`class` 留在 `Shape` 而不是跟着光标搬过去：它的数据来源是 Typst 的数学间距类（`char_class` 从字符算、`class: 7` 是分式与表格），前端从不读它、也不上线，只是恰好被 `move_word` 用了。搬到 editing 就等于承认"这个类只为光标存在"，那是把因果说反。
 
 `typst`（与 Typst `MathKind` 的对应关系）跟着 `Shape` 走：`Sqrt`/`Root` 都是形状，二者都认领 `Radical`。
 
-加一个 `Kind` 时编译器会要求把这几件事一次说清：`Kind::shape()` 与 `Kind::grammar()` 都是穷尽 `match`。
+加一个 `Kind` 时编译器会要求把这几件事一次说清：`Kind::shape()` 与 `Kind::grammar()` 都是穷尽 `match`；编辑规则那张表是**按名字查的**，所以它另有一条对账测试（`editing::tests::every_shape_declares_its_editing_rules`）要求每个形状都在表里有一次回答，且表里没有形状表不认识的键。
 
-`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个形状可以认领 0 个（编辑器专有：`macro`/`template-call`/`parameter`/`unknown`）、1 个或多个（`raw` 认领 `Box`/`Mathml`/`External`；`sqrt` 与 `root` 都认领 `Radical`；`char`/`symbol`/`style` 都认领 `Glyph`；`decoration` 认领 `Accent` 与 `Cancel`）。对账是**按形状**做的，不是按 `Kind`——`Radical`/`Accent`/`Cancel`/`Line` 只由借来的形状认领，五个描述符 `Kind` 删掉之后，形状表是唯一认领它们的地方。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何形状认领的变体"恰好等于 `slots::UNMODELLED`——现在只剩 `Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一项就必然要改那张表，并在那里写下为什么其余几项还没做。这三项与上一节的"名字表"是**两件事**：`VecElem` 连名字都没进表，而 `Group` 是"编辑器的一个格子就是一个 group"、根本不需要谁去代表它。`cancel` 则是第三类——它靠 `commands.json` 里的一行把 `decoration` 形状借过来用，`MathKind::Cancel` 因此由那个形状一并认领（见下节）。形状名与线名**故意可以不同**（`Kind::Fenced` 的形状名仍是 `delim`，线名是 `decorated`）：形状名是配置与 `Shape` 表用的键，线名是给前端的绘图契约，只在画法变化时才需要改。
+`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个形状可以认领 0 个（编辑器专有：`macro`/`template-call`/`parameter`/`unknown`；后两个是模板树里那两个变体在注册期投影时的中间形状名，**不上线**）、1 个或多个（`raw` 认领 `Box`/`Mathml`/`External`；`sqrt` 与 `root` 都认领 `Radical`；`char`/`symbol`/`style` 都认领 `Glyph`；`decoration` 认领 `Accent` 与 `Cancel`）。对账是**按形状**做的，不是按 `Kind`——`Radical`/`Accent`/`Cancel`/`Line` 只由借来的形状认领，五个描述符 `Kind` 删掉之后，形状表是唯一认领它们的地方。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何形状认领的变体"恰好等于 `slots::UNMODELLED`——现在只剩 `Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一项就必然要改那张表，并在那里写下为什么其余几项还没做。这三项与上一节的"名字表"是**两件事**：`VecElem` 连名字都没进表，而 `Group` 是"编辑器的一个格子就是一个 group"、根本不需要谁去代表它。`cancel` 则是第三类——它靠 `commands.json` 里的一行把 `decoration` 形状借过来用，`MathKind::Cancel` 因此由那个形状一并认领（见下节）。形状名与线名**故意可以不同**（`Kind::Fenced` 的形状名仍是 `delim`，线名是 `decorated`）：形状名是配置、`Shape` 表与编辑规则表共用的键，线名是给前端的绘图契约，只在画法变化时才需要改。
 
 `Char` 的载荷是**一个字形簇**（`String`，不是一个 `char`），因为"字符"与"Unicode 标量"不是一回事：`é` 可能是一个标量也可能是两个，emoji 常是好几个。词法本来就把一个字形簇收进一个节点，`GlyphItem` 也装一个簇——按标量拆会让回写在簇中间插入分隔符，把 `é` 写成 `e ́`。`Kind::Number` 同理是"一个格"，串内字符由 `Write::Run` 连成一个记号。
 
@@ -360,8 +368,8 @@ View:      macro
 
 四处值得单独记：
 
-- `Entry::Role` 按**角色**指定光标首次进入的格子，因此根式向前进入落在"根指数"（它是书写顺序里的第一格）。
-- `Vertical::Swap { end_up }` 区分上下键换格后落在格首还是格尾：分式落格首、根式落格尾。
+- `editing::Entry::Role` 按**角色**指定光标首次进入的格子，因此根式向前进入落在"根指数"（它是书写顺序里的第一格）。
+- `editing::Vertical::Swap { end_up }` 区分上下键换格后落在格首还是格尾：分式落格首、根式落格尾。
 - 写模板**不再需要表达格序与拼写不一致**：`Root` 曾经把格子存成 `[被开方式, 根指数]`（与 Typst 的 `root(index, radicand)` 相反），靠 `Write::Template("root({1}, {0})")` 在回写时反回来，解析期再用 `args.swap(0, 1)` 配合——同一个事实写在两处，还牵动入口角色、上下互换、`Horiz::Pair` 与 `∛x` 的构造。现在格子就按书写顺序存，模板读作 `root({0}, {1})`，那四处一起消失。模板必须单遍展开，否则格子源码里的花括号会被当成占位符。
 - `Kind::Scripts` 的存储固定为 `[base, upper, lower]` 三格（`math::script_cell` 是唯一的格索引来源），空格子表示没有该脚标；视图因此不再需要合成缺格。Typst 的 `ScriptsItem` 有六个附件字段，因为它区分"居中极限"与"侧挂脚标"、并且保留左侧附件；一个格子属于哪一种由编译器决定、单独去问（`native-adapter`），不存在这里。
 
@@ -371,10 +379,10 @@ View:      macro
 
 `Shape::view` 是**形状名**，不是线名，两者可以不同：
 
-* 形状名要**每个 `Kind` 唯一且稳定**，因为 `config/commands.json` 写的是它（`slots.rs` 的测试就钉着这条），所以 `Kind` 变体改名不该动它（`Frac` → `Fraction` 之后仍是 `fraction`）。
+* 形状名要**每个 `Kind` 唯一且稳定**，因为它是三张表共用的键：`config/commands.json` 写的是它（`slots.rs` 的测试就钉着这条），`editing::RULES` 也按它取（对账测试钉着那条），所以 `Kind` 变体改名不该动它（`Frac` → `Fraction` 之后仍是 `fraction`）。
 * 线名由 `view_atom` 算出来，因此**可以把几个形状合并到一个线上 kind**，而它就合并了：`Sqrt`、`Fenced`、`Accent`、`Line` 一律以 `decorated` 上线，靠 `marker` 区分画法。
 
-这不是审美问题，是四者的**编辑声明逐项相同**（1 格、`Arity::Exact`、`Entry::Edge`、`Horiz::Linear`、`Vertical::None`、`class` 0），只有 `write` 与画法不同。线名按"一条独立的编辑或显示逻辑"划，形状名按"配置能指向什么"划，两者各自成立。
+这不是审美问题，是四者的**盒子与编辑声明逐项相同**（1 格、`Arity::Exact`、`class` 0，编辑上 `Entry::Edge`、`Horiz::Linear`、`Vertical::None`），只有 `write` 与画法不同。线名按"一条独立的编辑或显示逻辑"划，形状名按"配置与编辑规则能指向什么"划，两者各自成立。
 
 | 形状名（`Shape::view`） | 线名（`view_atom`） | 额外字段 |
 | --- | --- | --- |
@@ -449,7 +457,7 @@ render.raw: [{start:684, end:694}]
 
 前端另有一张 `ARRANGEMENTS` 白名单：遇到不认识的排布**报告一次**（经 `Typesetter.warn` 到状态栏），而不是静默按横排画错。
 
-回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 **16** 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符。
+回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 **16** 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符，`editing.rs` 的单元测试保证编辑规则表与形状表两侧互为全集，且规则引用的每个 `role` 都在那个形状的槽位里存在。
 
 每个 `Kind` 实际给前端提供了什么、对应的引擎 item 又有什么、两者差在哪，逐条列在 `docs/kind-inventory.md`（从真实后端与真实适配器取回，不是读代码推的）。
 

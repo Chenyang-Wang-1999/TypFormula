@@ -184,12 +184,14 @@ def emitted_kinds(view, out):
 # `ARRANGEMENTS` but no backend view ever carries them.
 FRONTEND_MADE = {"symbol", "absent"}
 
-# Arrangements that must exist and that *nothing* can emit, on purpose: they belong to
-# nodes that live only inside a macro template, which `bind_template_inner` replaces
-# before the view reaches the wire. `docs/kind-inventory.md` 第五节 measures this (zero
-# occurrences across every case). They still need a drawing because `view_atom` builds
-# them, and a `Decl` because `template_size` walks them.
-NEVER_ON_THE_WIRE = {"parameter", "template-call"}
+# There used to be a second exception list here: `parameter` and `template-call`, the two
+# nodes of a macro template's internal tree, which `bind_template_inner` replaced before
+# the view reached the wire. Both are gone -- from that list, from `ARRANGEMENTS`, and
+# from the display tree altogether: a template is stored as a display tree whose holes
+# and edges are *variants* of the stored type (`crates/core/src/view.rs`,
+# `ViewTemplate`), so there is no node to send and therefore nothing for the frontend to
+# draw. The comparison below is now exact: the frontend draws the names the backend
+# really emits, plus exactly the two it makes itself.
 
 
 def frontend_arrangements():
@@ -210,7 +212,7 @@ def audit_arrangements(emitted):
     """
     declared = frontend_arrangements()
     missing = sorted(emitted - declared)
-    extra = sorted(declared - emitted - FRONTEND_MADE - NEVER_ON_THE_WIRE)
+    extra = sorted(declared - emitted - FRONTEND_MADE)
     return declared, missing, extra
 
 
@@ -261,7 +263,7 @@ def main():
     print("== 排布名双向对照 ==")
     print(f"   后端在这 {len(CASES)} 个用例里真正发出的线名：{len(emitted)} 个")
     print(f"   前端 ARRANGEMENTS 声明：{len(declared)} 个"
-          f"（{sorted(FRONTEND_MADE)} 前端自造，{sorted(NEVER_ON_THE_WIRE)} 不上线但必须有画法）")
+          f"（其中 {sorted(FRONTEND_MADE)} 是前端自造的，后端不发）")
     if missing:
         print(f"   ✗ 前端没有画法的线名：{missing}——会在运行时经 note_unknown 报告")
     if extra:

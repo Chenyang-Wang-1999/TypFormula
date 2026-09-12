@@ -4,13 +4,14 @@ fn input(e:&mut Editor,s:&str){e.apply(Action::Input{text:s.into()}).unwrap();}
 fn key(e:&mut Editor,s:&str){e.apply(Action::Key{key:s.into(),ctrl:false,shift:false}).unwrap();}
 fn source(e:&Editor)->String{typst::write_cell(&e.root)}
 fn find_raw(v:&View)->Option<&View>{if v.kind=="raw"{Some(v)}else{v.children.iter().find_map(find_raw)}}
-/// 公式第一个原子被画成什么排布——"这个名字还绑着可展宏吗"现在靠它分辨。
+/// 这个名字在当前的宏定义表里还绑着一条**可展**定义吗。
 ///
-/// 从前这一问能用 `Kind` 回答：未绑定的调用是 `Raw`、绑定的可展宏是 `MacroCall`。放宽
-/// 之后两者都是 `MacroCall`（名字未知的调用画成 `raw_macro`、可展宏画成 `macro`），
-/// 所以判据移到了**画法**上——而这正是它本来想说的意思。
-fn first_view_kind(e:&mut Editor)->String{
-    e.response().view.children.iter().find(|c|c.kind!="stop").map(|c|c.kind.clone()).unwrap_or_default()
+/// 这一问从前用 `Kind` 回答（未绑定是 `Raw`、绑定的可展宏是 `MacroCall`）；放宽之后
+/// 两者都是 `MacroCall`，判据一度挪到**画法**上（`macro` / `raw_macro`）。两处都不对：
+/// 画法是显示层的事，而这个问题是模型的——定义表里这个名字绑到的是什么，
+/// `macro_registry` 直接答得了，不必绕一圈去问它被画成什么样。
+fn expands(e: &Editor, name: &str) -> bool {
+    typst::macro_registry(&e.definitions).get(name).is_some_and(|d| d.expandable)
 }
 
 #[test]
@@ -152,9 +153,11 @@ fn macro_edits_reclassify_without_losing_arguments_and_undo_restores_definitions
     e.apply(Action::Undo).unwrap();
     assert_eq!(e.response().source, old);
     e.apply(Action::SetDefinitions { definitions:String::new() }).unwrap();
-    assert_eq!(first_view_kind(&mut e),"raw_macro","定义被清掉后它不再是宏调用，只是名字未知的调用");
+    assert!(!expands(&e, "ratio"), "定义被清掉后它不再是可展宏，只是名字未知的调用");
+    assert!(matches!(e.root[0].kind, Kind::MacroCall { .. }), "参数仍然在树上，不该丢");
     e.apply(Action::SetDefinitions { definitions:RATIO.into() }).unwrap();
-    assert_eq!(first_view_kind(&mut e),"macro","定义回来后又成了可展的宏调用");
+    assert!(expands(&e, "ratio"), "定义回来后又成了可展的宏调用");
+    assert_eq!(source(&e), "ratio(a, b) + ratio(c, d)");
     let old = e.response().source;
     for invalid in ["#let ratio(x) = $", "$x$", "#import \"a.typ\""] {
         assert!(e.apply(Action::SetDefinitions { definitions:invalid.into() }).is_err());
@@ -234,8 +237,14 @@ fn jacobian_expands_dependencies_and_links_outer_parameters() {
     let args = views(&state.view, "macro-argument");
     for i in [0,2] { assert_eq!(views(args[i], "char").iter().map(|v| v.text.as_str()).collect::<String>(), "az"); }
     assert_eq!(views(&state.view, "stop").iter().filter(|v| v.active).count(), 1);
-    assert!(views(&state.view, "parameter").is_empty());
-    assert!(views(&state.view, "template-call").is_empty());
+    // Two assertions used to sit here: `views(&state.view, "parameter").is_empty()` and
+    // `views(&state.view, "template-call").is_empty()`. They are **deleted, not moved**:
+    // once `Parameter`/`TemplateCall` become variants of the template tree rather than
+    // arrangements a node can be drawn with, a `parameter`/`template-call` view node is
+    // impossible to build, so those assertions could only ever be vacuously true. What
+    // they meant to guard — "internal markers never reach the wire" — is now guarded
+    // harder by `tests/editing_model.rs`, which checks the **spelling** that leaked
+    // (`#parameter0`) instead of a kind name that never appears.
     e.apply(Action::Undo).unwrap();
     assert_eq!(source(&e), "jac(a, b, x, y)");
     e.apply(Action::Redo).unwrap();
@@ -340,7 +349,14 @@ fn dependency_graphs_are_shared_and_projection_limits_do_not_change_classificati
     for i in 1..30 { defs.push_str(&format!("\n#let layer{i}(x) = $layer{}(#x) + layer{}(#x)$", i-1, i-1)); }
     let registry = typst::macro_registry(&defs);
     assert!(registry.entries.iter().all(|d| d.expandable));
-    assert!(registry.entries.iter().all(|d| d.template.len() <= 3));
+    // The template is a **display** tree now, so what used to be "the root cell holds
+    // at most three atoms" is "the root node holds at most three children": the same
+    // count of the same material, read off the tree the registry actually stores.
+    let material = |d: &typst::MacroDefinition| match &*d.template {
+        typformula_core::view::ViewTemplate::Node(node) => node.children.len(),
+        _ => 0,
+    };
+    assert!(registry.entries.iter().all(|d| material(d) <= 3));
     let mut e = Editor::default();
     e.apply(Action::Import { source:format!("{defs}\n$layer29(a)$") }).unwrap();
     let state = e.response();

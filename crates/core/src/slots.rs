@@ -1,19 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Every `Kind`'s slot schema, declared once.
+//! Every `Kind`'s two declarations, made once: what it looks like (`Shape`) and
+//! how it spells itself (`Grammar`).
 //!
-//! `Kind` carries instance data (how many columns, which script exists); this
-//! module says what a node's cells *mean* and how the caret moves between them.
+//! `Kind` carries instance data (how many columns, which script exists); these
+//! two tables say what a node's cells *mean* to the frontend and to the writer.
 //! The accessors that used to switch on `Kind` with a `_ =>` catch-all now read
-//! `Kind::shape()` / `Kind::grammar()`, so a new kind is two exhaustive match arms instead of a hunt
-//! for silent fallbacks scattered across `math.rs` and `cursor.rs`.
+//! `Kind::shape()` / `Kind::grammar()`, so a new kind is two exhaustive match arms
+//! instead of a hunt for silent fallbacks scattered across `math.rs` and `cursor.rs`.
 //!
-//! `Decl` also records the three things that are *not* about slots but that
-//! every kind has to answer anyway: the frontend's arrangement name (`view`),
-//! the Typst spelling (`write`), and which Typst `MathKind`s the kind stands
-//! for (`typst`). The last one is the reason the variant names follow Typst's:
-//! the two vocabularies are meant to be read side by side, and
-//! `the_typst_vocabulary_is_covered_exactly_once` is what keeps the comparison
-//! honest.
+//! Two things are deliberately **not** here:
+//!
+//! * **how the caret moves** — that is `crate::editing`, a separate table joined to
+//!   this one by the shape name, because reachability is a property of an *instance*
+//!   rather than of a shape (`docs/editing-model.md` §3);
+//! * **which arrangement the frontend draws** — `Shape::view` is the *shape* name,
+//!   which is what `config/commands.json` writes and what the editing rules are keyed
+//!   by; the *wire* name is chosen by `view_atom`, which merges several shapes under
+//!   one kind and does (`sqrt`, `delim`, `decoration` and `line` all travel as
+//!   `decorated`). Keeping the two names apart is what let the shape table stop
+//!   carrying drawing data the frontend never sees.
+//!
+//! `Shape::typst` is claimed for the vocabulary ledger rather than read at runtime,
+//! and is the reason the variant names follow Typst's: the two vocabularies are meant
+//! to be read side by side, and `the_typst_vocabulary_is_covered_exactly_once` keeps
+//! the comparison honest.
 //!
 //! `tests/round_trip.rs` guards the spelling and `tests/caret_navigation.rs`
 //! guards the slot schema.
@@ -69,13 +79,11 @@ pub struct Slot {
     /// Font scale relative to the parent, in per-mille (`1000` = 100%).
     /// Per-mille rather than `f32` so the whole table stays `const`.
     pub scale: u16,
-    pub optional: bool,
 }
 
 impl Slot {
-    pub const fn full(role: Role) -> Self { Self { role, scale: 1000, optional: false } }
-    pub const fn scaled(role: Role, scale: u16) -> Self { Self { role, scale, optional: false } }
-    pub const fn blank(role: Role, scale: u16) -> Self { Self { role, scale, optional: true } }
+    pub const fn full(role: Role) -> Self { Self { role, scale: 1000 } }
+    pub const fn scaled(role: Role, scale: u16) -> Self { Self { role, scale } }
 }
 
 /// How many cells the schema describes.
@@ -87,46 +95,7 @@ pub enum Arity {
     Repeat,
 }
 
-/// Where the caret lands when it first enters this node.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Entry {
-    /// Follow the direction to the named role. Roles must be unique in `slots`.
-    Role { forward: Role, backward: Role },
-    /// First cell forward, last cell backward (used where roles repeat).
-    Edge,
-    /// Middle row of a grid: first column forward, last column backward.
-    GridMiddle,
-}
-
-/// Whether left/right walk between this node's cells.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Horiz {
-    /// Never: a fraction and an attachment deliberately block the caret at
-    /// their cell boundary (`InsetMathFrac`/`InsetMathScript` do the same).
-    Locked,
-    /// Linear, but stopping at a column boundary (grid, alignment).
-    Column,
-    /// Linear.
-    Linear,
-}
-
-/// How up/down move between this node's cells.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Vertical {
-    /// No movement inside this node.
-    None,
-    /// Swap between two roles. `end_up` puts the caret at the end of the cell
-    /// it moves up into (a radical's degree reads before its radicand).
-    Swap { up: Role, down: Role, end_up: bool },
-    /// Attachment rules: base to script only from the end of the base, and a
-    /// script back to the base, which need the live script indices.
-    Attach,
-    /// Column arithmetic (grid, alignment).
-    Column,
-}
-
-/// How a node's cells become its Typst spelling.
-///
+/// How a node's cells become its Typst spelling.///
 /// Exactly one kind spells itself through a template: `frac`, as `"frac({0}, {1})"`.
 /// The rest are either one of the dedicated forms below or `Write::Named`, which is
 /// what every call uses — including the configured commands, whose spelling is
@@ -160,7 +129,14 @@ pub enum Write {
     Matrix,
     /// Rows joined by ` \` + newline, cells by ` & ` (`Multiline`).
     Rows,
-    /// A placeholder that is not valid Typst (`Parameter`).
+    /// A parameter hole, spelled the way its definition writes it (`#x`).
+    ///
+    /// Never part of the document's own spelling: the only tree a `Parameter` lives
+    /// in is a macro template, and a template is stored as a display tree whose holes
+    /// are a variant of their own (`view::ViewTemplate`). So this arm is reached only
+    /// for the fragments of a template that need a spelling — a font variant's
+    /// expression, a call the editor cannot shape — which is exactly where the
+    /// definition's own parameter name is the right answer.
     Marker,
     /// Never written: only reachable inside an expanded macro template.
     TemplateOnly,
@@ -179,9 +155,8 @@ pub struct Grammar {
     pub write: Write,
 }
 
-/// What a node looks like and how the caret moves inside it: its slots and their
-/// roles, the arrangement the frontend draws it with, where the caret enters, how
-/// it walks, and the spacing class.
+/// What a node's box is: its items and their roles, the arrangement the frontend
+/// lays it out by, how many cells it has, and its math spacing class.
 ///
 /// Taken by **shape name**, which is why a configured command can borrow one:
 /// `frac(a, b)` is stored as a `MacroCall`, and `config/commands.json` says its
@@ -193,6 +168,9 @@ pub struct Grammar {
 /// free to merge several shapes under one wire kind and does (`Sqrt`, `Fenced`,
 /// `Accent` and `Line` all travel as `decorated`). `grid`/`aligned`/`script` are
 /// likewise shape names whose wire kinds are `table`/`multiline`/`scripts`.
+///
+/// **How the caret moves is not here** — see `crate::editing`. This struct is the
+/// box, and nothing else.
 #[derive(Clone, Copy)]
 pub struct Shape {
     /// The frontend's layout strategy for this node. `view_atom` reads it; a
@@ -221,11 +199,13 @@ pub struct Shape {
     pub typst: &'static [&'static str],
     pub slots: &'static [Slot],
     pub arity: Arity,
-    pub entry: Entry,
-    pub horizontal: Horiz,
-    pub vertical: Vertical,
     /// Math spacing class for kinds whose class is fixed. `Char` derives its
     /// class from the character itself, so its entry here is never read.
+    ///
+    /// This stays in the box rather than following the caret into `crate::editing`
+    /// even though `move_word` is its only reader: the data comes from Typst's own
+    /// math classes, and the frontend never sees it. Moving it would say "this class
+    /// exists for the caret", which puts the cause the wrong way round.
     pub class: u8,
 }
 
@@ -241,14 +221,21 @@ impl Shape {
     pub fn index_of(&self, role: Role) -> Option<usize> {
         self.slots.iter().position(|slot| slot.role == role)
     }
-    /// Whether this shape is a radical. The degree is drawn to the **left** of the
-    /// radicand, so the radicand is met from its right — which is what makes the caret
-    /// land at the end of the cell it is entered from the right.
-    pub fn is_radical(&self) -> bool { self.typst == K_RADICAL }
     /// Whether this is the font-variant shape. It is the one shape applied by
     /// substituting codepoints, so it only applies to a body that is a run of
     /// characters (`typst::has_glyph_run`).
     pub fn is_font_variant(&self) -> bool { self.view == "style" }
+    /// Whether this shape may be borrowed **while its body still holds holes**.
+    ///
+    /// A font variant is the one shape whose applicability depends on the body it is
+    /// written around, and a hole is not a character — so the question cannot be
+    /// answered until the call site's arguments have been bound. Every other shape is
+    /// decided by the name alone and is borrowed right away.
+    ///
+    /// That is what lets a template keep a variant call **undecided**
+    /// (`view::ViewTemplate::Deferred`) and settle it per instance, where the body is
+    /// finally known.
+    pub fn needs_binding(&self) -> bool { self.is_font_variant() }
 }
 
 // The command names live in `config/commands.json`, which `build.rs` turns into the
@@ -396,7 +383,7 @@ const RADICAND: &[Slot] = &[Slot::full(Role::Radicand)];
 /// `radical` special case in the caret. Storing the source order removes all six.
 const ROOT: &[Slot] = &[Slot::scaled(Role::Index, 550), Slot::full(Role::Radicand)];
 /// The shape a script's cells always have: base, upper, lower.
-const ATTACH: &[Slot] = &[Slot::full(Role::Base), Slot::blank(Role::Upper, 700), Slot::blank(Role::Lower, 700)];
+const ATTACH: &[Slot] = &[Slot::full(Role::Base), Slot::scaled(Role::Upper, 700), Slot::scaled(Role::Lower, 700)];
 
 // The `typst` lists of the table below, named for the same reason.
 /// A single character, and a named symbol: both resolve to a glyph, which is why
@@ -428,91 +415,70 @@ const K_NONE: &[&str] = &[];
 
 // One `Shape` per arrangement. They are constants rather than inline literals
 // because two tables read them: `Kind::shape` (what a stored node looks like) and
-// `shape_named` (what a name in `config/commands.json` borrows).
+// `shape_named` (what a name in `config/commands.json` borrows). How the caret moves
+// inside each of them is `crate::editing`, keyed by the `view` name written here.
 const CHAR_SHAPE: Shape = Shape {
-    view: "char", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "char", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, class: 0,
 };
 const SYMBOL_SHAPE: Shape = Shape {
-    view: "symbol", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "symbol", typst: K_GLYPH, slots: LEAF, arity: Arity::Exact, class: 0,
 };
 const NUMBER_SHAPE: Shape = Shape {
-    view: "number", typst: K_NUMBER, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "number", typst: K_NUMBER, slots: TEXT, arity: Arity::Exact, class: 0,
 };
 const RAW_SHAPE: Shape = Shape {
-    view: "raw", typst: K_OPAQUE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "raw", typst: K_OPAQUE, slots: LEAF, arity: Arity::Exact, class: 0,
 };
 const UNKNOWN_SHAPE: Shape = Shape {
-    view: "unknown", typst: K_NONE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "unknown", typst: K_NONE, slots: LEAF, arity: Arity::Exact, class: 0,
 };
+/// A parameter hole. It is a shape for the same reason every editable node has one:
+/// the fields are exhaustive, so a kind cannot be added without stating its box. It
+/// has no wire life — the hole is a variant of the *template* tree
+/// (`view::ViewTemplate`), never a node of the display tree.
 const PARAMETER_SHAPE: Shape = Shape {
-    view: "parameter", typst: K_NONE, slots: LEAF, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "parameter", typst: K_NONE, slots: LEAF, arity: Arity::Exact, class: 0,
 };
 const TEXT_SHAPE: Shape = Shape {
-    view: "text", typst: K_TEXT, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "text", typst: K_TEXT, slots: TEXT, arity: Arity::Exact, class: 0,
 };
 const MACRO_SHAPE: Shape = Shape {
-    view: "macro", typst: K_NONE, slots: ARGS, arity: Arity::Repeat, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "macro", typst: K_NONE, slots: ARGS, arity: Arity::Repeat, class: 0,
 };
+/// The edge to an earlier definition, inside a template. Like `parameter` it is
+/// editor-only and becomes a variant of the template tree.
 const TEMPLATE_CALL_SHAPE: Shape = Shape {
-    view: "template-call", typst: K_NONE, slots: ARGS, arity: Arity::Repeat, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "template-call", typst: K_NONE, slots: ARGS, arity: Arity::Repeat, class: 0,
 };
 const FRACTION_SHAPE: Shape = Shape {
-    view: "fraction", typst: K_FRACTION, slots: FRACTION, arity: Arity::Exact,
-    entry: Entry::Role { forward: Role::Numerator, backward: Role::Denominator },
-    horizontal: Horiz::Locked,
-    vertical: Vertical::Swap { up: Role::Numerator, down: Role::Denominator, end_up: false },
-    class: 7,
+    view: "fraction", typst: K_FRACTION, slots: FRACTION, arity: Arity::Exact, class: 7,
 };
 const SQRT_SHAPE: Shape = Shape {
-    view: "sqrt", typst: K_RADICAL, slots: RADICAND, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "sqrt", typst: K_RADICAL, slots: RADICAND, arity: Arity::Exact, class: 0,
 };
 const ROOT_SHAPE: Shape = Shape {
-    view: "root", typst: K_RADICAL, slots: ROOT, arity: Arity::Exact,
-    // Forward enters the degree, which now stands in cell 0 because the cells are
-    // stored in the order they are read.
-    entry: Entry::Role { forward: Role::Index, backward: Role::Radicand },
-    horizontal: Horiz::Linear,
-    vertical: Vertical::Swap { up: Role::Index, down: Role::Radicand, end_up: true },
-    class: 0,
+    view: "root", typst: K_RADICAL, slots: ROOT, arity: Arity::Exact, class: 0,
 };
 const SCRIPTS_SHAPE: Shape = Shape {
-    view: "script", typst: K_SCRIPTS, slots: ATTACH, arity: Arity::Exact,
-    entry: Entry::Role { forward: Role::Base, backward: Role::Base },
-    horizontal: Horiz::Locked, vertical: Vertical::Attach, class: 0,
+    view: "script", typst: K_SCRIPTS, slots: ATTACH, arity: Arity::Exact, class: 0,
 };
 const DELIM_SHAPE: Shape = Shape {
-    view: "delim", typst: K_FENCED, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "delim", typst: K_FENCED, slots: TEXT, arity: Arity::Exact, class: 0,
 };
 const GRID_SHAPE: Shape = Shape {
-    view: "grid", typst: K_TABLE, slots: CELL, arity: Arity::Repeat, entry: Entry::GridMiddle,
-    horizontal: Horiz::Column, vertical: Vertical::Column, class: 7,
+    view: "grid", typst: K_TABLE, slots: CELL, arity: Arity::Repeat, class: 7,
 };
 const ALIGNED_SHAPE: Shape = Shape {
-    view: "aligned", typst: K_MULTILINE, slots: CELL, arity: Arity::Repeat, entry: Entry::Edge,
-    horizontal: Horiz::Column, vertical: Vertical::Column, class: 0,
+    view: "aligned", typst: K_MULTILINE, slots: CELL, arity: Arity::Repeat, class: 0,
 };
 const DECORATION_SHAPE: Shape = Shape {
-    view: "decoration", typst: K_ACCENT, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "decoration", typst: K_ACCENT, slots: TEXT, arity: Arity::Exact, class: 0,
 };
 const LINE_SHAPE: Shape = Shape {
-    view: "line", typst: K_LINE, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "line", typst: K_LINE, slots: TEXT, arity: Arity::Exact, class: 0,
 };
 const STYLE_SHAPE: Shape = Shape {
-    view: "style", typst: K_GLYPH, slots: TEXT, arity: Arity::Exact, entry: Entry::Edge,
-    horizontal: Horiz::Linear, vertical: Vertical::None, class: 0,
+    view: "style", typst: K_GLYPH, slots: TEXT, arity: Arity::Exact, class: 0,
 };
 
 /// The Typst `MathKind` variants no `Kind` stands for.
@@ -566,11 +532,14 @@ pub fn char_class(value: char) -> u8 {
 }
 
 impl Kind {
-    /// What this node looks like and how the caret moves inside it.
+    /// The box this node is drawn as.
     ///
     /// Exhaustive on purpose: the compiler will not accept a new `Kind` until its
-    /// slots, its entry rule, its navigation and the Typst construct it models are
-    /// all stated.
+    /// slots, its arrangement and the Typst construct it models are all stated.
+    /// Its **editing** rules are declared separately, in `crate::editing`, keyed by
+    /// the `view` name given here — so adding a shape means answering there too, and
+    /// `editing::tests::every_shape_declares_its_editing_rules` is what makes that
+    /// answer mandatory rather than optional.
     ///
     /// Leaves have no cells of their own, so nothing to enter or walk; each is
     /// shown under its own arrangement.
@@ -641,20 +610,25 @@ pub mod view {
     pub const MACRO_COLLAPSED: &str = "raw_macro";
 }
 
+/// The sample nodes the shape and editing tables are checked against.
+///
+/// Shared rather than copied because `crate::editing`'s tests have to walk the same
+/// list: the join between the two tables ("a rule may only name a role its shape
+/// declares") is only checkable if both sides enumerate the same shapes.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
     use super::*;
-    use crate::math::{MathAtom, MathData};
+    use crate::math::MathData;
 
     /// One representative per `Kind`, with the number of cells it really stores.
-    fn representatives() -> Vec<(&'static str, Kind, usize)> {
+    pub(crate) fn representatives() -> Vec<(&'static str, Kind, usize)> {
         vec![
             ("Char", Kind::Char { text: "x".into() }, 0),
             ("Symbol", Kind::Symbol { name: "arrow".into(), glyph: "→".into() }, 0),
             ("Number", Kind::Number, 1),
             ("Raw", Kind::Raw { source: "dif".into() }, 0),
             ("Unknown", Kind::Unknown { name: "fra".into(), saved: MathData::new(), caret: 3, anchor: None, original: None }, 0),
-            ("Parameter", Kind::Parameter { index: 0 }, 0),
+            ("Parameter", Kind::Parameter { index: 0, name: "x".into() }, 0),
             ("Text", Kind::Text, 1),
             ("MacroCall", Kind::MacroCall { name: "f".into(), function: true }, 2),
             ("TemplateCall", Kind::TemplateCall { definition: 0 }, 2),
@@ -671,7 +645,7 @@ mod tests {
     /// `sqrt`, `root`, `decoration`, `line`, `style` and `delim` are all borrowable
     /// by a `MacroCall`; between them they are the reason the shape table exists
     /// apart from the kind table.
-    fn borrowable_shapes() -> Vec<(&'static str, Shape, usize)> {
+    pub(crate) fn borrowable_shapes() -> Vec<(&'static str, Shape, usize)> {
         vec![
             ("fraction", FRACTION_SHAPE, 2),
             ("sqrt", SQRT_SHAPE, 1),
@@ -683,38 +657,44 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn every_kind_has_a_representative_here() {
-        // `Kind::shape` makes a new kind fail to compile; this count is what
-        // makes a new kind fail to be *covered* by this file.
-        assert_eq!(representatives().len(), 14, "新增 Kind 后请在这里补一条代表实例");
-    }
-
-    /// Every shape the two invariants below hold for, with the number of cells a node
-    /// of that shape really stores.
+    /// Every shape a node can be drawn with, with the number of cells a node of that
+    /// shape really stores.
     ///
-    /// Two sources, because the schema is now reached two ways: a stored `Kind` carries
-    /// its own shape, and a configured command *borrows* one by name. Checking only the
-    /// kinds would leave the borrowed half — which is where the slots of `frac`, `sqrt`,
-    /// `hat` and the rest actually live — unguarded.
-    fn every_shape() -> Vec<(String, Shape, usize)> {
+    /// Two sources, because a shape is reached two ways: a stored `Kind` carries its
+    /// own, and a configured command *borrows* one by name. Checking only the kinds
+    /// would leave the borrowed half — which is where the slots of `frac`, `sqrt`,
+    /// `hat` and the rest actually live — unguarded. `editing.rs` checks its rules
+    /// against this same list, which is what makes the two tables' joins visible.
+    pub(crate) fn every_shape() -> Vec<(String, Shape, usize)> {
         let kinds = representatives().into_iter().map(|(label, kind, cells)| (label.to_string(), kind.shape(), cells));
         let borrowed = borrowable_shapes().into_iter().map(|(label, shape, cells)| (label.to_string(), shape, cells));
         kinds.chain(borrowed).collect()
     }
 
+    /// The distinct shapes, once each.
+    ///
+    /// `every_shape` deliberately lists a shape twice when a stored kind and a
+    /// configured command share it (`fraction`, `delim`, `grid`), which is exactly what
+    /// the vocabulary check must not count twice: two entries for one shape would read
+    /// as "two shapes claim this `MathKind`".
+    pub(crate) fn distinct_shapes() -> Vec<(&'static str, Shape)> {
+        let mut out: std::collections::BTreeMap<&'static str, Shape> = std::collections::BTreeMap::new();
+        for (_, shape, _) in every_shape() { out.entry(shape.view).or_insert(shape); }
+        out.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+    use crate::math::MathAtom;
+
     #[test]
-    fn named_roles_exist_in_the_schema_that_names_them() {
-        for (label, shape, _) in every_shape() {
-            if let Entry::Role { forward, backward } = shape.entry {
-                assert!(shape.index_of(forward).is_some(), "{label}：入口角色 {forward:?} 不在槽位表里");
-                assert!(shape.index_of(backward).is_some(), "{label}：入口角色 {backward:?} 不在槽位表里");
-            }
-            if let Vertical::Swap { up, down, .. } = shape.vertical {
-                assert!(shape.index_of(up).is_some(), "{label}：上移角色 {up:?} 不在槽位表里");
-                assert!(shape.index_of(down).is_some(), "{label}：下移角色 {down:?} 不在槽位表里");
-            }
-        }
+    fn every_kind_has_a_representative_here() {
+        // `Kind::shape` makes a new kind fail to compile; this count is what
+        // makes a new kind fail to be *covered* by this file.
+        assert_eq!(representatives().len(), 14, "新增 Kind 后请在这里补一条代表实例");
     }
 
     #[test]
@@ -733,33 +713,6 @@ mod tests {
                     assert!(cells >= shape.slots.len(), "{label}：重复图式的模式比格子还多");
                     for index in 0..cells.max(8) {
                         assert!(shape.role_at(index).is_some(), "{label}：第 {index} 格没有角色");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn entry_cells_stay_inside_the_cells_they_describe() {
-        for (label, kind, cells) in representatives() {
-            if cells == 0 { continue; }
-            let atom = MathAtom::nest(kind, cells);
-            for forward in [true, false] {
-                let entry = atom.entry_cell(forward);
-                assert!(entry < cells, "{label}：入口格子 {entry} 越界（共 {cells} 格）");
-            }
-        }
-    }
-
-    #[test]
-    fn horizontal_neighbours_stay_inside_the_cells_too() {
-        for (label, kind, cells) in representatives() {
-            if cells == 0 { continue; }
-            let atom = MathAtom::nest(kind, cells);
-            for index in 0..cells {
-                for forward in [true, false] {
-                    if let Some(next) = atom.idx_horizontal(index, forward) {
-                        assert!(next < cells, "{label}：第 {index} 格向{}走到越界的 {next}", if forward { "右" } else { "左" });
                     }
                 }
             }
@@ -903,18 +856,6 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "扫描 MathKind 时漏了 {expected}：{names:?}");
         }
-    }
-
-    /// The distinct shapes, once each.
-    ///
-    /// `every_shape` deliberately lists a shape twice when a stored kind and a
-    /// configured command share it (`fraction`, `delim`, `grid`), which is exactly what
-    /// the vocabulary check must not count twice: two entries for one shape would read
-    /// as "two shapes claim this `MathKind`".
-    fn distinct_shapes() -> Vec<(&'static str, Shape)> {
-        let mut out: std::collections::BTreeMap<&'static str, Shape> = std::collections::BTreeMap::new();
-        for (_, shape, _) in every_shape() { out.entry(shape.view).or_insert(shape); }
-        out.into_iter().collect()
     }
 
     #[test]

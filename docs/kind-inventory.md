@@ -118,12 +118,12 @@
 
 ## 五、不能从源码到达的两项
 
-`Kind::Parameter` 与 `Kind::TemplateCall` 只存在于**宏模板的内部树**（`MacroDefinition::template`），线上到不了：
+`Kind::Parameter` 与 `Kind::TemplateCall` 只存在于**宏模板在注册期的那棵原子树**里，可编辑树与显示树都到不了：
 
 - 解析宏定义体时 `ParseContext { template: true }`，`#x` 变成 `Parameter`、嵌套调用变成 `TemplateCall`；
-- 但显示调用时 `view.rs` 的 `bind_template_inner` 会把 `parameter` 换成实参视图、把 `template-call` 换成被调宏的展开结果。
+- 但定义体只解析这一次：注册期就把它**投影成显示树**存进 `MacroDefinition::template: Arc<ViewTemplate>`，原子树随后丢掉。投影出去的那棵树里，"洞"与"边"是**类型上的变体**（`ViewTemplate::Hole`/`Edge`）而不是两个节点，绑定时洞被实参视图整体替换、边被换成被调宏的展开——显示树里根本没有这种节点。
 
-实测：32 个用例的完整 `view` JSON 里，`"kind": "parameter"` 与 `"kind": "template-call"` 出现 **0 次**。它们仍必须有 `Decl`（`template_size` 要遍历、`Write::TemplateOnly` 要在写入时停下），但**前端永远看不到它们**。
+实测：32 个用例的完整 `view` JSON 里，`"kind": "parameter"` 与 `"kind": "template-call"` 出现 **0 次**。它们仍必须有 `Shape`（注册期那次投影要经过 `view_atom`，`template_size` 也要遍历原子树），但**前端永远看不到它们**——`mathview.py` 的 `ARRANGEMENTS` 里已经**没有**这两个名字了，`tools/kind_inventory.py` 的双向对照因此不再需要例外清单：前端能画的名字，恰好等于后端真发出的名字加两个前端自造的。
 
 ## 六、探测中发现的十二件事
 
@@ -135,7 +135,7 @@
 11. **一个"字符"是一个字形簇，不是一个 Unicode 标量。** 词法把 `e`+U+0301、`👍🏽`、ZWJ 家庭 emoji 各收成一个 `MathText` 节点，而 `GlyphItem.text` 也是一个字形簇；编辑器原先按标量拆成多个 `Char`，于是**回写会在字形簇中间插入分隔符**，敲一个键就把 `é` 变成 `e` + 空格 + 飘在后面的重音符（实测码位 `0x65 0x20 0x7a 0x20 0x301`）。对齐载荷为一个字形簇之后：`0x65 0x301 0x20 0x7a`，字形簇完好。这是"回写义务"那一类缺陷，会改坏文档内容。
 12. **前端"有分支但后端到不了"的名字，一共九个，已全部删除。** 逐个对照命令表（`config/commands.json`）与 `Shape::view`：`decoration` 里的 `widehat`/`dot`/`ddot`/`dddot`/`arrow`/`underline`/`underbrace`/`underbracket`/`underparen` 都不可能出现在线上——后端只产生 `hat` 与 `cancel`（`Accent`，线上都是 `decorated`）以及 `overline`/`underline`（`Line`，线上也是 `decorated`），其余名字会落成 `Raw` 由引擎自己画。反向的检查也做了：`multiline` 的左右交替对齐、`scripts` 的 `_placement`（`limits`/`scripts`）、`unknown` 的 `_string_mode` 都是真的到得了的；`ARRANGEMENTS` 白名单里多出的 `draft-*`/`absent`/`stop`/`cell`/`macro-argument` 是前端自造或后端合成的节点，不在 `Shape` 里，属于白名单该有的成员。后来 View 词汇整体重划（`sqrt`/`delim`/`decoration`/`line` 合并成 `decorated`，`grid`/`aligned`/`script`/`macro-collapsed` 改名），这张白名单也随之换过一遍；`decorated` 内部改用 `marker` 分派，同样只收后端真能产生的记号。
 
-    这次靠人眼逐个对照，**所以后来把它变成了机器检查**：`tools/kind_inventory.py` 现在把 32 个用例里**实际发出的线名**与 `mathview.py` 的 `ARRANGEMENTS` 做双向对照，任一边多出来就打印并**以非零码退出**。实测两个方向都对齐——23 个真发出的线名 + `parameter`/`template-call`（第五节：只存在于宏模板里，上线前就被 `bind_template_inner` 换掉，但必须有画法与 `Decl`）+ `absent`/`symbol`（前端自造）= 全部 25 个。检查本身也验过有牙：往 `ARRANGEMENTS` 里塞一个 `bogus-arm` 立刻报「后端发不出来的排布名」，退出码 1。
+    这次靠人眼逐个对照，**所以后来把它变成了机器检查**：`tools/kind_inventory.py` 现在把 32 个用例里**实际发出的线名**与 `mathview.py` 的 `ARRANGEMENTS` 做双向对照，任一边多出来就打印并**以非零码退出**。检查本身也验过有牙：往 `ARRANGEMENTS` 里塞一个 `bogus-arm` 立刻报「后端发不出来的排布名」，退出码 1。对照曾经需要一份例外清单——`parameter`/`template-call`（第五节：只存在于宏模板里，上线前就被换掉，但必须有画法）+ `absent`/`symbol`（前端自造）。**现在清单只剩前端自造的那两个**：模板改存视图树之后，前两个在显示树里连节点都不是，前端那两行画法已删，于是"每个线名都有画法、每个画法都有线名"是**确切**的 23 对 23。
 
     顺带在两处踩到"看着该有却没有"：`draft-text` 需要草稿里**有名字**（只打一个 `\` 只有占位符与光标），`empty-cell` 需要**真的有空格子**——而 `frac(a, )` 的尾逗号**不产生实参**，所以要用带显式空档的 `mat(, ; , )`。两个用例因此补进了 `CASES`。
 

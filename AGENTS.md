@@ -22,10 +22,12 @@ typformula/
 │   └── src/
 │       ├── lib.rs
 │       ├── math.rs             `MathData`/`MathAtom`/`Kind`：可编辑树本身；`command_shape()`/`is_macro()`
-│       ├── slots.rs            **唯一一张**声明表：每个 `Kind` 的槽位、导航、形状名、拼写、对应的 Typst `MathKind`
+│       ├── slots.rs            声明表：每个 `Kind` 的槽位、形状名、拼写、对应的 Typst `MathKind`
+│       ├── editing.rs          编辑模型：进入点、左右/上下怎么走、哪一格可达（按**形状名**取）
 │       ├── typst.rs            源码 ⇄ 树：`parse_formula`/`write_atom`，宏注册表，`has_glyph_run`
 │       ├── cursor.rs           `Editor` 与 `Action`：所有编辑动作（含命令草稿、选区、历史）
-│       └── view.rs             `View`/`Response`：交给前端的显示树（`view_atom` 把形状合并成线名）
+│       └── view.rs             `View`/`Response`：交给前端的显示树（`view_atom` 把形状合并成线名）；
+│                               注册期存下的模板也是显示树（`ViewTemplate`，洞与边是它的**变体**）
 ├── desktop/                    Qt 前端（PyQt5，源码运行）
 │   ├── __main__.py             入口：注册随附字体、装异常钩子、开窗口
 │   ├── window.py               主窗口：源码/编辑区投影、公式会话驱动、Raw 取图调度、源码栏、大纲、预览、菜单
@@ -58,10 +60,11 @@ typformula/
 │   ├── stored_kinds.rs         真正会被存进树的 `Kind` 恰好是哪 12 个
 │   ├── command_mode.rs         命令草稿：`\frac`、`\frac()`、补全、确认与取消
 │   ├── structured_input.rs     普通输入 / 字符串模式 / 符号简写的边界
-│   ├── caret_navigation.rs     导航规则（与 slots.rs 的声明对应）
+│   ├── caret_navigation.rs     导航规则（与 editing.rs 的声明对应）
 │   ├── lyx_traces.rs           LyX 行为对照回归
 │   ├── macro_scope.rs          宏绑定与作用域
 │   ├── source_modes.rs         可展/不可展宏的判定
+│   ├── editing_model.rs        编辑模型的两条不变量（洞不上线、模板材料不可达）
 │   ├── document.rs             annotate 的区间、失败块的重试
 │   ├── failed_block.rs         取不到图的片段：进入修复与恢复
 │   ├── attachments.rs          limits / stretch 的附件布局
@@ -73,6 +76,7 @@ typformula/
 │   └── engine_boxes.py         用真实适配器量公式盒子的宽高与基线
 ├── docs/
 │   ├── architecture.md         分层、名字处理、两棵树、Kind/View 的判据（先读这篇）
+│   ├── editing-model.md        三层职责的分工：为什么光标与可编辑性不属于 `Shape`
 │   ├── kind-inventory.md       每个 Kind 的能力清单：存储字段、线上字段、引擎 item、缺口
 │   ├── desktop.md              桌面端操作、字体、投影、构建运行与边界
 │   ├── validation.md           按日期记录的实测与修复过程（历史，不改写）

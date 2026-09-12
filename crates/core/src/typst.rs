@@ -3,6 +3,7 @@
 // Structural editing and draft keystrokes do not reparse the formula.
 use crate::math::*;
 use crate::slots::{self, Write};
+use crate::view::{self, ViewTemplate};
 use unicode_segmentation::UnicodeSegmentation;
 use typst_syntax::{Source, SyntaxKind, SyntaxNode, ast::{self, AstNode}};
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}};
@@ -39,8 +40,15 @@ pub struct MacroDefinition {
     pub expandable: bool,
     pub shadowed: bool,
     pub reason: String,
+    /// What the body expands to, **stored as a display tree**.
+    ///
+    /// Not as the atoms it was parsed from: those are dropped once this is built. Two
+    /// representations of one template would drift, and the display tree is the one
+    /// every reader wants — a call site is this material with its arguments bound into
+    /// the holes, and a hole is a *variant* here (`view::ViewTemplate::Hole`), so the
+    /// frontend cannot be handed one however the caller is written.
     #[serde(skip)]
-    pub template: Arc<MathData>,
+    pub template: Arc<ViewTemplate>,
     #[serde(skip)]
     pub context: Arc<String>,
     #[serde(skip)]
@@ -234,7 +242,7 @@ fn capped_mul(a: usize, b: usize) -> usize { a.saturating_mul(b).min(SIZE_CAP) }
 fn template_size(data: &MathData, registry: &MacroRegistry, arity: usize) -> TemplateSize {
     let mut out = TemplateSize { fixed: 1, params: vec![0; arity], depth: 0 };
     for atom in data {
-        if let Kind::Parameter { index } = atom.kind { out.params[index] = capped_add(out.params[index], 1); continue; }
+        if let Kind::Parameter { index, .. } = atom.kind { out.params[index] = capped_add(out.params[index], 1); continue; }
         if let Kind::TemplateCall { definition } = atom.kind {
             let callee = &registry.entries[definition].size;
             out.fixed = capped_add(out.fixed, callee.fixed);
@@ -329,7 +337,7 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
         let names: Vec<String> = binding.kind().bindings().iter().map(|n| n.as_str().to_string()).collect();
         let mut def = MacroDefinition { source: input.to_string(), input: input.to_string(), name: names.join(", "), names,
             params: vec![], expandable: false, shadowed: false, reason: "仅支持直接返回数学公式的位置参数函数或公式常量".into(),
-            template: Arc::new(vec![]), context: Arc::new(text[..context_end].to_string()), function: false, definition_start: at, size: TemplateSize::default() };
+            template: Arc::new(ViewTemplate::empty()), context: Arc::new(text[..context_end].to_string()), function: false, definition_start: at, size: TemplateSize::default() };
         let mut body = binding.init();
         let mut supported = def.names.len() == 1;
         let mut locals = HashSet::new();
@@ -354,7 +362,7 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
             let mut used = vec![false; def.params.len()];
             fn check(data: &MathData, params: &[String], used: &mut [bool]) -> bool {
                 data.iter().all(|atom| {
-                    if let Kind::Parameter { index } = atom.kind { used[index] = true; }
+                    if let Kind::Parameter { index, .. } = atom.kind { used[index] = true; }
                     if let Kind::Raw { source } = &atom.kind {
                         let parsed = Source::detached(format!("$ {source} $"));
                         if has_reference(parsed.root(), params) { return false; }
@@ -372,7 +380,9 @@ fn analyze_macros(text: &str, previous: Option<&MacroRegistry>) -> MacroRegistry
                 def.expandable = true;
                 def.reason = "所有参数均可在结构槽位中编辑".into();
                 def.size = template_size(&template, &registry, def.params.len());
-                def.template = Arc::new(template);
+                // The atoms stop here: what is kept is the display tree they project
+                // to, built with no session because registration has none.
+                def.template = Arc::new(view::template_tree(&template, &registry));
             }
         }
         registry.register(def);
@@ -520,7 +530,7 @@ fn parse_nodes(nodes: &[&SyntaxNode], ctx: &ParseContext) -> MathData {
         if child.kind() == SyntaxKind::Hash {
             if let Some(next) = children.next() {
                 if let Some(index) = parameter(next, ctx.params) {
-                    result.push(MathAtom { kind: Kind::Parameter { index }, cells: vec![] });
+                    result.push(MathAtom { kind: Kind::Parameter { index, name: ctx.params[index].clone() }, cells: vec![] });
                 } else { result.push(MathAtom::raw(format!("#{}", next.full_text()))); }
             }
         } else if !matches!(child.kind(), SyntaxKind::Space | SyntaxKind::Parbreak | SyntaxKind::LineComment | SyntaxKind::BlockComment) {
@@ -531,7 +541,7 @@ fn parse_nodes(nodes: &[&SyntaxNode], ctx: &ParseContext) -> MathData {
 }
 fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
     if let Some(index) = parameter(node, ctx.params) {
-        return vec![MathAtom { kind: Kind::Parameter { index }, cells: vec![] }];
+        return vec![MathAtom { kind: Kind::Parameter { index, name: ctx.params[index].clone() }, cells: vec![] }];
     }
     if node.kind() == SyntaxKind::MathIdent && ctx.is_bound(node.full_text().as_str()) {
         if let Some((index, def)) = ctx.resolve(node.full_text().as_str()).filter(|(_,d)| !d.function) {
@@ -829,7 +839,14 @@ pub fn write_atom(atom: &MathAtom) -> String {
             other => unreachable!("{other:?} 由自己的文本拼写，但它没有文本"),
         },
         Write::Marker => match &atom.kind {
-            Kind::Parameter { index } => format!("#parameter{index}"),
+            // A hole spells itself the way the **definition** writes it, because
+            // that is the only scope a hole exists in: a template fragment that
+            // reaches this function (a font variant's expression, a call the editor
+            // cannot shape) has to be a fragment the definition's own text contains,
+            // so `definitions`/`origin` can locate it. It used to be
+            // `#parameter{index}` — a name invented here, which then leaked onto the
+            // wire as if it were source (`docs/editing-model.md` §6.2).
+            Kind::Parameter { name, .. } => format!("#{name}"),
             other => unreachable!("{other:?} 声明为占位拼写"),
         },
         Write::TemplateOnly => unreachable!("template edges never belong to the editable source tree"),

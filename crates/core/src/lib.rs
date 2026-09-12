@@ -10,8 +10,10 @@
 //! What lives here:
 //!
 //! * `math` — `MathData`/`MathAtom`/`Kind`: the editable tree.
-//! * `slots` — one exhaustive table per `Kind`: cells, navigation, view name,
-//!   Typst spelling, and which Typst `MathKind` it stands for.
+//! * `slots` — two exhaustive tables per `Kind`: the box it draws (`Shape`) and
+//!   the way it spells itself (`Grammar`).
+//! * `editing` — the editing model: where the caret enters, how it walks, and
+//!   which cells it can reach.
 //! * `typst` — parsing Typst source into that tree, and writing it back.
 //! * `cursor` — `Editor`: every editing action, in terms of the tree.
 //! * `view` — the tree as the frontend receives it.
@@ -20,6 +22,7 @@
 //! and `rpc` (transports), `services`/`packages`/`workspace` (process, network,
 //! paths). See `docs/architecture.md`.
 pub mod cursor;
+pub mod editing;
 pub mod math;
 pub mod slots;
 pub mod typst;

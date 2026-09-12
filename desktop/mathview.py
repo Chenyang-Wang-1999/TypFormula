@@ -106,12 +106,20 @@ class Typesetter:
     # alignment); `raw_macro` is a known callee the kernel cannot expand; `style`
     # is a font variant over a run of characters, drawn from the glyphs the engine
     # supplied — or as the call, until they arrive.
+    #
+    # `parameter` and `template-call` used to be here. They were the two nodes of a
+    # macro template's *internal* tree, which the kernel replaced before the view
+    # reached the wire, so this frontend could never receive one; a drawing for them
+    # was dead code that also hid a leak. The template is now stored as a display
+    # tree whose holes and edges are *variants* of the stored type
+    # (`crates/core/src/view.rs`, `ViewTemplate`), so the display tree has no such
+    # node to send and nothing here has to know the names.
     ARRANGEMENTS = frozenset({
-        "char", "symbol", "number", "raw", "text", "unknown", "parameter",
+        "char", "symbol", "number", "raw", "text", "unknown",
         "draft-text", "draft-placeholder", "draft-caret", "absent", "stop",
         "cell", "empty-cell", "fraction", "decorated", "root", "scripts",
         "table", "multiline", "style",
-        "macro", "macro-argument", "raw_macro", "template-call",
+        "macro", "macro-argument", "raw_macro",
     })
 
     def __init__(self, settings, cache=None):

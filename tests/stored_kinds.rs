@@ -16,8 +16,10 @@
 //! `match`，新增一个变体时编译器会要求在这里回答一次。
 //!
 //! 两个变体永远不在这个集合里，但**不是**因为它们多余：`Parameter` 与
-//! `TemplateCall` 只存在于宏模板的内部树，上线前就被 `bind_template_inner` 换掉
-//! （`docs/kind-inventory.md` 第五节），这里读的是可编辑树，所以看不到它们。
+//! `TemplateCall` 是宏模板**在注册期**的那棵原子树里的东西——定义体解析一次、
+//! 投影成显示树（`view::ViewTemplate`）之后原子树就丢掉了，而投影出去的那棵树里
+//! "洞"与"边"是**类型上的变体**而不是节点（`docs/editing-model.md` 第九节），
+//! 所以可编辑树与显示树都看不到它们。
 
 use std::collections::BTreeSet;
 use typformula_core::math::Kind;
