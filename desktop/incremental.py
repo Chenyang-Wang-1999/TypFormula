@@ -67,9 +67,16 @@ def merge(previous,syntax,new_source,start,end,replacement,reparsed):
         formula=_shift_formula(old,start,end,delta,new_source)
         if formula is not None:shifted.append(formula)
     by_range={(item['start'],item['end']):item for item in shifted}
-    old_let_changed=any(style['kind']=='let' and not (style['end']<=start or style['start']>=end) for style in previous.get('styles',[]))
-    new_let_changed=any(style['kind']=='let' and not (style['end']<=reparsed['start'] or style['start']>=reparsed['end']) for style in syntax.get('styles',[]))
-    invalidate_after=reparsed['start'] if old_let_changed or new_let_changed else None
+    # A reparse can include a neighbouring unchanged let. Only changed binding
+    # text/ranges invalidate its dependents; moving the same block is not an edit.
+    old_bindings=set()
+    for style in previous.get('styles',[]):
+        if style['kind']!='let':continue
+        bounds=_range(style['start'],style['end'],start,end,delta)
+        old_bindings.add((*(bounds or (start,start)),style.get('text','')))
+    new_bindings={(s['start'],s['end'],s.get('text','')) for s in syntax.get('styles',[]) if s['kind']=='let'}
+    changed=old_bindings.symmetric_difference(new_bindings)
+    invalidate_after=min((item[0] for item in changed),default=None)
     formulas=[];rebuild=[]
     for base in syntax.get('formulas',[]):
         cached=by_range.get((base['start'],base['end']))

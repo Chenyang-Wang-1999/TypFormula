@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from copy import deepcopy
 from pathlib import Path
 from PyQt5.QtCore import QObject, QProcess, QTimer
 from .model import ROOT
@@ -69,6 +70,8 @@ class Core(QObject):
         self.budgets=dict(BUDGETS);self.budgets.update(budgets or {})
         self.document=None      # the source the child confirmed last
         self.active=None        # start of the formula session the child is in
+        self.session_source=None
+        self.session_actions=[]
         self.problem=""         # why the last exchange failed
         self.last_detail=""     # what the replaced child said on stderr
         self.closed=False
@@ -118,7 +121,7 @@ class Core(QObject):
             self.problem="公式核心返回了无法解析的响应";return None
         return reply
 
-    def mirror(self, reply):
+    def mirror(self, reply, action, arguments):
         """Remember the source and the session the child just confirmed."""
         result=reply.get("result")
         if not isinstance(result,dict):return
@@ -128,6 +131,15 @@ class Core(QObject):
         if "active_range" in result:
             bounds=result["active_range"]
             self.active=bounds.get("start") if isinstance(bounds,dict) else None
+            if action=="activate_formula":
+                self.session_source=self.document;self.session_actions=[]
+            elif self.active is None:
+                self.session_source=None;self.session_actions=[]
+            elif action!="state":
+                entry=(action,deepcopy(arguments))
+                if action=="geometry" and self.session_actions and self.session_actions[-1][0]==action:
+                    self.session_actions[-1]=entry
+                else:self.session_actions.append(entry)
 
     def call(self, action, **arguments):
         if self.closed:raise RuntimeError("公式核心已关闭")
@@ -136,28 +148,39 @@ class Core(QObject):
             if self.running():
                 reply=self.exchange(action,arguments,budget)
                 if reply is not None:
-                    self.mirror(reply)
                     if "error" in reply:raise ValueError(reply["error"])
+                    self.mirror(reply,action,arguments)
                     return reply["result"]
             elif not self.problem:self.problem="公式核心已退出"
             if attempt:break
             # One recovery. The request cannot have been applied -- the child died
             # with it or never answered it -- and the session is rebuilt below, so
             # asking again is exactly what the user meant by it.
-            self.dispose();self.restore()
+            self.dispose()
+            if not self.restore():break
         raise RuntimeError(self.describe(action))
 
     def restore(self):
         """A fresh child, put back into the session this window was in.
 
-        The document is the source the child confirmed last and every change
-        since was mirrored from a reply, so replaying `set_source` restores it
-        exactly; a formula session is re-entered afterwards when it was open.
+        Replay the acknowledged actions from the session's original source.
+        Re-parsing the latest source alone loses selections, drafts and cursor
+        paths (and can produce a different tree from the one being edited).
         """
         self.spawn()
-        if self.document is None:return
-        if self.exchange("set_source",{"source":self.document},self.budget("set_source")) is None:return
-        if self.active is not None:self.exchange("activate_formula",{"start":self.active},self.budget("activate_formula"))
+        if self.document is None:return True
+        requests=[("set_source",{"source":self.session_source if self.active is not None else self.document})]
+        if self.active is not None:
+            requests.append(("activate_formula",{"start":self.active}))
+            requests.extend(self.session_actions)
+        for action,arguments in requests:
+            reply=self.exchange(action,arguments,self.budget(action))
+            if reply is None or "error" in reply:
+                if reply is not None:self.problem="恢复公式会话失败："+str(reply["error"])
+                self.dispose();return False
+        if reply.get("result",{}).get("source")!=self.document:
+            self.problem="恢复公式会话后的源码不一致";self.dispose();return False
+        return True
 
     def reason(self):
         live=self.errors.detail() if self.errors else ""

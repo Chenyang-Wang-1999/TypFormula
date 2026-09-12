@@ -30,7 +30,7 @@ pub fn find_tinymist() -> Result<PathBuf, String> {
     Err("未找到 Tinymist；请安装 VS Code Tinymist 扩展，或设置 TINYMIST_BIN".into())
 }
 
-struct DocumentLsp { lsp: Lsp, path: String, source: String, version: i64 }
+struct DocumentLsp { lsp: Lsp, path: String, source: String, version: i64, preview: Value }
 impl DocumentLsp {
     /// The one LSP session, started on first use and reused while the file stays the
     /// same. Both the language methods and the live preview hang off it: Tinymist hosts
@@ -41,7 +41,7 @@ impl DocumentLsp {
             lsp.uri = url::Url::from_file_path(file).map_err(|_|"无效文件 URI")?.into();
             lsp.notify("textDocument/didOpen", json!({"textDocument":{"uri":lsp.uri,"languageId":"typst","version":1,"text":source}}))?;
             lsp.request("workspace/executeCommand", json!({"command":"tinymist.pinMain","arguments":[file]}))?;
-            *slot = Some(DocumentLsp { lsp, path: path.into(), source: source.into(), version: 1 });
+            *slot = Some(DocumentLsp { lsp, path: path.into(), source: source.into(), version: 1, preview: Value::Null });
         }
         let session = slot.as_mut().unwrap();
         if session.source != source {
@@ -78,9 +78,15 @@ impl Services {
                     // Tinymist's own client does it. `--data-plane-host 127.0.0.1:0` asks
                     // the OS to pick a free port, so two windows never collide.
                     let arguments = json!([["--task-id", "typformula", "--data-plane-host", "127.0.0.1:0", file.to_string_lossy()]]);
-                    session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doStartPreview","arguments":arguments}))
+                    let result = session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doStartPreview","arguments":arguments}))?;
+                    session.preview = result.clone();
+                    Ok(result)
                 }
-                "kill" => { session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doKillPreview","arguments":["typformula"]})) }
+                "kill" => {
+                    let result = session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doKillPreview","arguments":["typformula"]}))?;
+                    session.preview = Value::Null;
+                    Ok(result)
+                }
                 other => Err(format!("不支持的预览动作 {other}")),
             }
         })();
@@ -117,7 +123,7 @@ impl Services {
             }
             let diagnostics = if session.lsp.diagnostic_version.is_none_or(|v|v == session.version) { session.lsp.diagnostics.clone() } else { json!([]) };
             let root_uri=url::Url::from_directory_path(&self.workspace).map_err(|_|"无效项目目录")?;
-            Ok(json!({"result":value,"legend":session.lsp.semantic_legend,"diagnostics":diagnostics,"version":session.version,"uri":session.lsp.uri,"rootUri":root_uri.as_str()}))
+            Ok(json!({"result":value,"legend":session.lsp.semantic_legend,"diagnostics":diagnostics,"version":session.version,"uri":session.lsp.uri,"rootUri":root_uri.as_str(),"preview":session.preview}))
         })();
         if result.is_err() { *guard = None; }
         result

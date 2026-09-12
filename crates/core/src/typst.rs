@@ -648,10 +648,7 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             // whether it is centred) follows from that same name.
             if let Some(rows) = slots::command_spec(&name).and_then(|spec| spec.rows) {
                 let row_lengths = match rows {
-                    // `mat` ends a row at each semicolon, so the row widths are whatever
-                    // the punctuation said — they need not agree. `mat(a, b; c)` really is
-                    // a table the engine lays out (two rows, two columns then one), so it
-                    // is one here too.
+                    // Read the original widths first, then pad each short row.
                     "mat" if !args.is_empty() => cells_per_row,
                     // One argument per row, so every row is one cell wide.
                     "mat" => { args = vec![vec![]; NEW_TABLE_CELLS]; vec![NEW_TABLE_COLUMNS; NEW_TABLE_COLUMNS] }
@@ -671,6 +668,9 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
                     row.resize(columns, vec![]);
                     cells.extend(row);
                 }
+                // Padding is a real editable cell in a matrix. All rows must
+                // expose and serialize it, otherwise typing there is discarded.
+                let row_lengths = vec![columns; row_lengths.len()];
                 return vec![MathAtom { kind: Kind::Table { columns, row_lengths, name: name.clone() }, cells }];
             }
             // The name is what says whether the editor has a shape for this call at
@@ -879,10 +879,8 @@ pub fn write_atom(atom: &MathAtom) -> String {
         },
         Write::Matrix => match &atom.kind {
             Kind::Table { columns, row_lengths, name } => {
-                // One writer for every table. The command name is the callee, the row
-                // convention is the difference between them, and `row_lengths` is what
-                // keeps a ragged row ragged: cells are padded to `columns` for layout,
-                // so the padding has to be trimmed back off here.
+                // Every matrix cell is real, including the empty cells used to
+                // pad short input rows. Serialize the complete rectangle.
                 //
                 // An empty cell writes as *nothing* — `write_cell` answers a quoted empty
                 // string for one, which is how a text run spells it, and `mat(a, ; c, d)`
@@ -895,7 +893,7 @@ pub fn write_atom(atom: &MathAtom) -> String {
                 let separator = if rows == Some("mat") { "; " } else { ", " };
                 let last_row = row_lengths.len().saturating_sub(1);
                 let body = atom.cells.chunks(*columns).enumerate().map(|(r, row)| {
-                    let used = row_lengths.get(r).copied().unwrap_or(row.len()).min(row.len());
+                    let used = row.len();
                     row[..used].iter().enumerate().map(|(i, cell)| {
                         if !cell.is_empty() { write_cell(cell) }
                         else if r == last_row && i + 1 == used { "\"\"".to_string() }

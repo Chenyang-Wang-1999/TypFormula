@@ -18,6 +18,7 @@ from .mathview import Typesetter,MathCanvas
 from .svg import qt_svg
 from .rawcache import RawCache,signature,reusable,raw_key,signature_digest
 from .incremental import merge as incremental_merge
+from .definitions import blocks as definition_blocks, DefinitionDraft
 
 def initial_window_geometry(available):
     """Fit and center a top-level window inside one screen's work area."""
@@ -53,6 +54,7 @@ class Window(QMainWindow):
         self.history=[];self.future=[];self.revision=0;self.analysis={};self.math_state=None
         self.semantic_spans=[];self.engine_spans=[]
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
+        self.definition_draft=None
         self.settings=load_settings();self.typesetter=Typesetter(self.settings);self.typesetter.warn=self.report
         self.raw_cache=RawCache();self.raw_pending=set()
         # (analysis, {render_id prefix -> digest of the script shape}) for the fragments
@@ -93,7 +95,7 @@ class Window(QMainWindow):
         # started here. `preview_dock` holds the web view once `set_preview(True)` runs.
         self.preview_dock=QDockWidget("实时预览",self);self.preview_dock.hide()
         self.addDockWidget(Qt.RightDockWidgetArea,self.preview_dock)
-        self.preview_view=None;self.preview_started=False
+        self.preview_view=None;self.preview_started=False;self.preview_enabled=False;self.preview_token=0;self.preview_pending=False
         # Kept off-window only for explicit SVG export; the live preview is the dock above.
         self.math_scroll=QScrollArea(self.editor.viewport());self.math_scroll.setWidgetResizable(False)
         self.math_canvas=MathCanvas(self);self.math_scroll.setWidget(self.math_canvas);self.math_scroll.hide()
@@ -171,18 +173,20 @@ class Window(QMainWindow):
     def body(self):return {"path":self.path.name if self.path else "untitled.typ","source":self.source,"raw":[],"formulas":[],"overlays":{}}
 
     def load(self,path=None):
-        self.finish_formula(focus=False)
+        if not self.finish_formula(focus=False):return
         if path:
             path=Path(path).resolve()
             with path.open("r",encoding="utf-8-sig",newline="") as stream:text=stream.read()
             self.newline="\r\n" if "\r\n" in text else "\n";text=text.replace("\r\n","\n")
         else:text="";self.newline="\n"
+        self.stop_preview()
         self.path=path;self.source=text;self.saved=text;self.history=[];self.future=[];self.semantic_spans=[];self.engine_spans=[]
         self.typesetter.cache.clear();self.typesetter.svg.clear();self.typesetter.placements.clear();self.typesetter.glyphs.clear();self.ensure_services()
         self.core.call("set_source",source=text)
         self.analysis=self.core.call("analyze");self.bind_formula_ids({},self.analysis);self.raw_cache.edits.clear();self.load_glyphs();self.raw_cache.rebind({},self.analysis);self.raw_pending.clear();self.revision+=1
         for editor in self.editors:editor.expanded.clear()
         self.project((0,0));self.compile_timer.start()
+        if self.preview_enabled:self.start_preview()
 
     def project(self,selection=None,schedule_raw=True,incremental=False):
         self.loading=True
@@ -221,6 +225,42 @@ class Window(QMainWindow):
         """
         loading=self.loading;self.loading=True
         self.apply_highlights();self.sync_source_lines();self.loading=loading
+
+    def projected_objects(self):
+        return self.analysis.get('formulas',[])+self.definition_blocks()
+
+    def definition_blocks(self):
+        return definition_blocks(self.source,self.analysis.get('styles',[]),self.analysis.get('formulas',[]))
+
+    def open_definitions(self,block,editor,last=False):
+        if not self.finish_formula(focus=False):return
+        self.definition_draft=DefinitionDraft(self,editor,block,last)
+        editor.project(schedule_raw=False);self.reposition_definitions()
+        self.definition_draft.show();self.definition_draft.source.setFocus()
+
+    def reposition_definitions(self):
+        draft=self.definition_draft
+        if draft is None:return
+        cursor=QTextCursor(draft.editor.document())
+        cursor.setPosition(draft.editor.mapping.display_position(draft.start))
+        rect=draft.editor.cursorRect(cursor)
+        draft.setGeometry(rect.x(),rect.y(),draft.content_width(),draft.content_height())
+        draft.raise_()
+
+    def cancel_definitions(self):
+        draft=self.definition_draft
+        if draft is None:return
+        self.definition_draft=None;draft.hide();draft.deleteLater()
+        draft.editor.project((draft.end,draft.end),schedule_raw=False);draft.editor.setFocus()
+
+    def confirm_definitions(self):
+        draft=self.definition_draft
+        if draft is None:return
+        text=draft.source.toPlainText();a,b=draft.start,draft.end
+        if self.source[a:b]!=draft.original:
+            self.report('宏定义原文已变化，请取消后重新打开');return
+        self.cancel_definitions()
+        self.replace(a,b,text)
 
     def mirror_scroll(self,source):
         """Keep the dock and the editor on the same lines.
@@ -293,6 +333,12 @@ class Window(QMainWindow):
         reparsed=(self.math_state if core_current else state).get('reparsed_range',{'start':0,'end':len(self.source.encode('utf-8'))})
         self.last_reparsed=reparsed
         syntax=self.core.call("scan")
+        binding_text=lambda analysis:[s.get('text','') for s in analysis.get('styles',[]) if s['kind']=='let']
+        if binding_text(self.analysis)!=binding_text(syntax):
+            # A confirmed definition edit changes even an identically spelled
+            # macro call's image. Plain prose edits keep these caches intact.
+            self.typesetter.cache.clear();self.typesetter.svg.clear()
+            self.typesetter.placements.clear();self.typesetter.glyphs.clear();self.typesetter.touch()
         candidate,rebuild=incremental_merge(self.analysis,syntax,self.source,byte_start,byte_end,replacement,reparsed)
         for target in rebuild:
             formula=self.core.call("analyze_formula",start=target)
@@ -347,7 +393,8 @@ class Window(QMainWindow):
     def source_changed(self):
         if self.loading:return
         text=self.source_view.toPlainText();position=from_u16(text,self.source_view.textCursor().position())
-        self.replace(0,len(self.source),text,True)
+        a,b,replacement=difference(self.source,text)
+        self.replace(a,b,replacement,True)
         cursor=self.source_view.textCursor();cursor.setPosition(u16(text[:position]));self.source_view.setTextCursor(cursor)
         if re.search(r'[#.\w]$',text[:position]):self.completion_timer.start()
 
@@ -362,10 +409,16 @@ class Window(QMainWindow):
         self.analysis=self.update_analysis(old_source,a,b,text);self.raw_cache.rebind(old,self.analysis)
         for editor in self.editors:editor.expanded.clear()
         self.project(selection,incremental=True);self.compile_timer.start()
-    def undo(self):self.restore(self.history,self.future)
-    def redo(self):self.restore(self.future,self.history)
+    def undo(self):
+        if self.definition_draft is not None:self.definition_draft.source.undo()
+        else:self.restore(self.history,self.future)
+    def redo(self):
+        if self.definition_draft is not None:self.definition_draft.source.redo()
+        else:self.restore(self.future,self.history)
 
     def activate(self,start,editor=None,position=None,last=False):
+        block=next((b for b in self.definition_blocks() if b['start']==start),None)
+        if block is not None:self.open_definitions(block,editor or self.focused_editor(),last);return
         if not self.finish_formula(focus=False):return
         editor=editor or self.focused_editor()
         state=self.core.call("activate_formula",start=start);self.math_state=state;self.active_editor=editor
@@ -408,6 +461,7 @@ class Window(QMainWindow):
             if state['cursor']==previous['cursor']:self.exit_formula(arrow)
 
     def reposition_math(self,*args):
+        self.reposition_definitions()
         if not self.math_state or not self.active_editor:return
         editor=self.active_editor;cursor=QTextCursor(editor.document())
         cursor.setPosition(min(self.active_position,editor.document().characterCount()-1));rect=editor.cursorRect(cursor)
@@ -416,6 +470,8 @@ class Window(QMainWindow):
         self.math_scroll.setGeometry(max(0,min(rect.x(),editor.viewport().width()-width)),max(0,rect.y()),width,height)
 
     def finish_formula(self,focus=True):
+        if self.definition_draft is not None:
+            self.report('请先确认或取消宏定义草稿');return False
         if not self.math_state:return True
         if self.math_state.get("pending"):
             self.report("请先确认或取消公式命令草稿");return False
@@ -478,12 +534,17 @@ class Window(QMainWindow):
                 if current!=self.saved:
                     QMessageBox.warning(self,"文件在外部已修改","为保留外部修改，请使用另存为保存当前版本。");return False
             atomic_write(path,self.source.replace("\n",self.newline).encode("utf-8"))
-            self.path=path;self.saved=self.source;self.ensure_services();self.project();self.compile_timer.start();return True
+            changed_path=path!=self.path
+            if changed_path:self.stop_preview()
+            self.path=path;self.saved=self.source;self.ensure_services();self.project();self.compile_timer.start()
+            if changed_path and self.preview_enabled:self.start_preview()
+            return True
         except Exception as error:QMessageBox.warning(self,"保存失败",str(error));return False
 
     def split(self):
+        if not self.finish_formula():return
         if len(self.editors)>1:
-            self.finish_formula();other=self.editors.pop();other.setParent(None);other.deleteLater()
+            other=self.editors.pop();other.setParent(None);other.deleteLater()
         else:
             editor=Editor(self);self.editors.append(editor);self.splitter.addWidget(editor);editor.project((0,0))
             editor.verticalScrollBar().valueChanged.connect(self.reposition_math)
@@ -736,6 +797,11 @@ class Window(QMainWindow):
             # A language service that is not running is not a document error: the marks
             # simply stay as they were rather than reporting on every keystroke.
             if error or revision!=self.revision:return
+            if self.preview_enabled and not self.preview_pending and "preview" in reply and reply["preview"] is None:
+                # A new Tinymist session has no preview, even if the pane still
+                # holds the previous process's URL.
+                self.preview_started=False
+                self.start_preview()
             self.mark_diagnostics(reply.get("diagnostics") or [])
         self.lsp.request("/api/lsp",self.body()|{"method":"diagnostics","position":{"line":0,"character":0}},done,key="diagnostics")
 
@@ -944,6 +1010,7 @@ class Window(QMainWindow):
         therefore kills the preview rather than leaving one compiling in the background,
         which is what "只有开启时才渲染" asks for.
         """
+        self.preview_enabled=on
         if not on:
             self.preview_dock.hide()
             self.stop_preview()
@@ -962,10 +1029,14 @@ class Window(QMainWindow):
         what keeps a stale reply from loading a preview of a document that has moved on —
         the same guard `compile` uses for its pages.
         """
-        if self.preview_started or not self.services or self.preview_widget() is None:return
+        if self.preview_started or not self.lsp or self.preview_widget() is None:return
         self.preview_started=True
+        self.preview_pending=True
+        self.preview_token+=1;token=self.preview_token
         revision=self.revision
         def started(result,error):
+            if token!=self.preview_token:return
+            self.preview_pending=False
             if error:
                 self.preview_started=False;self.report("实时预览启动失败："+error);return
             target=preview.url(result)
@@ -974,14 +1045,16 @@ class Window(QMainWindow):
             self.preview_revision=revision
             self.preview_widget().load(target)
             self.report("实时预览已开启")
-        self.services.request("/api/preview/live",self.body()|{"action":"start"},started)
+        self.lsp.request("/api/preview/live",self.body()|{"action":"start"},started)
 
     def stop_preview(self):
         """Stop Tinymist's preview, if one is running. Safe to call when none is."""
         if not self.preview_started:return
+        self.preview_token+=1
         self.preview_started=False
+        self.preview_pending=False
         if self.preview_view is not None:self.preview_view.setUrl(QUrl("about:blank"))
-        if self.services:self.services.request("/api/preview/live",self.body()|{"action":"kill"},lambda result,error:None)
+        if self.lsp:self.lsp.request("/api/preview/live",self.body()|{"action":"kill"},lambda result,error:None)
 
     def compile(self,callback=None):
         revision=self.revision
@@ -1244,6 +1317,9 @@ class Window(QMainWindow):
                 selection.cursor.setPosition(convert(a));selection.cursor.setPosition(convert(b),QTextCursor.KeepAnchor)
                 selection.format=fmt;selections.append(selection)
             editor.setExtraSelections((editor.base_selections if isinstance(editor,Editor) else [])+selections)
+            # Definition sources are painted inside text objects, so their token
+            # colours must repaint even when a span maps to one collapsed position.
+            editor.viewport().update()
 
     def find_replace(self):
         dialog=QDialog(self);dialog.setWindowTitle("查找 / 替换 Typst 源码")

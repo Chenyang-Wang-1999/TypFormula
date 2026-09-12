@@ -168,23 +168,14 @@ fn grid_atoms_round_trip() {
     }
 }
 
-/// A matrix's rows need not be the same width, and a deliberately blank cell has to
-/// survive that.
-///
-/// The editor used to refuse `mat(a, b; c)` outright, on the stated grounds that Typst
-/// cannot lay it out. That is untrue — measured against the engine it is two rows of two
-/// and one, `43.008pt` tall, the same as `mat(1, 2; 3, 4)` — and **no test covered the
-/// refusal**, so nothing failed when it went. `row_lengths` is what makes the second
-/// case safe: trimming trailing empty cells instead would rewrite `mat(a, ; c, d)` (two
-/// columns, one deliberately blank) as the ragged `mat(a; c, d)`, which means something
-/// else entirely.
+/// Short matrix rows are padded with real, editable empty cells.
 #[test]
-fn a_matrix_may_have_rows_of_different_widths() {
+fn a_matrix_pads_short_rows_with_empty_cells() {
     let editor = load("mat(a, b; c)");
     assert!(
         matches!(&editor.root[0].kind, Kind::Table { columns: 2, row_lengths, name }
-                 if row_lengths == &vec![2, 1] && name == "mat"),
-        "mat(a, b; c) 应当是两列、行宽 [2, 1] 的表，实际是 {:?}",
+                 if row_lengths == &vec![2, 2] && name == "mat"),
+        "mat(a, b; c) 应当是两列、行宽 [2, 2] 的表，实际是 {:?}",
         editor.root[0].kind
     );
     // A blank cell that is not trailing padding has to come back as a blank cell.

@@ -46,7 +46,7 @@ fn scan_syntax(document:&Document,classify:bool)->(Vec<(usize,usize,&'static str
         let end = at + node.len();
         let kind = node.kind();
         if kind == SyntaxKind::LetBinding {
-            styles.push(json!({"kind":"let","start":at,"end":end}));
+            styles.push(json!({"kind":"let","start":at,"end":end,"text":node.full_text()}));
             if classify {
                 // **Every** `#let` body is source, whatever it contains — a `$$` written
                 // inside one is never a formula box.

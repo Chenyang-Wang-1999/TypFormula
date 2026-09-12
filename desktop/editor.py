@@ -102,7 +102,7 @@ class Editor(QTextEdit):
         if selection is None:selection=self.source_selection()
         scroll=self.verticalScrollBar().value()
         source=self.owner.source
-        self.mapping=Projection(source,() if self.source_only else self.owner.analysis.get("formulas",[]),self.expanded)
+        self.mapping=Projection(source,() if self.source_only else self.owner.projected_objects(),self.expanded)
         self.clear();font=QFont(self.owner.settings["font_family"]);font.setPointSizeF(self.owner.settings["font_size"])
         self.setFont(font);self.document().setDefaultFont(font)
         cursor=QTextCursor(self.document());cursor.insertText(self.mapping.text)
@@ -111,7 +111,7 @@ class Editor(QTextEdit):
     def incremental_project(self,selection=None,schedule_raw=True,reparsed=None):
         if selection is None:selection=self.source_selection()
         scroll=self.verticalScrollBar().value();source=self.owner.source
-        projected=Projection(source,() if self.source_only else self.owner.analysis.get('formulas',[]),self.expanded)
+        projected=Projection(source,() if self.source_only else self.owner.projected_objects(),self.expanded)
         current=self.toPlainText()
         a,b,replacement=difference(current,projected.text)
         self.loading=True

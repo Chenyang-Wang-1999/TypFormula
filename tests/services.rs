@@ -89,6 +89,9 @@ fn tinymist_serves_the_live_preview_on_the_ports_it_reports() {
     assert!(page.starts_with("HTTP/1.1 200") || page.starts_with("HTTP/1.0 200"), "static server must answer 200: {}", &page[..page.len().min(200)]);
     assert!(page.contains("<html") && page.contains("WebSocket"), "the served page is the preview application");
 
+    let synced=service.language(serde_json::json!({"path":"main.typ","source":"= Updated preview\n\nChanged text.","method":"diagnostics"})).unwrap();
+    assert_eq!(synced["preview"],start,"source synchronization must use the live preview's session");
+    assert_eq!(synced["version"],2);
     service.preview(serde_json::json!({ "path": "main.typ", "source": "", "action": "kill" }))
         .unwrap_or_else(|error| panic!("doKillPreview failed: {error}"));
     // The port must stop answering once the preview is killed, or a closed pane would

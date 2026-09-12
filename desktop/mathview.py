@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import QWidget, QApplication, QInputDialog
 from . import mathfont
 from . import rawcache
 from .svg import qt_svg
+from .definitions import source_document
 
 OBJECT = QTextFormat.UserObject + 1
 OBJECT_ID = QTextFormat.UserProperty + 1
@@ -451,11 +452,9 @@ class Typesetter:
                 text, draw_font, width = self.run(glyph, factor, substituted=True)
                 box = Box(width, em, ascent, [("text", 0, ascent, (text, draw_font, kind))])
         elif kind in ("table","multiline"):
-            # A ragged row is padded to `columns` for the flat cell list, so the
-            # padding has to be dropped here or the source would appear to have cells it
-            # does not: `mat(a, b; c)` is a two-cell row and a one-cell row, not three
-            # cells and an empty slot.
-            lengths=node.get("row_lengths") or []
+            # Alignment rows keep their own widths. Matrix padding is visible
+            # and editable, just like every other empty matrix cell.
+            lengths=(node.get("row_lengths") or []) if kind=="multiline" else []
             cells=[]
             for i,child in enumerate(children):
                 row,col=divmod(i,max(1,node.get("columns",1)))
@@ -656,6 +655,13 @@ class FormulaObject(QObject,QTextObjectInterface):
         (`typesetter.version`).
         """
         typesetter=self.editor.owner.typesetter
+        if formula.get('definition_block'):
+            draft=self.editor.owner.definition_draft
+            if draft is not None and draft.editor is self.editor and draft.block['start']==formula['start']:
+                return Box(draft.content_width(),draft.content_height(),18)
+            document=source_document(self.editor,formula)
+            size=document.size()
+            return Box(size.width(),size.height(),self.editor.fontMetrics().ascent())
         signature=(typesetter.version,typesetter.settings_signature())
         if signature!=self.signature:self.boxes.clear();self.signature=signature
         view=formula["view"]
@@ -678,9 +684,14 @@ class FormulaObject(QObject,QTextObjectInterface):
         node=self.editor.object_by_id.get(format.property(OBJECT_ID))
         if not node:return
         painter.save();painter.setClipRect(rect)
-        painter.fillRect(rect,QColor("#f1f6fb"))
+        painter.fillRect(rect,QColor("#ffffff" if node.get('definition_block') else "#f1f6fb"))
         painter.setPen(QColor("#c8d6e2"));painter.drawRoundedRect(rect.adjusted(.5,.5,-.5,-.5),2,2)
-        self.editor.owner.typesetter.paint(painter,self.box(node),rect.x()+4,rect.y()+3)
+        if node.get('definition_block'):
+            draft=self.editor.owner.definition_draft
+            if draft is None or draft.editor is not self.editor or draft.block['start']!=node['start']:
+                painter.translate(rect.x()+4,rect.y()+3)
+                source_document(self.editor,node).drawContents(painter)
+        else:self.editor.owner.typesetter.paint(painter,self.box(node),rect.x()+4,rect.y()+3)
         painter.restore()
 
 class MathCanvas(QWidget):

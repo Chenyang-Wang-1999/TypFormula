@@ -2,6 +2,22 @@ use typformula::document::Document;
 use serde_json::json;
 fn load(source:&str)->Document {let mut doc=Document::default();doc.apply(json!({"action":"set_source","source":source})).unwrap();doc}
 #[test]
+fn padded_matrix_cells_are_written_and_survive_reentry() {
+    for (source, cell, expected) in [("$mat(a, b; c)$",3,"$mat(a, b; c, z)$"), ("$mat(a; b, c)$",1,"$mat(a, z; b, c)$")] {
+        let mut doc=load(source);
+        doc.apply(json!({"action":"activate_formula","start":0})).unwrap();
+        assert_eq!(doc.source(),source,"activation does not rewrite source");
+        doc.apply(json!({"action":"click","cursor":{"slices":[{"atom":0,"cell":cell-1}],"pos":1}})).unwrap();
+        doc.apply(json!({"action":"key","key":"Tab"})).unwrap();
+        assert_eq!(doc.editor.cursor.slices[0].cell,cell);
+        doc.apply(json!({"action":"input","text":"z"})).unwrap();
+        assert_eq!(doc.source(),expected);
+        doc.apply(json!({"action":"deactivate_formula"})).unwrap();
+        doc.apply(json!({"action":"activate_formula","start":0})).unwrap();
+        assert_eq!(typformula_core::typst::write_cell(&doc.editor.root[0].cells[cell]),"z");
+    }
+}
+#[test]
 fn normal_source_is_lossless_even_when_incomplete() {
     for text in ["", "中文😀\r\n#let x = (", "// $not$\n`$raw$`\n$x$", "$ a/b $\n$x$"] {
         let mut doc=load(text);assert_eq!(doc.source(),text);assert!(doc.active.is_none());
@@ -148,4 +164,3 @@ fn a_definition_confirmed_inside_a_formula_reclassifies_the_whole_cell() {
     assert_eq!(response["view"]["children"][1]["kind"],json!("raw"));
     assert_eq!(doc.source(),"#let twice(a, b) = $ #a + #b $\n$ twice(1, 2) $","the document itself is untouched");
 }
-

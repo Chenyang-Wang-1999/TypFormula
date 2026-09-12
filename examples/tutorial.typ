@@ -17,6 +17,9 @@ $ pi = 4 sum_(n = 0)^(oo) frac((- 1)^(n), 2 n + 1) = 1 - frac(1, 3) + frac(1, 5)
 
 宏定义中的公式也可以转为公式框：
 
-    #let mathbf(x) = $upright(bold(#x))$
-    
-$ mathbf(F) = m mathbf(a) $
+#[
+#let pd(x) = $bold(#x)$
+
+]
+
+

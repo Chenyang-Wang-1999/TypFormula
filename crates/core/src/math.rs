@@ -117,14 +117,9 @@ pub enum Kind {
     /// every call whose shape its name fully describes is stored as a `MacroCall` and
     /// looks its shape up in `config/commands.json`.
     ///
-    /// `row_lengths` records how many cells each row really had before the flat list
-    /// was padded to `columns`, exactly as `Multiline` does. Rows need not be equal:
-    /// the editor used to refuse a ragged `mat(a, b; c)` as "not a table Typst can lay
-    /// out", which is simply untrue — measured against the engine it is two rows of two
-    /// and one, `43.008pt` tall, the same as `mat(1, 2; 3, 4)`. Without this the writer
-    /// would have to guess where a row ends, and trimming trailing empty cells would
-    /// turn `mat(a, ; c, d)` — two columns, one deliberately blank — into the ragged
-    /// `mat(a; c, d)`.
+    /// Short input rows are padded with editable empty cells. `row_lengths`
+    /// therefore contains `columns` for every row; unlike `Multiline`, a matrix
+    /// always displays and writes its complete rectangle.
     ///
     /// `name` is the command that built it, because the shape does not imply the
     /// spelling: `vec(a, b)` and `mat(a; b)` lay out to the same table and must still

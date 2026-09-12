@@ -95,8 +95,103 @@ class NativeTest(unittest.TestCase):
 
     def test_opaque_macro_stays_code_and_loaded_formula_folds(self):
         self.load("#let opaque(x) = $lr(#x, size: #100%)$\n$opaque(y)$")
-        self.assertEqual(len(self.window.editor.object_data),1)
-        self.assertIn("$lr(#x, size: #100%)$",self.window.editor.toPlainText())
+        self.assertEqual(len(self.window.editor.object_data),2)
+        self.assertNotIn("$lr(#x, size: #100%)$",self.window.editor.toPlainText())
+        self.window.editor.selectAll()
+        self.assertEqual(self.window.editor.createMimeDataFromSelection().text(),self.window.source)
+
+    def test_definition_block_drafts_commit_once_and_cancel_without_updating(self):
+        source='#let dbl(x) = $#x + 1$\n#let value = 2\n\n正文 $dbl(a)$'
+        self.load(source);window=self.window
+        block=next(f for f in window.editor.object_data.values() if f.get('definition_block'))
+        self.assertEqual(block['count'],2)
+        history=len(window.history);revision=window.revision
+        window.activate(block['start'])
+        self.assertIsNotNone(window.definition_draft)
+        with patch.object(window.core,'call',wraps=window.core.call) as calls:
+            window.definition_draft.source.setPlainText('#let dbl(x) = $#x - 1$\n#let value = 2')
+            self.assertEqual(window.source,source);self.assertEqual(window.revision,revision)
+            self.assertEqual(calls.call_count,0)
+        window.cancel_definitions();self.assertEqual(window.source,source)
+        window.activate(block['start'])
+        window.definition_draft.source.setPlainText('#let dbl(x) = $#x - 1$\n#let value = 2')
+        window.confirm_definitions()
+        self.assertIsNone(window.definition_draft)
+        self.assertIn('#x - 1',window.source);self.assertEqual(len(window.history),history+1)
+        window.undo();self.assertEqual(window.source,source)
+
+    def test_definition_block_displays_full_source_with_editor_token_colours(self):
+        from .definitions import source_document
+        source='#let caption = "中文😀"\n#let twice(x) = $x + x$\n\n$twice(a)$'
+        self.load(source);window=self.window;editor=window.editor
+        block=next(f for f in editor.object_data.values() if f.get('definition_block'))
+        expected=source[:from_byte(source,block['end'])]
+        quoted=source.index('"');end=source.index('"',quoted+1)+1
+        window.semantic_spans=[(1,4,'#8250a3'),(quoted,end,'#267349')]
+        window.apply_highlights()
+        document=source_document(editor,block)
+        self.assertEqual(document.toPlainText(),expected)
+        self.assertEqual(document.defaultFont(),editor.font())
+        self.assertIs(source_document(editor,block),document)
+        def colour_at(doc,position):
+            cursor=QTextCursor(doc);cursor.setPosition(position)
+            cursor.setPosition(position+1,QTextCursor.KeepAnchor)
+            return cursor.charFormat().foreground().color().name()
+        self.assertEqual(colour_at(document,1),'#8250a3')
+        self.assertEqual(colour_at(document,u16(source[:quoted])),'#267349')
+        window.semantic_spans=[(1,4,'#146ba0')];window.apply_highlights()
+        self.assertEqual(colour_at(source_document(editor,block),1),'#146ba0')
+        self.assertEqual(window.source,source)
+
+    def test_definition_source_wraps_long_lines_without_truncation(self):
+        from .definitions import source_document
+        source='#let caption = "'+('字😀'*80)+'"'
+        self.load(source);editor=self.window.editor;editor.resize(240,400)
+        block=next(f for f in editor.object_data.values() if f.get('definition_block'))
+        document=source_document(editor,block)
+        self.assertEqual(document.toPlainText(),source)
+        self.assertLessEqual(document.size().width(),max(72,editor.viewport().width()-50))
+        self.assertGreater(document.size().height(),editor.fontMetrics().lineSpacing()*2)
+        self.assertAlmostEqual(editor.handler.box(block).height,document.size().height())
+
+    def test_plain_context_edit_keeps_macro_definition_block_and_distant_view(self):
+        source='正文\n\n#let dbl(x) = $#x + 1$\n\n'+('paragraph\n\n'*6)+'$dbl(a)$'
+        self.load(source);window=self.window
+        before=signature(window.analysis['formulas'][-1]['view'])
+        with patch.object(window.core,'call',wraps=window.core.call) as calls:
+            window.replace(0,0,'新')
+        targets=[c.kwargs.get('start') for c in calls.call_args_list if c.args[0]=='analyze_formula']
+        self.assertNotIn(window.analysis['formulas'][-1]['start'],targets)
+        self.assertEqual(signature(window.analysis['formulas'][-1]['view']),before)
+
+    def test_matrix_padding_is_visible_and_editable(self):
+        self.load('$mat(a, b; c)$');window=self.window
+        window.activate(0)
+        cursors=[s[3] for s in window.math_canvas.box.stops]
+        target=next(c for c in cursors if c['slices'] and c['slices'][-1]['cell']==3)
+        window.math_action('click',cursor=target);window.math_action('input',text='z')
+        self.assertEqual(window.source,'$mat(a, b; c, z)$')
+        window.finish_formula();window.activate(0)
+        self.assertIn('z',str(window.math_state['view']))
+
+    def test_definition_block_enters_by_arrows_and_enter_commits(self):
+        from PyQt5.QtGui import QKeyEvent
+        source='before\n#let dbl(x) = $#x + 1$\nafter $dbl(a)$'
+        self.load(source);window=self.window;editor=window.editor
+        block=next(f for f in editor.object_data.values() if f.get('definition_block'))
+        for key,position in [(Qt.Key_Right,block['start']),(Qt.Key_Left,block['end']),
+                             (Qt.Key_Down,0),(Qt.Key_Up,block['end']+1)]:
+            editor.project((position,position))
+            APPLICATION.sendEvent(editor,QKeyEvent(6,key,Qt.NoModifier))
+            self.assertIsNotNone(window.definition_draft,f'arrow {key} must enter the definition block')
+            self.assertLess(window.definition_draft.content_height(),100)
+            APPLICATION.sendEvent(window.definition_draft.source,QKeyEvent(6,Qt.Key_Escape,Qt.NoModifier))
+            self.assertEqual(window.source,source)
+        window.activate(block['start'])
+        draft=window.definition_draft.source
+        draft.setPlainText('#let dbl(x) = $#x - 1$')
+        APPLICATION.sendEvent(draft,QKeyEvent(6,Qt.Key_Return,Qt.NoModifier))
+        self.assertIsNone(window.definition_draft);self.assertIn('#x - 1',window.source)
 
     def test_formula_session_edits_authoritative_source(self):
         self.load("Before $a/b$ after")
@@ -919,14 +1014,14 @@ class NativeTest(unittest.TestCase):
             if route=='/api/preview/live' and body.get('action')=='start':
                 callback({'staticServerPort':38251,'dataPlanePort':38251,'isPrimary':True},None)
             else:callback({},None)
-        with patch.object(window.services,'request',side_effect=request):
+        with patch.object(window.lsp,'request',side_effect=request):
             self.assertFalse(window.preview_started,'没有开启时不该有预览在跑')
             window.set_preview(True)
         self.assertIn(('/api/preview/live','start'),asked,'开启时才向 Tinymist 要预览')
         self.assertEqual(len(loaded),1,'按回复里的地址加载预览页')
         # The page and its WebSocket share a port, so the reply's address is the whole URL.
         self.assertIn('38251',loaded[0])
-        with patch.object(window.services,'request',side_effect=request):
+        with patch.object(window.lsp,'request',side_effect=request):
             window.set_preview(False)
         self.assertIn(('/api/preview/live','kill'),asked,'关闭时必须停掉 Tinymist 的预览')
         self.assertFalse(window.preview_started,'关闭后不再有预览在跑')
@@ -944,12 +1039,59 @@ class NativeTest(unittest.TestCase):
         def request(route,body,callback,key=None):
             if route=='/api/preview/live' and body.get('action')=='kill':killed.append(route)
             callback({'staticServerPort':1,'dataPlanePort':1,'isPrimary':True},None)
-        with patch.object(window.services,'request',side_effect=request):
+        with patch.object(window.lsp,'request',side_effect=request):
             window.set_preview(True)
             self.assertTrue(window.preview_started)
             events=type('E',(object,),{'ignore':lambda self:None,'accept':lambda self:None})()
             window.closeEvent(events)
         self.assertTrue(killed,'关窗要停掉预览')
+
+    def test_live_preview_shares_sync_and_restarts_after_language_session_loss(self):
+        window=self.window;asked=[];loaded=[];running=[None]
+        class View:
+            def load(self,url):loaded.append(url.toString())
+            def setUrl(self,url):pass
+        window.preview_view=View()
+        def request(route,body,callback,key=None):
+            asked.append((route,body.copy()))
+            if route=='/api/preview/live':
+                running[0]={'staticServerPort':38251,'dataPlanePort':38251} if body['action']=='start' else None
+                callback(running[0] or {},None)
+            else:callback({'diagnostics':[],'preview':running[0]},None)
+        with patch.object(window.lsp,'request',side_effect=request),patch.object(window.services,'request') as render:
+            window.set_preview(True)
+            window.replace(0,len(window.source),'Hello changed')
+            window.request_diagnostics()
+            self.assertEqual(asked[-1][1]['source'],'Hello changed')
+            self.assertEqual(len(loaded),1)
+            running[0]=None
+            window.request_diagnostics()
+            self.assertEqual(len(loaded),2)
+            self.assertEqual(asked[-1][1]['action'],'start')
+            self.assertEqual(asked[-1][1]['source'],'Hello changed')
+            self.assertFalse(any(call.args[0]=='/api/preview/live' for call in render.call_args_list))
+            window.set_preview(False)
+
+    def test_live_preview_ignores_late_start_and_reopens_for_another_file(self):
+        window=self.window;loaded=[];requests=[]
+        class View:
+            def load(self,url):loaded.append(url.toString())
+            def setUrl(self,url):pass
+        window.preview_view=View()
+        # Use files in the current workspace so both requests share the pipe.
+        def request(route,body,callback,key=None):requests.append((route,body.copy(),callback))
+        with patch.object(window.lsp,'request',side_effect=request):
+            window.set_preview(True);old=requests[-1][2]
+            window.set_preview(False)
+            old({'staticServerPort':38251,'dataPlanePort':38251},None)
+            self.assertEqual(loaded,[])
+            window.set_preview(True)
+            with patch.object(Path,'open',return_value=__import__('io').StringIO('New document')):
+                window.load(window.workspace/'another.typ')
+            starts=[body for route,body,_ in requests if route=='/api/preview/live' and body['action']=='start']
+            self.assertEqual(starts[-1]['path'],'another.typ')
+            self.assertEqual(starts[-1]['source'],'New document')
+            window.set_preview(False)
 
     def test_pdf_button_uses_typst_pdf(self):
         self.assertTrue(hasattr(self.window,'preview_dock'),'实时预览有自己的 dock')
@@ -1503,6 +1645,23 @@ while True:
 
 class BridgeTest(unittest.TestCase):
     """One slow or dead helper must not cost the window its formula service."""
+    def test_real_core_recovers_cursor_selection_draft_and_history(self):
+        scenarios=[
+            ([('key',{'key':'End'})],('input',{'text':'z'}),'$a + b z$'),
+            ([('key',{'key':'End'}),('key',{'key':'ArrowLeft','shift':True})],('input',{'text':'z'}),'$a + z$'),
+            ([('key',{'key':'End'}),('input',{'text':'\\sqrt(x)'})],('key',{'key':'Enter'}),'$a + b sqrt(x)$'),
+            ([('key',{'key':'End'}),('input',{'text':'z'})],('undo',{}),'$a + b$'),
+        ]
+        for actions,(action,args),expected in scenarios:
+            with self.subTest(expected=expected):
+                core=Core()
+                try:
+                    core.call('set_source',source='$a + b$');core.call('activate_formula',start=0)
+                    for name,arguments in actions:core.call(name,**arguments)
+                    core.child.kill();core.child.waitForFinished(1000)
+                    self.assertEqual(core.call(action,**args)['source'],expected)
+                finally:core.close()
+
     def scripted(self,script,config):
         """Run a scripted child instead of the real backend; returns the launches."""
         import json,sys
