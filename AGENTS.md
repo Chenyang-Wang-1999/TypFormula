@@ -10,13 +10,13 @@ typformula/
 ├── src/                        外围（host crate `typformula`）：与外界打交道的一切
 │   ├── lib.rs                  模块清单；说明"内核可以没有外围，外围不能没有内核"
 │   ├── main.rs                 两个进程入口：`--desktop-core`（文档+公式会话）、`--stdio <目录>`（服务管道）
-│   ├── document.rs             文档所有权：源码是唯一权威 + 一个活动公式会话；`Document::annotate` 给每个 Raw 算源码区间（`Locator`）
+│   ├── document.rs             文档所有权：源码是唯一权威 + 一个活动公式会话；`document::annotate` 给每个 Raw 算源码区间（`Locator`）
 │   ├── desktop.rs              `--desktop-core` 的协议：`analyze`/`analyze_formula`/`scan`（含 `style_expressions`），一行一个 JSON 动作
 │   ├── rpc.rs                  `--stdio` 的协议：`dispatch` 把请求路由到 services/lsp/packages/preview
 │   ├── services.rs             Tinymist 会话（语言方法**与实时预览**共用）、公式/附件/字形适配器子进程、整页预览与 PDF；`ask_adapter` 是三条适配器请求的公共入口
 │   ├── packages.rs             @preview 包索引检索、下载、解压到 Typst 缓存
 │   └── workspace.rs            工作区内路径解析（拒绝越界）
-├── crates/core/                编辑内核（crate `typformula-core`）：只依赖 `typst-syntax` 与 serde
+├── crates/core/                编辑内核（crate `typformula-core`）：typst-syntax、serde/serde_json、unicode-segmentation
 │   ├── Cargo.toml
 │   ├── build.rs                编译期把 config/*.json 生成成 `COMMANDS`/`SYMBOLS` 表（格式错误直接编译失败）
 │   └── src/
@@ -32,6 +32,8 @@ typformula/
 │   ├── __main__.py             入口：注册随附字体、装异常钩子、开窗口
 │   ├── window.py               主窗口：源码/编辑区投影、公式会话驱动、Raw 取图调度、源码栏、大纲、预览、菜单
 │   ├── editor.py               编辑区控件：自定义公式对象、投影与光标映射、行号、语法高亮
+│   ├── definitions.py          文档内紧凑宏定义块：高亮源码、方向键进入、Enter 提交、Esc 取消
+│   ├── language.py             正文与源码栏的 Tinymist 悬停、符号说明、定义跳转
 │   ├── mathview.py             **公式排版与绘制**：`Typesetter`（Box 布局）、`FormulaObject`（页面里的公式）、`MathCanvas`（公式编辑框）
 │   ├── preview.py              实时预览的接线：QtWebEngine 的 import 顺序约束、从 Tinymist 回复里取页面地址（渲染归 Tinymist）
 │   ├── mathfont.py             字体家族解析与字形映射（`glyph(..., substituted=True)` 是"引擎给的串原样画"的分界）
@@ -50,7 +52,7 @@ typformula/
 │   ├── src/main.rs             单次请求模式 + `--server`；三类请求：映射区间取 SVG / 附件 placement / `glyphs` 取替换后的字形
 │   ├── src/render.rs           FontStore 与 World：把内存源码编译成 SVG/PDF
 │   └── tests/fixtures/sub/     import 相关用例的夹具
-├── config/                     编译期嵌入内核的配置（不需要运行时读取）
+├── config/                     命令/符号表编译期嵌入内核；桌面设置由前端运行时读取
 │   ├── commands.json           14 个命令名 → 形状（`fraction`/`decorated`/`style`/`grid` 等）
 │   ├── symbols.json            40 项符号名 → 显示字形
 │   ├── desktop-settings.json   桌面端默认设置（字号、字体、缩放）
@@ -79,6 +81,9 @@ typformula/
 │   ├── editing-model.md        三层职责的分工：为什么光标与可编辑性不属于 `Shape`
 │   ├── kind-inventory.md       每个 Kind 的能力清单：存储字段、线上字段、引擎 item、缺口
 │   ├── desktop.md              桌面端操作、字体、投影、构建运行与边界
+│   ├── style-raw-macro-review.md  style/raw_macro 修复前的审查记录（当前行为见 architecture.md）
+│   ├── tutorial.typ            编辑器教程文档
+│   ├── Figures/                教程插图
 │   ├── validation.md           按日期记录的实测与修复过程（历史，不改写）
 │   ├── lyx-desktop-rendering-study.md  LyX 的渲染路径调研
 │   ├── rust-for-cpp.md         写给 C++ 背景的 Rust 对照
@@ -87,7 +92,6 @@ typformula/
 ├── vendor/typst/               固定版本的 Typst 引擎（含本项目的数学 IR 标签桥接补丁，见 UPSTREAM.md）
 ├── fonts/                      随附数学字体（NewCM Math 与 NewCM10 Italic）与 NOTICE
 ├── workspace/                  运行时的默认工作目录（未跟踪）
-├── Figures/                    文档插图
 ├── build-desktop.cmd           构建 release 后端 + 适配器，并检查 PyQt5（只构建，不启动）
 ├── start-desktop.cmd           启动窗口（`python -m desktop`）
 ├── Cargo.toml                  根 workspace（成员 `.` 与 `crates/core`；排除 vendor 与 native-adapter）
@@ -97,8 +101,16 @@ typformula/
 
 ### 两条边界
 
-- **内核不依赖外围**：`crates/core` 只用 `typst-syntax` + serde，反向依赖会被 cargo 拒绝。加功能时先问"这属于编辑模型还是属于周边"。
+- **内核不依赖外围**：`crates/core` 的普通依赖为 `typst-syntax`、`serde`、`serde_json`、`unicode-segmentation`，其中 Typst 依赖仅限语法库；未声明 host 依赖，不能直接引用外围模块。加功能时先问"这属于编辑模型还是属于周边"。
 - **只有 `native-adapter` 链接 Typst 编译器**：内核与前端都不链接它；要引擎的数据（字形、附件位置、编译好的 SVG）一律走 `/api/*` 请求。
+
+### 当前实现约定
+
+- 一个窗口持有完整源码、一个活动公式会话，以及各公式的静态 View。正文编辑后按公式源码、定义和作用域变化决定是否请求 `analyze_formula`；视图复用不等于所有渲染数据永不失效。
+- `style` / `raw_macro` 是 View kind，不是存储 `Kind`。style 字形请求的 `definitions` 固定为空，缓存区分 pending、成功（含空串）与失败；raw_macro 通过源码区间取图，模板 raw_macro 片段还区分调用实例。
+- 矩阵逐行补空块至矩形，补出的格子参与显示、导航和回写；Multiline 对齐行仍保留各行列数。正在编辑的空上下标显示 `empty-cell` 和光标，未使用的另一侧显示为 `absent`。
+- 宏定义块的草稿只在 Enter 确认后写回源码并触发更新。正文与源码栏的 LSP 功能在 `language.py` / `window.py` 中接线。
+- 编辑与编译请求走私有 JSON 管道；可选实时预览由 Tinymist 提供本地 HTTP/WebSocket 服务，前端用 QtWebEngine 显示。`/api/*` 是管道路由名，不是 host 的 HTTP 服务。
 
 ### 常用命令
 

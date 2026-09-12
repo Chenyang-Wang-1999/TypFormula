@@ -1,6 +1,6 @@
 # Rust 速成：给 C++ 程序员
 
-面向本项目内核（`src/`、`native-adapter/`）。假设你熟悉 C++11/17：RAII、模板、智能指针、`std::variant`、并发。
+面向本项目 Rust 代码（编辑内核 `crates/core/src/`、host `src/`、独立编译适配器 `native-adapter/`）。假设你熟悉 C++11/17：RAII、模板、智能指针、`std::variant`、并发。
 
 工具链：`rustc 1.98.1`，`edition = "2024"`（见 `Cargo.toml:4`）。edition 决定语法可用性，不是编译器版本——本项目允许 `if let` 链式写法，正是因为 2024。
 
@@ -351,7 +351,7 @@ let kind = match (name.as_str(), args.len()) {
 };
 ```
 
-`("mat", n) if n > 0 && ...` 里的 `if` 是 **match guard**：先按元组匹配名字与参数个数，再检查附加条件（各行列数一致才当矩阵，否则落到 `_` 退化成 Raw）。C++ 的 `switch` 没有这个，得写嵌套 `if`。
+`("mat", n) if n > 0 && ...` 里的 `if` 是 **match guard**：先按元组匹配名字与参数个数，再检查附加条件。这里保留的是旧代码的语法示例；当前矩阵已接受短行并补空块至齐行，不再采用示例中的等宽拒绝条件。C++ 的 `switch` 没有这个，得写嵌套 `if`。
 
 注意 `->` 后面跟 `return`：分支的**类型必须一致**，`_` 分支用 `return` 发散（类型 `!`）才能和其余分支产出的 `Kind` 共存——这是第 20 章 never type 的实际用处。
 
@@ -504,18 +504,18 @@ cargo test -- --nocapture      # 显示 println! 输出
 
 `#[cfg(test)] mod tests`（`document.rs:255`）是单元测试惯例：测试代码和实现同文件，但只在该模块编译进测试时存在。
 
-## 6. 自测题：加一个新的 `Kind`
+## 6. 自测题：扩展一个结构
 
-这是最好的练习，而且直接连着内核扩展性的讨论。按 §1.3 的穷尽性，编译器会带你走完 Rust 侧的每一步——**先改枚举，然后跟着编译错误走**。
+先判断是否需要新的存储 Kind。`cancel` 已通过配置借用 decoration 形状，不适合作为“新增 Kind”的练习；只有现有名字、形状和实例字段无法表达的结构才考虑增加变体。
 
-1. `math.rs:21` 加一个变体，例如 `Cancel`（`\cancel` 斜线）。
-2. `cargo check` → 报错：`view.rs:138` 的 match 不穷尽。补上视图投影。
-3. 再 `cargo check` → 报错：`typst.rs:605` 的 `write_atom` 不穷尽。补上源码回写。
-4. `typst.rs:488` `parse_atom` 加构造分支（**这步编译器不提醒，靠自觉**，忘了就静默退化成 `Raw`）。
-5. 手动检查四处**编译器不管**的：`math.rs:56 entry_cell`、`math.rs:97 idx_horizontal`、`math.rs:65 math_class`。
-6. 前端：`mathview.py` 加布局分支，并让它发出 `stops`（`mathview.py:406`）否则光标进不去。
+1. 阅读 `crates/core/src/math.rs` 的 Kind 与 `slots.rs` 的 Grammar/Shape；若只需配置新名字，先改 `config/commands.json`。
+2. 确实增加 Kind 时，跟随穷尽 match 补全 `Kind::grammar`、`Kind::shape`、`Projector::view_atom` 和写回逻辑。
+3. 在 `typst.rs::parse_atom` 增加可到达的解析入口；编译成功不代表这个入口真的可用。
+4. 在 `editing.rs` 声明导航，核对 role 与形状表；新增可达路径应携带真实 stop，模板材料保持不可达。
+5. 复用现有 View kind 时核对 role/marker；增加 View kind 时同步 `desktop/mathview.py` 的 ARRANGEMENTS 与画法。
+6. 补充存储 Kind 清单、源码往返、导航或绑定测试，用 `tools/kind_inventory.py` 核对实际线上输出，并更新架构文档。
 
-做完你会清楚感受到：Rust 侧有 2 处强制、3 处静默；Python 侧全静默。这正是上一轮讨论的"契约只在一半路程上被强制"。
+编译器检查类型和穷尽匹配；解析可达性、配置语义、光标行为与前后端协议仍需要有针对性的验证。
 
 ## 7. 外部资料
 

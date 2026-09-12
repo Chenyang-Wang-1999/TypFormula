@@ -2,8 +2,8 @@
 //! The editing kernel: the model, its declarations, and the Typst spelling.
 //!
 //! This crate is the half a frontend is written against. It knows nothing about
-//! transports, processes, files or the network — only `typst-syntax` and serde —
-//! so the compiler refuses any dependency back towards the host. That is the
+//! transports, processes, files or the network. Its dependencies are `typst-syntax`,
+//! serde/serde_json and unicode-segmentation, with no dependency on the host. That is the
 //! point of it being a separate crate rather than a module: `pub(crate)` cannot
 //! stop a kernel file from reaching into a host file, a crate boundary can.
 //!

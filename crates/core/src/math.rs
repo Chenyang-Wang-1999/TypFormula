@@ -63,8 +63,8 @@ pub struct MathAtom {
 /// * an *opaque* kind stands in for several `MathKind`s the editor keeps as
 ///   source text (`Raw`, and `Fenced`'s delimiters are strings, not items as in
 ///   `FencedItem`);
-/// * a *split* kind is one whose one Typst construct the editor models with more
-///   than one node (`Sqrt` and `Root` against `Radical`).
+/// * several borrowed shapes may map to one Typst construct (`sqrt` and `root`
+///   against `Radical`); both are stored as `MacroCall`, not separate kinds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Kind {

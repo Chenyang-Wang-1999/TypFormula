@@ -2,7 +2,7 @@
 
 **状态：已实现。** 三层职责已落到代码里：`slots::Grammar` / `slots::Shape` / `crate::editing`。实测记录见 [validation.md](validation.md) 的对应一节。
 
-先读 [architecture.md](architecture.md) 的「槽位模型」一节。本文接手它，但**改变它的结论**：那里曾说 `Decl` 拆成 `Grammar`（语法）+ `Shape`（渲染与编辑），本文论证"编辑"不该在 `Shape` 里——现在已经拆开。
+先读 [architecture.md](architecture.md) 的「槽位模型」一节。本文补充三层职责的设计理由：`Grammar` 管拼写，`Shape` 管形状，编辑规则与实例可达性独立处理；架构文档与当前实现均已采用这一划分。
 
 ## 一、三层
 
@@ -42,7 +42,7 @@
 | | 读者 | 归 |
 | --- | --- | --- |
 | `role` | **前端 `mathview.py` 的 `slot(children, role, index)`**——按角色**摆放**子节点 | **Shape** |
-| `scale`（per-mille） | 前端（分子分母 ×0.9、脚标 ×0.7） | **Shape** |
+| `scale`（per-mille） | 内核中的尺寸声明；当前 View 未传该字段，前端各排布分支另写 ×0.9、×0.7 等比例 | **Shape**（数值尚未跨层统一） |
 | `arity` | box 有几个 item | **Shape** |
 | ~~`optional`~~ | 零读者（死数据，见第四节） | —（已删） |
 
@@ -206,9 +206,9 @@ editing.rs::every_shape_declares_its_editing_rules
 | 模板**不带会话**是类型事实 | 类型级，潜在路径 | 只剩"建的时候传 `None`"这一条纪律 |
 | 定义体投影**一次**而非每调用点一次 | **常数因子**，实测一次 200 原子的投影约 93µs | 每个调用点多花几十微秒；总量被 `projection_size` 门在 4096 节点量级，所以**不是量级差** |
 
-代价也说清：`View` 与 `ViewNode` 两份字段（11 个，编译器守得住）、注册期一次 `ViewTemplate::of` 转换（里面有全项目唯一一处按 `kind` 名字认洞/边）、`editing::RULES` 里多两个中间形状名（`parameter`/`template-call`）。
+代价也说清：`View` 与 `ViewNode` 两份节点字段（需要同步维护）、注册期一次 `ViewTemplate::of` 转换（里面有全项目唯一一处按 `kind` 名字认洞/边）、`editing::RULES` 里多两个中间形状名（`parameter`/`template-call`）。
 
-**一件容易误判、值得写下来的事**：这不是为了让 `Style` 更好修。两种存法下 `command_shape()` 都只看模板自己的 cells，洞都让它答 `None`——所以 `Style` 那个待修的缺陷在两边同样难。真正起作用的是上面第一行：**模板不是 `MathData`，所以"不展开"这件事不靠纪律**。这与这个项目其他几处的做法同类（内核/外围的 crate 边界、`Write::TemplateOnly` 的 `unreachable!`）。
+**一件容易误判、值得写下来的事**：这不是为了让 `Style` 更好修。两种存法下 `command_shape()` 都只看模板自己的 cells，洞都让它答 `None`——所以 style 的绑定时形状判定在两种存法下都需要单独处理。真正起作用的是上面第一行：**模板不是 `MathData`，所以"不展开"这件事不靠纪律**。这与这个项目其他几处的做法同类（内核/外围的 crate 边界、`Write::TemplateOnly` 的 `unreachable!`）。
 
 模板那边曾经另记着一个**不解决**的问题：`Style` 形状判定要看**已绑定**主体的字形串，而判定发生在绑定之前（`has_glyph_run` 对还没填的洞答 `false`）。**已经修好**，而且修法正是这一节说的"挪到实例侧"：
 
@@ -219,7 +219,7 @@ editing.rs::every_shape_declares_its_editing_rules
 * **不需要给模板加"待定"状态。** 折叠节点自带的 `text` 就是那句带洞的拼写，所以"未定"是**既有数据**的表达，不是一个新的变体。这条是设计评审时指出来的：先做过一版 `ViewTemplate::Deferred`，被它取代。
 * **字形请求的键跟着变成绑完之后的拼写**（`bold(upright(u))`）。这本来就是对的——引擎要编译的是表达式本身，而带洞的那句它读不懂。这正是原先那把钥匙打不开门的原因。
 
-## 十、怎样算完成
+## 十、拆分完成时的验收记录
 
 | # | 判据 | 结果 |
 | --- | --- | --- |
@@ -227,7 +227,7 @@ editing.rs::every_shape_declares_its_editing_rules
 | 2 | `Slot.optional` 删除 | 已删，`Slot::blank` 并入 `Slot::scaled` |
 | 3 | 第七节那条对齐测试跨两表继续生效 | `editing.rs` 两条（role 对齐 + 表互为全集） |
 | 4 | 6.1 与 6.2 两条不变量有测试守着，且**先看到失败** | `tests/editing_model.rs`；6.1 一开始就是绿的（构造），6.2 **当时红、现在绿**；6.3（变体按绑完之后的形态画）先红、后绿，并做过变异检查 |
-| 5 | 全绿（搬迁期间行为零变化） | 内核 **143 通过 / 0 失败 / 6 忽略**（6 条都要本机环境：Tinymist ×5、原生渲染器 ×1）+ 适配器 **21** + 桌面 **87**；`kind_inventory.py` 退出码 0 |
+| 5 | 当时全绿（以下为历史计数，后续实测见 validation.md） | 内核 **143 通过 / 0 失败 / 6 忽略**（6 条都要本机环境：Tinymist ×5、原生渲染器 ×1）+ 适配器 **21** + 桌面 **87**；`kind_inventory.py` 退出码 0 |
 | 6 | 状态行改为"已实现"，`validation.md` 追加实测 | 本节与 [validation.md](validation.md) |
 
 ---

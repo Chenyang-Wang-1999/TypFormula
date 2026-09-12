@@ -31,7 +31,9 @@ def raw_key(node):
     stretches to the width of `x`, so the same base source is a different picture
     under a different script. A fragment that sits in a `script` therefore carries
     that script's shape as `_context` (a digest the window stamps), and it is part
-    of the key. Everything else shares one image per source text, wherever it stands.
+    of the key. Template raw_macro fragments with a render_request.call also carry
+    the invocation identity and occurrence, so different arguments get different
+    frames. Ordinary Raw fragments still share by text and script context.
     """
     text=node.get('text','')
     request=node.get('render_request',{})

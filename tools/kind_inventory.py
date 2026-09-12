@@ -57,9 +57,9 @@ CASES = [
     # ... unless an argument is not positional, in which case no cell list can spell the
     # call back and it stays `Raw`.
     ("Raw/named argument", "$lr(x, size: #100%)$", []),
-    # A macro whose body nests two style calls: the shape a `Style` node will have to
-    # survive, and today the nesting happens entirely inside `raw_macro` nodes.
-    ("RawMacro/nested in a macro",
+    # Binding the argument turns the stored raw_macro template into nested style
+    # Views, while retaining the argument's cursor identities.
+    ("Style/nested in a macro",
      "#let mathbf(x) = $bold(upright(#x))$\n$ mathbf(a) $", []),
     ("Fraction", "$frac(a, b)$", []),
     ("Sqrt", "$sqrt(x)$", []),
@@ -99,10 +99,11 @@ CASES = [
     ("primes", "$x'$", []),
 ]
 
-# The `View` fields the frontend can read (`src/view.rs`).
+# Core View fields and host annotation fields the frontend can read.
 WIRE = ["kind", "role", "text", "display_glyph", "columns", "attachment", "edit",
         "definitions", "origin", "source_range", "active", "selected",
-        "marker", "border", "is_mat", "row_lengths"]
+        "marker", "style_name", "border", "is_mat", "row_lengths", "source_text",
+        "render_id", "render_request"]
 
 # Views that belong to a node kind, for the summary. These are the *wire* names
 # `view_atom` emits, which is not always the shape name a `Kind` declares
@@ -111,7 +112,7 @@ WIRE = ["kind", "role", "text", "display_glyph", "columns", "attachment", "edit"
 # `table`/`multiline`/`scripts`.
 VIEW_KINDS = ["char", "symbol", "number", "raw", "unknown", "text", "macro", "raw_macro",
               "macro-argument", "template-call", "parameter", "fraction", "decorated",
-              "root", "scripts", "table", "multiline", "absent"]
+              "root", "scripts", "table", "multiline", "style", "absent"]
 
 
 def call(child, payload):
@@ -179,9 +180,8 @@ def emitted_kinds(view, out):
         emitted_kinds(child, out)
 
 
-# Nodes the frontend builds for itself rather than receiving: a delimiter it draws as a
-# symbol, and the placeholder it substitutes for a missing child. They belong in
-# `ARRANGEMENTS` but no backend view ever carries them.
+# Nodes the frontend can also build for itself: delimiter symbols and missing-child
+# placeholders. The backend may emit these too; they need no separate probe case.
 FRONTEND_MADE = {"symbol", "absent"}
 
 # There used to be a second exception list here: `parameter` and `template-call`, the two
@@ -191,7 +191,7 @@ FRONTEND_MADE = {"symbol", "absent"}
 # and edges are *variants* of the stored type (`crates/core/src/view.rs`,
 # `ViewTemplate`), so there is no node to send and therefore nothing for the frontend to
 # draw. The comparison below is now exact: the frontend draws the names the backend
-# really emits, plus exactly the two it makes itself.
+# really emits, allowing also the nodes it can synthesize itself.
 
 
 def frontend_arrangements():
@@ -263,7 +263,7 @@ def main():
     print("== 排布名双向对照 ==")
     print(f"   后端在这 {len(CASES)} 个用例里真正发出的线名：{len(emitted)} 个")
     print(f"   前端 ARRANGEMENTS 声明：{len(declared)} 个"
-          f"（其中 {sorted(FRONTEND_MADE)} 是前端自造的，后端不发）")
+          f"（其中 {sorted(FRONTEND_MADE)} 也可由前端合成）")
     if missing:
         print(f"   ✗ 前端没有画法的线名：{missing}——会在运行时经 note_unknown 报告")
     if extra:

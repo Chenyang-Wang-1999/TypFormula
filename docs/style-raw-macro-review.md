@@ -1,10 +1,10 @@
 # style / raw_macro 实现审查
 
-后续修复状态：以下八项均已处理。第 1、2 项及第 3 项的在途去重由“公式 View 复用与 style 空定义上下文”一轮完成；本轮完成失败缓存与局部重排、模板片段来源和调用实例匹配、参数光标保留、失败源码修复、活动调用内部取图，以及 UTF-8 诊断坐标。下文保留修复前的复现记录；最新实测见 validation.md。
+后续修复状态：以下八项均已处理。第 1、2 项及第 3 项的在途去重由“公式 View 复用与 style 空定义上下文”一轮完成；本轮完成失败缓存与局部重排、模板片段来源和调用实例匹配、参数光标保留、失败源码修复、活动调用内部取图，以及 UTF-8 诊断坐标。下文保留修复前的复现记录；当前行为见 [architecture.md](architecture.md)，后续实测见 [validation.md](validation.md)。下文的行号、缓存表和测试数量均属于修复前证据。
 
-日期：2026-09-12。范围：文档、当前源码、真实 release core / layout adapter，以及 Qt offscreen；未使用 computer use，未启动可见窗口。本次只梳理与复现，没有修改产品实现。
+日期：2026-09-12。范围：审查当时的文档与源码、真实 release core / layout adapter，以及 Qt offscreen；未使用 computer use，未启动可见窗口。本次只梳理与复现，没有修改产品实现。
 
-## 实现链路
+## 修复前的实现链路（历史）
 
 这里的 `style` 是数学 View 的字体变体，不是 `analysis.styles` 中用于文档高亮的语法区间，也不是 Typst 的全部 set/show 规则。
 

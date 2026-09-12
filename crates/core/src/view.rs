@@ -48,9 +48,9 @@ pub struct ViewNode {
     /// index and an edge's definition index — because they are projected as nodes
     /// before `ViewTemplate::of` turns them into variants.
     pub columns: usize,
-    /// How many cells each row really has, before the flat list was padded to
-    /// `columns`. `mat(a, b; c)` and `a & b \ c` both pad a short row, so without this
-    /// the frontend would draw a cell the source does not have.
+    /// Visible cells per row: matrices retain the complete padded rectangle;
+    /// multiline alignments retain their original row widths so unused padding
+    /// is not drawn as editable content.
     pub row_lengths: Vec<usize>,
     pub children: Vec<ViewTemplate>,
 }

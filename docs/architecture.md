@@ -2,21 +2,21 @@
 
 ## 原生桌面前端
 
-`desktop/` 是 Qt Widgets / PyQt5 原生前端，通过 `--desktop-core` 管道使用 Rust Document，通过独立 `--stdio` 管道使用编译/包服务与 Tinymist。没有 WebView、HTTP 端口或 WASM；两个后端进程都是窗口自己启动的私有管道。完整源码及文档撤销由窗口持有，QTextDocument 只是带自定义公式对象的投影；位置映射显式转换 Python Unicode、Rust UTF-8 和 Qt/LSP UTF-16。一个窗口只保留一个活动公式会话和绘图控件，分栏共享源码。
+`desktop/` 是 Qt Widgets / PyQt5 原生前端，通过 `--desktop-core` 管道使用 Rust Document，通过独立 `--stdio` 管道使用编译/包服务与 Tinymist。编辑与服务请求走私有管道，不使用 WASM，host 不提供 HTTP 服务。每个窗口启动一个核心与两个服务进程，渲染与 LSP 分开；可选实时预览由 Tinymist 提供本地 HTTP/WebSocket 服务，前端用 QtWebEngine 显示。完整源码及文档撤销由窗口持有，QTextDocument 只是带自定义公式对象的投影；位置映射显式转换 Python Unicode、Rust UTF-8 和 Qt/LSP UTF-16。一个窗口只保留一个活动公式会话和绘图控件，分栏共享源码。
 
 Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`，使用 Typst 增量解析器返回的实际重解析范围；桌面公式索引只扫描更新后的轻量语法节点，平移范围外已有投影，逐公式比较编辑前后的源码，只为新建、内容改变或宏定义变化影响到的公式构造 View；普通正文重解析覆盖到未改动的公式不再触发 analyze_formula。公式外的 #、方括号和花括号变更可能改变绑定作用域，保守保留重解析范围内的投影失效。`let` 变化会使其后的宏投影失效。合并时只重建真正移动的节点：编辑点之前的公式与未移动的子树与上一份投影共享，因此每次按键不再深拷贝全部公式。载入文件和 `analyze_formula` 不可用时的回退仍走一次全量 `analyze`，即完整投影；上面描述的增量只覆盖编辑路径。此策略沿用 Typst 保持远处 span 稳定的增量解析边界，而不是按输入字符猜测影响范围。参见 [Typst 编译器架构](https://github.com/typst/typst/blob/main/docs/dev/architecture.md) 与 [comemo](https://github.com/typst/comemo)。
 
-窗口与后端的连接由 `desktop/bridge.py` 管理：`Core` 持有一个文档与一个活动公式会话，按动作给等待预算（`set_source`/`analyze` 这类要整篇解析的请求另计），核心退出或超时后重启、按镜像到的源码重放 `set_source` 并恢复当时打开的公式会话，再重试该请求一次；`Services` 持有 `--stdio` 通道，子进程退出后由下一次请求重启。两条通道的失败信息都带动作名、退出码与后端 stderr 尾部。细节见 [desktop.md](desktop.md)。
+窗口与后端的连接由 `desktop/bridge.py` 管理：`Core` 持有一个文档与一个活动公式会话，按动作给等待预算（`set_source`/`analyze` 这类要整篇解析的请求另计），核心退出或超时后重启、从激活前的源码重放成功确认的会话动作并核验最终源码，再重试该请求一次；`Services` 持有 `--stdio` 通道，子进程退出后由下一次请求重启。两条通道的失败信息都带动作名、退出码与后端 stderr 尾部。细节见 [desktop.md](desktop.md)。
 
-公式排版结果按视图缓存：`FormulaObject.box` 为每个视图保留一份 Box，Qt 在一次布局/绘制周期内对同一公式的 `intrinsicSize` 与 `drawObject` 调用因此只排版一次，鼠标命中判定复用同一结果。Raw SVG 或附件位置变化（`Typesetter.touch`）以及编辑字号、SVG 倍率、`math_font` 变化时缓存失效。片段位图一律按**黑色**栅格化（`desktop/svg.py` 的单色转换只在编辑器缓存这条路上启用）：片段是从文档里切出来的图，文档可能把数学排成白色，浅色编辑区上就看不见了；导出路径仍用原始 SVG。
+公式排版结果按视图缓存：`FormulaObject.box` 为每个视图保留一份 Box，Qt 在一次布局/绘制周期内对同一公式的 `intrinsicSize` 与 `drawObject` 调用因此只排版一次，鼠标命中判定复用同一结果。每个 View 的 `_draw_revision` 记录其派生绘图数据变化，style 回包仅重排读取对应键的 View；Raw SVG、附件或诊断回包目前仍会调用全局 `Typesetter.touch`。编辑字号、SVG 倍率、`math_font` 变化同样使缓存失效。片段位图一律按**黑色**栅格化（`desktop/svg.py` 的单色转换只在编辑器缓存这条路上启用）：片段是从文档里切出来的图，文档可能把数学排成白色，浅色编辑区上就看不见了；导出路径仍用原始 SVG。
 
-编辑器自己画的公式有三个约定，都与编译结果对齐：**脚标移位**取 Typst 的 `.36 em / .25 em`（从编译 SVG 的基线差量出），基底是组合对象时再按它的真实升降部让开；**空槽**（`empty-cell`）画成虚线方框而不是 `□` 字形，`\frac` + Enter 之后分子分母各一个，方框会把该槽的 stop 一起折进 Box，否则光标画不出来、核心的 `move_vertical` 也找不到落点；**独占一行的行间公式**整行居中（`Editor.apply_alignment` 设块的 `AlignHCenter`），与正文同行的保持左对齐，因为 Typst 会把块级公式断到单独一行而投影不会。命令草稿与 Raw 源码共用 `source_run`，都走编辑器正文字体：它们是待编译的源码，不是编译出的字形。
+编辑器自己画的公式有三个约定，都与编译结果对齐：**脚标移位**取 Typst 的 `.36 em / .25 em`（从编译 SVG 的基线差量出），基底是组合对象时再按它的真实升降部让开；**空槽**（`empty-cell`）画成虚线方框而不是 `□` 字形，`\frac` + Enter 之后分子分母各一个，`a` 后输入 `^` / `_` 时当前脚标也显示空槽，方框会把该槽的 stop 一起折进 Box，否则光标画不出来、核心的 `move_vertical` 也找不到落点；**独占一行的行间公式**整行居中（`Editor.apply_alignment` 设块的 `AlignHCenter`），与正文同行的保持左对齐，因为 Typst 会把块级公式断到单独一行而投影不会。命令草稿与 Raw 源码共用 `source_run`，都走编辑器正文字体：它们是待编译的源码，不是编译出的字形。
 
 源码栏（`Window.source_dock`，一个 `QDockWidget`，里面放 `SourceEditor`）与编辑器**逐行对齐**：同一个文档默认字体、同一个顶部偏移，并把编辑器实测的每行高度以 `MinimumHeight` 写进源码栏的块（带高公式的行比纯文本行高）。行高逐一相等之后两栏的滚动值可以直接对应，`Window.mirror_scroll` 双向跟随。跟随只发生于**用户滚动**：重投影会重建两栏并各放回自己的滚动值，源码栏的光标同步也会让源码栏滚到自己的光标处，这两种都不算"要跟随的滚动"（`Window.loading` 期间 `mirror_scroll` 直接返回，`Window.project` 设完光标把源码栏滚回原位），否则停在一处的源码栏光标会把编辑器一起拽走。源码栏是 `QTextEdit` 而非 `QPlainTextEdit`：后者的文档布局忽略块行高。
 
 公式字体分两件事：**结构行度量**（em、基线、下降部）取编辑器正文字体，**字形**取数学字体。`desktop/mathfont.py` 注册随附字体并读回 Qt 报告的真实家族名，只在已安装的家族里解析设置里的 `math_font`；名字不存在时退回随附数学字体而不是交给 `QFont`，因为 Qt 的替换是静默的，随后逐字回退又会把多个设计混进同一个公式。数学字体本身不能提供行度量：`NewComputerModern Math` 必须容纳四层高的定界符，12pt 下报告 `ascent=99`、`height=185`，直接当行高会得到几乎空白的巨框。数学变量的字形来自 Unicode 数学斜体区间（`a→𝑎`、`h→ℎ`），与编译结果同一套字形；文本单元保持直立。这里有一个必须分清的分界：**那个映射只适用于编辑器自己认出来的变量**。字体变体（`style` 节点）画的是**引擎已经替换好的**串，再映射一遍就把 `upright(A)` 的直体 `A` 改回斜体 `𝐴`——所以 `mathfont.glyph(..., substituted=True)` 让引擎给的串原样画（`bold` 只是因为 `𝐀` 不是 ASCII 才一直没露馅）。`h` 是这条映射唯一的例外，而且例外来自 **Unicode 的洞**而不是映射规则：U+1D455（mathematical italic small h）**未分配**，引擎把默认斜体 h 排成 Planck 常数 `ℎ` U+210E；52 个字母逐个问过真适配器，只有它一处不同。随附字体位于 `fonts/`，`native-adapter` 也把数学字体编进自己的二进制。
 
-每个 Raw 片段的源码区间由 `Document::annotate` 给出，它是"片段图像"与"源码"之间唯一的连接：窗口用 `render.raw` 的区间请求 Typst。规范序列化只用于估算位置——它补空格、把 `a/b` 写成 `frac(a, b)`——最终以"该区间里恰好是这段文本"为准，所以按自己习惯书写的公式同样出图。区间无法确定的片段退回源码显示并标出，核心允许左右键进入它的源码（`failed_previews` + `Action::PreviewResults`），这是它唯一的修复入口。
+每个 Raw 片段的源码区间由 `document::annotate` 给出，它是"片段图像"与"源码"之间唯一的连接：窗口用 `render.raw` 的区间请求 Typst。规范序列化只用于估算位置——它补空格、把 `a/b` 写成 `frac(a, b)`——先尝试原文匹配，必要时比较语法调用的规范拼写，所以按自己习惯书写的公式同样出图。区间无法确定的片段退回源码显示并标出，核心允许左右键进入它的源码（`failed_previews` + `Action::PreviewResults`），这是它唯一的修复入口。
 
 规范序列化（`typst::write_cell`）在**每两个原子之间**写一个分隔符，没有例外。原因是写出的源码会被重新解析，而 Typst 会把连写的字符当成一个整体：`xy` 是变量名（实测 `$ab$` 直接报 `unknown variable: ab`），`->` 是箭头、`||` 是 `‖`、`[|` 是 `⟦`、`...` 是 `…`。少一个分隔符，用户按下的两个字符就会在离开公式后变成一个不可再拆的 Raw 片段；`tests/structured_input.rs::a_separator_keeps_typed_characters_from_becoming_one_shorthand` 守着这条规则。代价是两个按键连写出的 `<=`、`>=`、`!=` 不再合并成 `≤`、`≥`、`≠`：这类符号改用命令输入（`\>=` 回车）得到。
 
@@ -32,7 +32,7 @@ Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`�
 
 F5 通过原生 `typst-pdf` 编译当前内存源码并交给系统默认阅读器；公式 Raw 和附件位置继续使用独立后台服务，不依赖 PDF 编译。详情及范围见 [desktop.md](desktop.md)。
 
-模板中的 `raw_macro` 保留两份拼写：`text` 是绑定实参后的显示文本，`source_text` 是用于定位的定义原文。host 给所有片段附加 `render_request`，并选择当前需要的非重叠取图区间；模板调用额外携带外层实际调用的字节区间与展开次数。适配器在内存源码中标记定义片段和调用边界，按调用与次数选取对应帧，因此同一个定义的不同实参不再共用错误图片。原文件不写入任何标记。
+模板中的 `raw_macro` 保留两份拼写：`text` 是绑定实参后的显示文本，`source_text` 是用于定位的定义原文。host 给所有片段附加 `render_request`，并选择当前需要的非重叠取图区间；没有独立 edit 的模板 raw_macro 额外携带外层实际调用的字节区间与展开次数。适配器在内存源码中标记定义片段和调用边界，按调用与次数选取对应帧，因此同一个定义的不同实参不再共用错误图片。原文件不写入任何标记。
 
 style 的 pending、成功字形（含空串）和失败分别保存；失败只在显式刷新时重试。字形回包只使读取该表达式的 View 重新排版，保留无关公式的 Box。raw_macro 取图失败显示失败源码框，可从边界用方向键进入源码草稿；Esc 恢复原来的 MacroCall，Enter 重新解析修复后的文本。进入正常 raw_macro 参数槽后切换为取内部片段的图，内部区间始终保留。
 
@@ -67,11 +67,11 @@ Tinymist 的命令路径与 didOpen 的文件 URI 使用同一套正常路径表
 
 宏绑定以 Typst 语法树中的作用域边界为依据：只收集活动公式祖先作用域中已经出现的 `let`，跳过已经结束的兄弟内容块/代码块；函数自身和形参遮蔽外层绑定。绑定表按顺序更新，模板依赖边仍引用不可变的定义版本，因此后续同名定义不会改变早先宏的捕获。当前仅支持 `let` 的静态结构展开，不尝试执行任意导入、循环或动态函数来推导展开结构。宏注册表按定义前缀缓存并**进程内共享**，保留多份条目：优先复用最长匹配前缀（同文档增长），否则回退到最近使用的一份并逐定义比较源码文本。`--stdio` 通道是每请求一线程，线程内缓存等于每请求重建，因此这里必须是跨线程缓存。
 
-**宏内片段没有独立渲染机制。** 定义体里画不出来的片段（Raw）和正文里的片段走同一条路：`Document::annotate` 为它算出它**在定义文本中的文档区间**，`render.raw` 用这个区间请求编译，文档里对该宏的调用就是编译它并产出那一帧的地方。所以同一个片段在定义体和各个调用点共用一张图，缓存命名空间是 `('raw', 源码文本)`。**唯一的例外是 attach 里的片段**：片段被插回原位置编译，`stretch(->)^x` 的基底拉伸到脚标 `x` 的宽度，同一段源码在不同 `script` 下是两张图，因此这类片段的键是 `('raw', 源码, script 形状摘要)`（`rawcache.signature(script)` 的摘要，见 [desktop.md](desktop.md)）；摘要只在**定义所在的公式视图**里建立，所以定义视图与调用点视图仍然同键。唯一额外的约束是**取图截断**：片段在定义里，它的排版结果产生在调用处，调用可能在文档更后面，所以只要这次请求里含定义内的片段，窗口就不截断源码（`context_end` 取全文），否则截断会把调用一起切掉、片段必然没有图。定义从未被调用时它自然没有图，和任何画不出来的片段一样显示源码 + 暖色标记。
+**宏内片段走同一条 `/api/render` 管道，但需要区分调用实例。** `document::annotate` 为模板片段保留定义区间与 `render_request`；其中没有独立 edit 的 raw_macro 另附加外层调用区间和展开次数。适配器在内存源码中标记定义与调用边界，按调用实例选择帧。普通 Raw 默认使用 `("raw", text[, script摘要])`；带 call 的 raw_macro 模板实例使用 `("raw-instance", text, origin, call_identity, occurrence, context)`，不同实参分别取帧。模板中的普通 Raw 仍按源码与脚本摘要共享，没有通用的逐调用环境缓存。存在定义内取图区间时，窗口仍将 `context_end` 设为全文，确保保留更后面的调用；因此这种批次仍可能受后文错误影响。定义没有被调用就没有对应排版帧。
 
 结构修改通过唯一 Editor 执行；若序列化结果实际改变，Document 仅替换活动范围，窗口把这次替换并入自己的撤销栈并重建投影，不会再次 `set_source` 清空活动树。源码进入和退出不做隐式格式化。隐藏公式只保存静态投影，不保存单独的光标和撤销栈。
 
-Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 UTF-16。所有跨层转换集中于 `desktop/model.py`（`to_byte`/`from_byte`/`u16`/`from_u16`）与 `Window.lsp_position`（`desktop/window.py`，唯一的 UTF-16 → LSP character 转换点）和 `src/services.rs`。LSP 返回替换范围后检查边界与重叠；异步请求返回时核对源码版本和文件身份，避免过期结果写入当前文档。
+Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 UTF-16。所有跨层转换集中于 `desktop/model.py`（`to_byte`/`from_byte`/`u16`/`from_u16`）与 `Window.lsp_position`（把 LSP 行号与 UTF-16 character 转为 Python 字符索引）和 `src/services.rs`。LSP 返回替换范围后检查边界与重叠；异步请求返回时核对源码版本和文件身份，避免过期结果写入当前文档。
 
 ## 分层：内核与外围
 
@@ -79,12 +79,12 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 
 | 层 | crate | 内容 | 依赖 |
 | --- | --- | --- | --- |
-| 内核 | `typformula-core`（`crates/core/`） | `math`（可编辑树）、`slots`（每个 `Kind` 的唯一一张声明表）、`typst`（解析与回写）、`cursor`（`Editor` 与全部编辑动作）、`view`（交给前端的形状） | 只有 `typst-syntax` + serde |
+| 内核 | `typformula-core`（`crates/core/`） | `math`（可编辑树）、`slots`（每个 `Kind` 的唯一一张声明表）、`typst`（解析与回写）、`cursor`（`Editor` 与全部编辑动作）、`view`（交给前端的形状） | `typst-syntax`、`serde`、`serde_json`、`unicode-segmentation` |
 | 外围 | `typformula`（仓库根） | `document`（源码即权威）、`desktop`/`rpc`（两条私有管道）、`services`/`packages`/`workspace`（进程、网络、路径）、`typformula` 二进制 | 内核 + std/网络/压缩 |
 
-方向是单向的：外围可以依赖内核，内核**不能**依赖外围。这条不是纸面规则：在 `crates/core/src/lib.rs` 里写 `use typformula::…` 会编译失败（`unresolved import`，实测）。所以"只改外围、不动内核"是编译器保证的——加一个新前端、新传输或新文件功能时，内核的五个模块不需要打开。
+方向是单向的：外围可以依赖内核，内核**不能**依赖外围。这条不是纸面规则：在 `crates/core/src/lib.rs` 里写 `use typformula::…` 会编译失败（`unresolved import`，实测）。所以"只改外围、不动内核"是编译器保证的——加一个新前端、新传输或新文件功能时，内核的六个功能模块不需要修改。
 
-内核里**不许出现**的东西（出现就说明该往上挪）：`std::process`、`std::fs`、网络、任何"传输/协议"形状的类型。给它定量身标准会更清楚：内核只回答两件事——**这棵树是什么**，以及**它该怎么写成 Typst**。
+内核里**不许出现**的东西（出现就说明该往上挪）：`std::process`、`std::fs`、网络、任何"传输/协议"形状的类型。给它定量身标准会更清楚：内核负责可编辑树、解析回写、编辑动作、导航和 View 投影；文件、进程、网络与请求路由由外围负责。
 
 两处容易踩的坑，写在根 `Cargo.toml` 里：
 
@@ -103,29 +103,29 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 
 `/api/render` 和 `/api/attachments` 使用正式版自己的 native-adapter。数学 IR 标签桥接保存在 `vendor/typst`；构建不再准备原型引擎或修改其他目录。源码、资源与缓存失败不影响代码区继续输入。
 
-`/api/glyphs` 走同一个适配器，回答"这段调用被引擎替换成了哪些字符"（下一节的 `Style`）：请求体带 `definitions` 与 `display`，适配器把这段拼写编译成数学 IR 再把字形串读回来。同一个片段可以既取图又取字，两者互不影响。
+`/api/glyphs` 走同一个适配器，回答"这段调用被引擎替换成了哪些字符"（下一节的 `Style`）：请求体带 `definitions` 与 `display`，适配器把这段拼写编译成数学 IR 再把字形串读回来。当前前端的 style 分支只请求字形，不自动回退 SVG；raw/raw_macro 分支按源码区间取图。
 
 ## 一个公式怎么变成可编辑的树
 
-这一节把"哪一层知道什么"写成一条链，因为分界线不明显，读代码时很容易把 `parse_atom` 的分支结构误当成 Typst 的分层结构。**一条公式里能成为可编辑节点的构造，只有两个来源：Typst 的语法节点，或者 `config/commands.json` 里的名字。**
+这一节把"哪一层知道什么"写成一条链，因为分界线不明显，读代码时很容易把 `parse_atom` 的分支结构误当成 Typst 的分层结构。**结构画法来自语法构造与配置形状；宏作用域决定绑定和模板展开。未配置的位置调用仍可保留可编辑实参，以 raw_macro 取图显示。**
 
 ### 来源一：语法节点（parser 直接给出，与名字无关）
 
-`typst-syntax` 的 parser 里，mathematical operator 带优先级，会被折成**专门的节点**（`parser.rs:404` 的 `math_op`）：
+`typst-syntax` 的 parser 里，mathematical operator 带优先级，会被折成**专门的节点**（`parser.rs` 的 `math_op`）：
 
 | 源码 | 节点 | `typst.rs` 的分支 |
 | --- | --- | --- |
-| `1/2` | `MathFrac` | `:545` |
-| `x_1`、`x^2`、`x'` | `MathAttach` | `:546` |
-| `∛x`、`∜x` | `MathRoot` | `:559` |
-| `(a + b)`、`[x]` | `MathDelimited` | `:575` |
-| `&`、`\` | `MathAlignPoint`、`Linebreak` | `:498`（`parse_cell` 预处理） |
+| `1/2` | `MathFrac` | `parse_atom` 的 MathFrac 分支 |
+| `x_1`、`x^2`、`x'` | `MathAttach` | `parse_atom` 的 MathAttach 分支；primes 仍保留 Raw |
+| `∛x`、`∜x` | `MathRoot` | `parse_atom` 的 MathRoot 分支 |
+| `(a + b)`、`[x]` | `MathDelimited` | `parse_atom` 的 MathDelimited 分支 |
+| `&`、`\` | `MathAlignPoint`、`Linebreak` | `parse_cell` 预处理 |
 
 `math_op` 把 `/` 映射到 `MathFrac`、`_`/`^` 映射到 `MathAttach`，**按算符形态判定，完全不查名字**。所以 `1/2` 是分式这件事，parser 自己就知道。
 
 ### 来源二：名字表（parser 给不出，只能查配置）
 
-`parser.rs:281-284` 是另一条路：
+`parser.rs` 是另一条路：
 
 ```rust
 if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
@@ -136,9 +136,9 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 规则只有一句：**一个 `MathIdent` 后面紧跟 `(`（`directly_at`，中间不许有空格），就包成 `MathCall`**。不查名字、不查作用域。所以 `frac(...)`、`vec(...)`、`cancel(...)`、`foo(...)` 在这一层**型别完全相同**——`MathCall` 只断言"有个标识符被调用了"，不回答"它是什么"。
 
-那"它是什么"在哪回答？在 **`typst-eval`**：把 callee 求值成作用域里的 `Func`，实参求值成 `Content`，得到 `Content::Elem(FracElem{…})`。**`MathKind` 还要更晚**：它是布局期的中间表示，`resolve_equation` 的调用点全在 `typst-layout`（`math/mod.rs:68`、`:123`）和 `typst-html`（`rules.rs:824`），`typst-library/src/math/ir/mod.rs:23` 只提供函数本身。到那里才由 `resolve.rs:197` 起的一长串 `to_packed::<FracElem>()` / `to_packed::<CancelElem>()`（`:222`）按**元素类型**分派。
+那"它是什么"在哪回答？在 **`typst-eval`**：把 callee 求值成作用域里的 `Func`，实参求值成 `Content`，得到 `Content::Elem(FracElem{…})`。**`MathKind` 还要更晚**：它是布局期的中间表示，`resolve_equation` 的调用点全在 `typst-layout`（`math/mod.rs`）和 `typst-html`（`rules.rs`），`typst-library/src/math/ir/mod.rs` 只提供函数本身。到那里才由 `resolve.rs` 起的一长串 `to_packed::<FracElem>()` / `to_packed::<CancelElem>()`按**元素类型**分派。
 
-**所以内核拿不到它。** `typformula-core` 只依赖 `typst-syntax`，`typst-eval`/`typst-library`/`typst-layout` 只有 `native-adapter` 那一侧才链接。名字→结构这件事必须由内核自己回答，`config/commands.json` 就是那个答案：
+**所以内核拿不到它。** `typformula-core` 在 Typst 系列 crate 中只依赖 `typst-syntax`，`typst-eval`/`typst-library`/`typst-layout` 只有 `native-adapter` 那一侧才链接。名字→结构这件事必须由内核自己回答，`config/commands.json` 就是那个答案：
 
 ```
 "frac(1, 2)"
@@ -149,8 +149,8 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 ### 由此得到的三条判断
 
-1. **`commands.json` 不是识别机制，是识别机制的补充。** 它只管"写成调用形式的构造"。`frac(1,2)` 不在表里会退成 `Raw`，但 `1/2` 仍然可编辑——同一种排版有两条入口，只有一条依赖这张表。
-2. **表里删一项的后果，`tests/round_trip.rs` 测不出来。** 删掉 `"frac"` 后 `frac(1,2)` 变 `Raw`，而 `Raw` 保留原文、往返照样成立。这类改动只有直接断言 `Kind` 的用例才有牙（对照 `math::is_number` 的单元测试：外部来源的规则，往返测试看不见）。
+1. **`commands.json` 不是识别机制，是识别机制的补充。** 它只管"写成调用形式的构造"。`frac(1,2)` 不在表里会退成未知形状的 `MacroCall`（`raw_macro`），但 `1/2` 仍然可编辑——同一种排版有两条入口，只有一条依赖这张表。
+2. **表里删一项的后果，`tests/round_trip.rs` 测不出来。** 删掉 `"frac"` 后 `frac(1,2)` 仍是 `MacroCall`，但不再借分式形状；调用本身仍可往返。这类改动只有直接断言 `Kind` 的用例才有牙（对照 `math::is_number` 的单元测试：外部来源的规则，往返测试看不见）。
 3. **要拿真实 `MathKind` 就绕不开跑一遍 layout。** 这不是选型问题，是 `resolve_equation` 的位置决定的——`native-adapter` 与 `tools/engine_boxes.py` 都因此必然在布局路径上。
 
 ### 三张表的边界（当前的已知缺口）
@@ -160,12 +160,13 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 | `frac`、`sqrt`、`root`、`hat`、`overline`、`underline`、`abs`、`norm`、`cancel` | `FracElem`/`RootElem`/`AccentElem`/`CancelElem` 等 | 是 | **存成 `MacroCall`，形状查表得到**（见下节） |
 | `mat`、`vec`、`cases` | `MatElem`/`VecElem`/`CasesElem` | 是 | `Kind::Table`，但**行方式与定界符来自配置**（见下节） |
 | `a/b`、`√x`、`(a+b)`、`x^2` | `Fraction`/`Radical`/`Fenced`/`Scripts` | 不适用 | 语法节点，与名字无关 |
-| `bb(A)`、`lr(x, size: #100%)` | `TextElem` 变体 / `LrElem` | **否** | `bb` 不在表里、`lr` 有具名实参——建的是未知名字的 `MacroCall`（画成 `raw_macro`，参数可编辑），**不是** `Raw` |
+| `bb(A)` | `TextElem` 变体 | **否** | 未知形状的 `MacroCall`，画成 `raw_macro`，参数可编辑 |
+| `lr(x, size: #100%)` | `LrElem` | **否** | 具名实参保留为 `Raw`，不构造参数槽 |
 | `bold(x)`、`upright(A)` | 变体在引擎里是**码位替换** | 是 | **存成 `MacroCall`，形状查表得到**；字形由 `/api/glyphs` 问引擎，见下节 |
 
-`vec` 曾经是这里"引擎认得、表里没有"的例子，现在进表了。**注意 `VecElem` 一直是 define 过的**（`math/mod.rs:68`），所以引擎从来就把它解析成列向量；内核当初不认它只是因为表里没有——两者是两回事。
+`vec` 曾经是这里"引擎认得、表里没有"的例子，现在进表了。**注意 `VecElem` 一直是 define 过的**（`math/mod.rs`），所以引擎从来就把它解析成列向量；内核当初不认它只是因为表里没有——两者是两回事。
 
-`resolve_vec`（`resolve.rs:1018`）把**每个参数各包成一行**（`map(|child| vec![child])`）再交给 `resolve_cells`，所以 `vec(1,2,3)` 与 `mat(1;2;3)` 排版逐字节相同。这是元素自己的固定行为，与逗号/分号的分列语义无关——前一版文档若把它解释成"逗号分隔却要换行"，那是错的。
+`resolve_vec`（`resolve.rs`）把**每个参数各包成一行**（`map(|child| vec![child])`）再交给 `resolve_cells`，所以 `vec(1,2,3)` 与 `mat(1;2;3)` 排版逐字节相同。这是元素自己的固定行为，与逗号/分号的分列语义无关——前一版文档若把它解释成"逗号分隔却要换行"，那是错的。
 
 ### 表格的行方式与定界符在配置里
 
@@ -184,34 +185,23 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 | `mat(1, 2; 3, 4)` | 2 | `()` | true | `mat(1, 2; 3, 4)` |
 | `vec(1, 2, 3)` | 1 | `()` | false | `vec(1, 2, 3)`（**不是** `mat(1; 2; 3)`） |
 | `cases(1, 2)` | 1 | `{ ` | false | `cases(1, 2)` |
-| `mat(a, b; c)` | 2 | `()` | true | `mat(a, b; c)`（**行宽不等**，见下） |
+| `mat(a, b; c)` | 2 | `()` | true | `mat(a, b; c, "")`（短行补空块，见下） |
 
 这就是为什么 `Kind::Table` 存了一个 `name`：**形状不蕴含拼写**。`vec(a, b)` 与 `mat(a; b)` 排出同一张表，节点不记住名字就写不回原样。
 
 配置值因此有两种写法：只写形状名（`"frac": "fraction"`），或者写带参数的对象。对象形式是这一次加的——`grid` 这个名字单独一个字符串说不清"这个表怎么切行、外面画什么"。
 
-### 行宽可以不等——旧的那条拒绝是错的
+### 矩阵短行补空块至齐行
 
-`Kind::Table` 里还有 `row_lengths`，和 `Multiline` 一模一样。它存在的直接原因是**编辑器原先拒绝建这个表**：
+`mat(a, b; c)` 可解析为矩阵。解析器先取最长行的列数，再逐行补空块，最后摊平成 `cells`；`columns = 2`、`row_lengths = [2, 2]`，补出的格子与其它空格一样参与显示、导航和回写。不能只在扁平数组末尾补齐，否则 `mat(a; b, c)` 会错排成 `[a, b]`、`[c, 空]`。
 
-> 「只有各行等宽的矩阵才是矩阵：`mat(a, b; c)` 不是 Typst 能排的表，所以留作源码。」
+进入或退出公式不会单独改写源码；结构编辑触发序列化后写出完整矩形。中间空格可用空参数表示，最后一行最后一个空格写成 `""`，以避免尾逗号被解析成没有实参。因此 `mat(a, b; c)` 的规范拼写是 `mat(a, b; c, "")`，解析器把矩阵里的空文本还原为空格。
 
-**这句话是错的。** 实测 24pt：`mat(a, b; c)` 高 `43.008pt`，与 `mat(1, 2; 3, 4)` **完全相同**——引擎照排，短行按缺格处理。所以那是一条**既错误又没人守**的规则：`round_trip.rs`、`structured_input.rs`、`desktop` 里都没有 `mat(a, b; c)` 的用例，删掉它时**一个测试都没红**。现在它有用例了（`a_matrix_may_have_rows_of_different_widths`）。
-
-`row_lengths` 记的是**补齐前**每行真正有几格。两个地方靠它：
-
-* **写回**要按它把补齐的格子去掉，否则 `mat(a, b; c)` 会被写成 `mat(a, b; c, )`；
-* **不能改用"删掉行尾空格子"这个更简单的办法**：`mat(a, ; c, d)`（两列、第二格是**有意留空**）会被改写成 `mat(a; c, d)`——那变成一行两格加一行一格，意思完全不同。这正是 `Multiline` 早就有 `row_lengths` 的原因。
-
-行的补齐是**逐行**做再摊平的（`Multiline` 也是），不是最后一次性补齐：否则 `mat(a; b, c)`（行宽 `[1, 2]`）会摊成 `[a, b, c, _]`，被 `chunks(2)` 读回成 `[a, b]` 与 `[c, _]` 两行。这个是**新加的用例抓出来的**。
-
-还有一个空格的坑：空格子写回时**什么都不写**（`write_cell` 对空格子回答的是 `""`，那是文本单元里空串的拼法，而 `mat(a, ; c, d)` 不是 `mat(a, "", c, d)`），**唯一的例外是最后一行的最后一格**——它后面没有分隔符了，裸写会留下一个尾逗号而没有实参，于是 `mat(, ; , )` 会读回"两格 + 一格"。所以那一格写成 `""`，而解析器会把空文本还原成空格子。这条也是**旧用例抓出来的**（`a_command_written_with_empty_parentheses_is_writable`）。
-
-`Kind::Table` 现在与 `Kind::Multiline` 的数据形状完全一致（`columns` + `row_lengths` + 扁平格子），差别只在写回（`; ` vs `&`/`\`）与视图（有无定界符、是否居中）。**没有拆成"稠密/稀疏"两个视图**：按"一条独立的编辑或显示逻辑"这条判据，两者的画法与编辑完全相同，只是**实例**参差与否，所以是 `row_lengths` 这个数据，不是第二个视图 kind。
+`Multiline` 同样逐行填充存储，但 `row_lengths` 保留各行原列数，前端跳过那些没有内容、尚未使用的补齐格；它的对齐行不适用矩阵的齐行约定。
 
 ### 配置好的名字存成 `MacroCall`，形状是查出来的
 
-`config/commands.json` 里的名字**不各自有一个 `Kind`**：节点存的是**调用**（`MacroCall { name, cells }`），而**槽位、导航、排布与拼写**都在画或写的那一刻由名字查表得到（`math::MathAtom::command_shape` → `slots::configured_shape`，画法由 `slots::configured_draw`）。`Kind::Fenced` 与 `Kind::Table` 例外，它们仍然真的被存下来（前者是 `(a+b)` 的语法节点，后者见上表），因为它们带着名字与配置都给不出的实例数据。
+`config/commands.json` 里的名字**不各自有一个 `Kind`**：节点存的是**调用**（`Kind::MacroCall { name, function }`，实参在 `MathAtom.cells`），槽位、导航与排布按名字借形状，拼写仍由该 Kind 的 `Grammar::write` 决定（`math::MathAtom::command_shape` → `slots::configured_shape`，画法由 `slots::configured_draw`）。`Kind::Fenced` 与 `Kind::Table` 例外，它们仍然真的被存下来（前者是 `(a+b)` 的语法节点，后者见上表），因为它们带着名字与配置都给不出的实例数据。
 
 需要强调的是**这里没有"形状描述符 Kind"这回事了**。曾经有：`Sqrt`/`Root`/`Accent`/`Line`/`Style` 五个变体留在枚举里，只为给 `configured_kind` 一个可以借的载体。它们现在整个删掉了——形状是 `Shape`（按形状名取），取图数据在配置文件里，见上文"五个变体已经删除"。
 
@@ -231,7 +221,7 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 1. **它带着名字和配置都给不出的实例数据**——`Table{columns}`、`Fenced{left,right}`、`Multiline{columns,row_lengths}`、`Raw{source}`、`MacroCall{name}`、`TemplateCall{definition}`、`Parameter{index,name}`、`Unknown{…}`、`Char{text}`、`Symbol{name,glyph}`；
 2. **它要保住书写形式**——`SkewedFraction`（若采纳）记的是"源码写的是 `a/b`"，这是出处而不是数据，但同样只有节点能记住。
 
-按这条，`Fraction`/`Sqrt`/`Root`/`Accent`/`Line` 都**不该是节点**：它们没有自己的数据，名字加上配置已经说全了。`√x`/`∛x` 也因此与 `sqrt(x)`/`root(3, x)` 折成同一个 `MacroCall`——radical 的形状不带数据，`√x` 该记的只有"它是 sqrt"这一个名字。
+当前 `Sqrt`/`Root`/`Accent`/`Line`/`Style` 只保留形状，调用存为 `MacroCall`。`Fraction` 仍保留为语法 `a/b` 的节点，当前回写规范化为 `frac(a, b)`；尚未实现区分斜分式来源的 `SkewedFraction`。`√x`/`∛x` 也因此与 `sqrt(x)`/`root(3, x)` 折成同一个 `MacroCall`——radical 的形状不带数据，`√x` 该记的只有"它是 sqrt"这一个名字。
 
 **`Table` 则必须留下，这是原计划里唯一算错的一项。** `mat` 的列数既不在名字里也不在配置里，只在参数列表的分号里：`mat(a, b; c, d)` 存成一个扁平格子表之后就再也分不出行界，写不回 `mat(a, b; c, d)`。所以 `mat` 不能变成普通 `MacroCall`——除非 `MacroCall` 自己长出一个列数字段，而那只是把同一个问题换了个地方放。
 
@@ -250,27 +240,27 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 ### `Style` 的替换表在适配器那一侧，不在前端也不在内核
 
-`Style` 的载荷是 `{name}`（命令名），**线上**才叫 `style_name`；`text` 是线上 View 的字段，装的是整段调用拼写。这个**机制**很便宜：形状不带数据（`name` 就是命令名，和 `Accent` 一样），所以只要一个形状 + 配置里几行——`Style` 那个 `Kind` 变体本身也不需要了。**贵的是那一步"替换"**，也就是"让前端负责渲染"实际要求什么。查证结果：
+style 形状由 `MacroCall.name`（命令名）查得，**线上**另填 `style_name`；`text` 是线上 View 的字段，装的是整段调用拼写。这个**机制**很便宜：形状不带数据（`name` 就是命令名，和 `Accent` 一样），所以只要一个形状 + 配置里几行——`Style` 那个 `Kind` 变体本身也不需要了。**贵的是那一步"替换"**，也就是"让前端负责渲染"实际要求什么。查证结果：
 
 | 事实 | 证据 |
 | --- | --- |
-| 变体是**码位替换**，不是字体特性 | `resolve.rs:311` 把每个字符过一遍 `to_style(c, MathStyle::select(c, variant, bold, italic))`，替换后的文本才去整形 |
-| 但那张表**不在 vendor 里** | `resolve.rs:4` 是 `use codex::styling::{MathStyle, to_style}`。`codex` 是 **Typst 自己的符号数据库**（`github.com/typst/codex`，Apache-2.0，作者是 The Typst Project Developers），`vendor/typst` 里的 `typst-library/src/symbols.rs:8,14` 用的就是它的 `ROOT`/`SYM`——它不在 `vendor/` 下，作为普通依赖随 `typst-library`/`typst-layout` 进构建（编辑器内核只依赖 `typst-syntax`，所以内核与前端都碰不到它） |
-| 它**不是偏移表**：一个字符可能变成**两个**（基字 + 变体选择符） | `to_style('Q', Chancery) == "𝒬\u{fe00}"`（`codex/src/styling.rs:362`）；`mathfont.glyph` 目前只处理**单字符** |
+| 变体是**码位替换**，不是字体特性 | `resolve.rs` 把每个字符过一遍 `to_style(c, MathStyle::select(c, variant, bold, italic))`，替换后的文本才去整形 |
+| 但那张表**不在 vendor 里** | `resolve.rs` 是 `use codex::styling::{MathStyle, to_style}`。`codex` 是 **Typst 自己的符号数据库**（`github.com/typst/codex`，Apache-2.0，作者是 The Typst Project Developers），`vendor/typst` 里的 `typst-library/src/symbols.rs,14` 用的就是它的 `ROOT`/`SYM`——它不在 `vendor/` 下，作为普通依赖随 `typst-library`/`typst-layout` 进构建（编辑器内核只依赖 `typst-syntax`，所以内核与前端都碰不到它） |
+| 它**不是偏移表**：一个字符可能变成**两个**（基字 + 变体选择符） | `to_style('Q', Chancery) == "𝒬\u{fe00}"`（`codex/src/styling.rs`）；`mathfont.glyph` 目前只处理**单字符** |
 | 它覆盖**非拉丁**字母表 | 同一份文档的例子：`ظ → 𞺚`、`ذ → 𞺸`（阿拉伯数学字母） |
 | `cal` 与 `scr` 是**两种**变体，Unicode 只有一套 script 区 | 实测 24pt：`cal(A)` 19.152 ≠ `scr(A)` 20.52 |
 
 字体本身没问题，这一点也量过了：随附的 `NewComputerModern Math` **覆盖全部变体区**，各区的"缺口"正是 Unicode 自己的设计（script 大写 18/26、fraktur 21/26、double-struck 19/26），而 Letterlike 那几个替代码位（`ℂℍℕℙℚℝℤ`）**全部存在**。
 
-所以这不是"把 `codex/src/styling.rs` 那张表转写进 Python"还是"先不做"的选择，而是**不要在前端复述那张表**：`to_style` 的输出早已在数学 IR 里（`resolve.rs:309-317` 把 `styled_text` 交给 `TextItem::create`），适配器只是把它**读回来**——`/api/glyphs` 带 `glyphs:true` 编译这段拼写，递归取 `Glyph`/`Text`/`Number` 的 `text`。前端因此不依赖 codex，"表抄错了就画错"这个风险不存在：编辑器画的字形与引擎排的字形是同一份数据。
+所以这不是"把 `codex/src/styling.rs` 那张表转写进 Python"还是"先不做"的选择，而是**不要在前端复述那张表**：`to_style` 的输出早已在数学 IR 里（`resolve.rs` 把 `styled_text` 交给 `TextItem::create`），适配器只是把它**读回来**——`/api/glyphs` 带 `glyphs:true` 编译这段拼写，递归取 `Glyph`/`Text`/`Number` 的 `text`。前端因此不依赖 codex，"表抄错了就画错"这个风险不存在：编辑器画的字形与引擎排的字形是同一份数据。
 
 style 请求的 `definitions` 固定为空，键是 `("", 调用拼写, display)`，不携带文档正文或宏定义前缀。同一表达式在不同公式、正文修改前后共享字形缓存；在途请求也按同一键去重，切换文档后的旧回包会丢弃。**按层**各问一次：`bold(upright(a))` 的引擎结果是 `𝐚`，但 `upright(a)` 这一层自己的字形是 `a`，光标进去要看到的正是后者。
 
-内核只在主体**真的有字形串**时才建 `Style` 节点（`has_glyph_run`：`Char`/`Symbol`/`Number`/`Text`，以及形状是 `style` 的嵌套调用；`Raw`、分数、重音都不算）。`bold(frac(a, b))`、`bold(hat(a))`、`upright(a/b)` 因此走 `raw_macro` 那条老路（一张图，光标进入画名字与参数槽），不需要字形，也就不存在"取不到字"的状态。
+内核只在主体**真的有字形串**时才投影为 `style` View（`has_glyph_run`：`Char`/`Symbol`/`Number`/`Text`，以及形状是 `style` 的嵌套调用；`Raw`、分数、重音都不算）。`bold(frac(a, b))`、`bold(hat(a))`、`upright(a/b)` 因此走 `raw_macro` 那条老路（一张图，光标进入画名字与参数槽），不需要字形，也就不存在"取不到字"的状态。
 
-前端只有两种画法：**有字形画字形，否则画这个调用**（名字 + 主体 + 右括）。第二种不只是"光标在里面"那一种——变体套一个字形时，画出来与那个字形一模一样，宏名是唯一说明在编辑什么的东西；而字形是**异步**到的，答案到达之前画调用也正是源码说的东西，画空串则什么都不说。
+前端在成功时画字形（含合法空串），光标进入或请求等待时画调用（名字 + 主体 + 右括），失败且未进入时画源码框。第二种不只是"光标在里面"那一种——变体套一个字形时，画出来与那个字形一模一样，宏名是唯一说明在编辑什么的东西；而字形是**异步**到的，答案到达之前画调用也正是源码说的东西，画空串则什么都不说。
 
-**取字与画分离**，这一条是踩过一次才定下来的：盖章发生在**布局那一刻**（页面的入口是 `FormulaObject.box`，公式框的入口是 `MathCanvas.refresh`），从缓存里读，所以答案回调只需要 `touch()` + 重画。此前盖章写在"视图建好时"，于是答案晚到时要么补盖、要么不盖——而一个公式恰好有**两个投影**（页面一份、公式框一份），"补盖"就变成每个投影各自的义务，漏掉一个的表现正是一个空白变体。
+**取字与画分离**，这一条是踩过一次才定下来的：盖章发生在**布局那一刻**（页面的入口是 `FormulaObject.box`，公式框的入口是 `MathCanvas.refresh`），从缓存里读，字形答案回调调用 `repaint_glyphs(key)`，由各 View 的绘图版本触发相关 Box 更新，不调用全局 `touch()`。此前盖章写在"视图建好时"，于是答案晚到时要么补盖、要么不盖——而一个公式恰好有**两个投影**（页面一份、公式框一份），"补盖"就变成每个投影各自的义务，漏掉一个的表现正是一个空白变体。
 
 未做：`bb`/`cal`/`frak`/`scr` 还没进 `config/commands.json`，所以 `bb(A)` 建的是**未知名字的调用**（`raw_macro`：光标在外画一张图，进去画名字与参数槽，参数可编辑）——不是 `Raw`。加它们是配置里几行——表不再是障碍。已知限制：`to_style` 可能返回两个码位（`𝒬\u{fe00}`），而 `mathfont.glyph` 是按字符映射的，`cal`/`scr` 这类变体要单独确认 Qt 画变体选择符的行为。
 
@@ -280,10 +270,10 @@ style 请求的 `definitions` 固定为空，键是 `("", 调用拼写, display)
 
 ```
 $RR$  →  MathIdent("RR")
-   ├─ ① parse_atom:532   ctx.is_bound("RR")?        ← 宏/定义作用域（不是配置）
+   ├─ ① parse_atom   ctx.is_bound("RR")?        ← 宏/定义作用域（不是配置）
    │       否 → 继续
-   ├─ ② node.cast::<ast::Expr>()  → MathIdent 不 cast 成任何 Expr → 落到 :643 的 `_`
-   └─ ③ :645   symbol("RR")?                        ← config/symbols.json
+   ├─ ② node.cast::<ast::Expr>()  → MathIdent 不 cast 成任何 Expr → 落到兜底 `_`
+   └─ ③ symbol("RR")?                        ← config/symbols.json
            ├─ 命中 → Kind::Symbol { name, glyph }
            └─ 未命中 → MathAtom::from_source → 又查一次 symbol() → Kind::Raw
 ```
@@ -294,9 +284,9 @@ $RR$  →  MathIdent("RR")
 | --- | --- | --- | --- |
 | 裸标识符，先 | 宏作用域（`definitions` 里的 `#let`） | `MacroCall`（可展）或 `Raw`（不可展） | 继续查符号表 |
 | 裸标识符，后 | `config/symbols.json`（40 项） | `Kind::Symbol` | `Kind::Raw` |
-| 调用 `name(...)` | `config/commands.json`（14 项） | 借形状的调用（`MacroCall`），或表里没有但实参全是位置实参的 `Kind::Raw`（画成 `raw_macro`） | `Kind::Raw` |
+| 未被绑定遮蔽的调用 `name(...)` | `config/commands.json`（14 项） | 配置形状的 `MacroCall` 或专门解析的 `Table`；未配置且实参可结构化时为 `MacroCall`（`raw_macro`） | 实参不可结构化时保留 `Raw` |
 
-**`Symbol` 不是 `Char`**，这一点常被含混过去：`Kind::Symbol` 的载荷是 `{name, glyph}`，`name` 保留源名、`glyph` 只用于显示（`view.rs`把它放进 `display_glyph`），回写走 `Write::OwnText` 写的是 **`name`** ——所以 `alpha` 存盘回来还是 `alpha`，不会变成 `𝛼`。真正"拆成字符"的是单字母的 `MathText`：`$R$` 是 `Char{text:"R"}`，而 `$RR$` 是 `MathIdent` 整体落 `Raw`（多字母标识符是一个节点，**不是**两个 `MathText`，所以那条 `graphemes` 拆分不会碰它）。
+**`Symbol` 不是 `Char`**，这一点常被含混过去：`Kind::Symbol` 的载荷是 `{name, glyph}`，`name` 保留源名、`glyph` 只用于显示（`view.rs` 把它放进 `View.text`；`display_glyph` 用于 Char 的显示覆盖），回写走 `Write::OwnText` 写的是 **`name`** ——所以 `alpha` 存盘回来还是 `alpha`，不会变成 `𝛼`。真正"拆成字符"的是单字母的 `MathText`：`$R$` 是 `Char{text:"R"}`，而 `$RR$` 是 `MathIdent` 整体落 `Raw`（多字母标识符是一个节点，**不是**两个 `MathText`，所以那条 `graphemes` 拆分不会碰它）。
 
 | 输入 | 节点 | Kind | 回写 |
 | --- | --- | --- | --- |
@@ -305,7 +295,7 @@ $RR$  →  MathIdent("RR")
 | `$RR$` | `MathIdent` | `Raw{source:"RR"}` | `RR` |
 | `$RRR$` | `MathIdent` | `Raw`（引擎侧 `unknown variable: RRR`） | `RRR` |
 
-`$RR$` 落在最后一行**不是错误**：`RR` 在引擎里是一个符号（黑板粗体 ℝ，`style.rs:150` 的文档自己写着 `bb(N) = NN`），实测 24pt 下 `RR` 与 `bb(R)` 盒子逐字节相同（都是 17.328），而单个斜体 `R` 是 18.792、`R R` 是 37.584。它成 `Raw` 只是因为 `symbols.json` 这 40 项没收它，而这**不是** `cancel`/`vec` 那种缺口：那两个早就在 `commands.json` 里（`decoration` 与 `grid` 形状），建的是借形状的调用，可以编辑；`RR` 才是"符号表没收、只能保留原文由引擎自己画"的那一类。
+`$RR$` 落在最后一行**不是错误**：`RR` 在引擎里是一个符号（黑板粗体 ℝ，`style.rs` 的文档自己写着 `bb(N) = NN`），实测 24pt 下 `RR` 与 `bb(R)` 盒子逐字节相同（都是 17.328），而单个斜体 `R` 是 18.792、`R R` 是 37.584。它成 `Raw` 只是因为 `symbols.json` 这 40 项没收它，而这**不是** `cancel`/`vec` 那种缺口：那两个早就在 `commands.json` 里（`decoration` 与 `grid` 形状），建的是借形状的调用，可以编辑；`RR` 才是"符号表没收、只能保留原文由引擎自己画"的那一类。
 
 ## 两棵树：可编辑树与显示树
 
@@ -372,11 +362,11 @@ View:      macro
 
 加一个 `Kind` 时编译器会要求把这几件事一次说清：`Kind::shape()` 与 `Kind::grammar()` 都是穷尽 `match`；编辑规则那张表是**按名字查的**，所以它另有一条对账测试（`editing::tests::every_shape_declares_its_editing_rules`）要求每个形状都在表里有一次回答，且表里没有形状表不认识的键。
 
-`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个形状可以认领 0 个（编辑器专有：`macro`/`template-call`/`parameter`/`unknown`；后两个是模板树里那两个变体在注册期投影时的中间形状名，**不上线**）、1 个或多个（`raw` 认领 `Box`/`Mathml`/`External`；`sqrt` 与 `root` 都认领 `Radical`；`char`/`symbol`/`style` 都认领 `Glyph`；`decoration` 认领 `Accent` 与 `Cancel`）。对账是**按形状**做的，不是按 `Kind`——`Radical`/`Accent`/`Cancel`/`Line` 只由借来的形状认领，五个描述符 `Kind` 删掉之后，形状表是唯一认领它们的地方。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何形状认领的变体"恰好等于 `slots::UNMODELLED`——现在只剩 `Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一项就必然要改那张表，并在那里写下为什么其余几项还没做。这三项与上一节的"名字表"是**两件事**：`VecElem` 连名字都没进表，而 `Group` 是"编辑器的一个格子就是一个 group"、根本不需要谁去代表它。`cancel` 则是第三类——它靠 `commands.json` 里的一行把 `decoration` 形状借过来用，`MathKind::Cancel` 因此由那个形状一并认领（见下节）。形状名与线名**故意可以不同**（`Kind::Fenced` 的形状名仍是 `delim`，线名是 `decorated`）：形状名是配置、`Shape` 表与编辑规则表共用的键，线名是给前端的绘图契约，只在画法变化时才需要改。
+`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个形状可以认领 0 个（编辑器专有：`macro`/`template-call`/`parameter`/`unknown`；后两个是模板树里那两个变体在注册期投影时的中间形状名，**不上线**）、1 个或多个（`raw` 认领 `Box`/`Mathml`/`External`；`sqrt` 与 `root` 都认领 `Radical`；`char`/`symbol`/`style` 都认领 `Glyph`；`decoration` 认领 `Accent` 与 `Cancel`）。对账是**按形状**做的，不是按 `Kind`——`Radical`/`Accent`/`Cancel`/`Line` 只由借来的形状认领，五个描述符 `Kind` 删掉之后，形状表是唯一认领它们的地方。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何形状认领的变体"恰好等于 `slots::UNMODELLED`——现在只剩 `Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一项就必然要改那张表，并在那里写下为什么其余几项还没做。这三项与上一节的"名字表"是**两件事**：`VecElem` 的 `vec` 已通过配置映射到 grid 形状，而 `Group` 是"编辑器的一个格子就是一个 group"、根本不需要谁去代表它。`cancel` 则是第三类——它靠 `commands.json` 里的一行把 `decoration` 形状借过来用，`MathKind::Cancel` 因此由那个形状一并认领（见下节）。形状名与线名**故意可以不同**（`Kind::Fenced` 的形状名仍是 `delim`，线名是 `decorated`）：形状名是配置、`Shape` 表与编辑规则表共用的键，线名是给前端的绘图契约，只在画法变化时才需要改。
 
 `Char` 的载荷是**一个字形簇**（`String`，不是一个 `char`），因为"字符"与"Unicode 标量"不是一回事：`é` 可能是一个标量也可能是两个，emoji 常是好几个。词法本来就把一个字形簇收进一个节点，`GlyphItem` 也装一个簇——按标量拆会让回写在簇中间插入分隔符，把 `é` 写成 `e ́`。`Kind::Number` 同理是"一个格"，串内字符由 `Write::Run` 连成一个记号。
 
-**命令名在 `config/commands.json` 里**，`crates/core/build.rs` 把它和 `config/symbols.json` 一起生成成 `COMMANDS`/`SYMBOLS` 两张表。文件里的值是 **`Kind` 的 `view` 名**（`frac` → `fraction`、`mat` → `grid`、`hat` → `decoration`），因为视图名是给前端的契约、比 `Kind` 变体名稳定（`Frac` 改名成 `Fraction` 不影响这个文件的意思）。`slots::shape_named` 把形状名翻译回 `Shape`。
+**命令名在 `config/commands.json` 里**，`crates/core/build.rs` 把它和 `config/symbols.json` 一起生成成 `COMMANDS`/`SYMBOLS` 两张表。文件里的值是 **`Shape::view` 的形状名**（`frac` → `fraction`、`mat` → `grid`、`hat` → `decoration`），因为形状名是配置与编辑规则共用的键、比 `Kind` 变体名稳定（`Frac` 改名成 `Fraction` 不影响这个文件的意思）。`slots::shape_named` 把形状名翻译回 `Shape`。
 
 这条配置只回答一个问题：**"这个名字，编辑器有没有对应的结构"**。它不回答参数个数（那是 `Shape::slots` 的长度：`fraction` 两格、`decoration` 一格）、不回答拼写（那是 `Grammar::write`，而对一个调用永远是 `Write::Named`）。所以它不是第二张表，而是"编辑器认识哪些命令"这**一个**事实的存放处——`slots.rs` 的两条单元测试把它钉在这里：每个名字必须指向一个真实存在、且形状名与声明一致的 `Shape`，反之每个"命令能建的形状"也必须有名字。
 
@@ -390,8 +380,8 @@ View:      macro
 
 - `editing::Entry::Role` 按**角色**指定光标首次进入的格子，因此根式向前进入落在"根指数"（它是书写顺序里的第一格）。
 - `editing::Vertical::Swap { end_up }` 区分上下键换格后落在格首还是格尾：分式落格首、根式落格尾。
-- 写模板**不再需要表达格序与拼写不一致**：`Root` 曾经把格子存成 `[被开方式, 根指数]`（与 Typst 的 `root(index, radicand)` 相反），靠 `Write::Template("root({1}, {0})")` 在回写时反回来，解析期再用 `args.swap(0, 1)` 配合——同一个事实写在两处，还牵动入口角色、上下互换、`Horiz::Pair` 与 `∛x` 的构造。现在格子就按书写顺序存，模板读作 `root({0}, {1})`，那四处一起消失。模板必须单遍展开，否则格子源码里的花括号会被当成占位符。
-- `Kind::Scripts` 的存储固定为 `[base, upper, lower]` 三格（`math::script_cell` 是唯一的格索引来源），空格子表示没有该脚标；视图因此不再需要合成缺格。Typst 的 `ScriptsItem` 有六个附件字段，因为它区分"居中极限"与"侧挂脚标"、并且保留左侧附件；一个格子属于哪一种由编译器决定、单独去问（`native-adapter`），不存在这里。
+- 写模板**不再需要表达格序与拼写不一致**：`Root` 曾经把格子存成 `[被开方式, 根指数]`（与 Typst 的 `root(index, radicand)` 相反），靠 `Write::Template("root({1}, {0})")` 在回写时反回来，解析期再用 `args.swap(0, 1)` 配合——同一个事实写在两处，还牵动入口角色、上下互换、`Horiz::Pair` 与 `∛x` 的构造。现在格子按书写顺序存，root 调用通过 `Write::Named` 回写，不再需要那四处转换。仍使用 `Write::Template` 的 Fraction 必须单遍展开，避免把格子源码中的花括号当作占位符。
+- `Kind::Scripts` 的存储固定为 `[base, upper, lower]` 三格（`math::script_cell` 是唯一的格索引来源），空格子不写出脚标；投影时未使用的空格显示为 `absent`，光标正在其中编辑的空格保留 `empty-cell` 与 stop。Typst 的 `ScriptsItem` 有六个附件字段，因为它区分"居中极限"与"侧挂脚标"、并且保留左侧附件；一个格子属于哪一种由编译器决定、单独去问（`native-adapter`），不存在这里。
 
 视图节点还带一个 `role`：父节点声明的**槽位角色**（`numerator`/`denominator`/`base`/`upper`/`lower`/`radicand`/`index`/`inner`/`cell`/`arg`）。前端 `mathview.py` 按角色取子节点，位置只作回退，所以一个复用已有排布与角色的新 `Kind` 不需要改前端。
 
@@ -400,7 +390,7 @@ View:      macro
 `Shape::view` 是**形状名**，不是线名，两者可以不同：
 
 * 形状名要**每个 `Kind` 唯一且稳定**，因为它是三张表共用的键：`config/commands.json` 写的是它（`slots.rs` 的测试就钉着这条），`editing::RULES` 也按它取（对账测试钉着那条），所以 `Kind` 变体改名不该动它（`Frac` → `Fraction` 之后仍是 `fraction`）。
-* 线名由 `view_atom` 算出来，因此**可以把几个形状合并到一个线上 kind**，而它就合并了：`Sqrt`、`Fenced`、`Accent`、`Line` 一律以 `decorated` 上线，靠 `marker` 区分画法。
+* 线名由 `view_atom` 算出来，因此**可以把几个形状合并到一个线上 kind**，而它就合并了：`sqrt`、`delim`、`decoration`、`line` 形状一律以 `decorated` 上线，靠 `marker` 区分画法。
 
 这不是审美问题，是四者的**盒子与编辑声明逐项相同**（1 格、`Arity::Exact`、`class` 0，编辑上 `Entry::Edge`、`Horiz::Linear`、`Vertical::None`），只有 `write` 与画法不同。线名按"一条独立的编辑或显示逻辑"划，形状名按"配置与编辑规则能指向什么"划，两者各自成立。
 
@@ -421,16 +411,16 @@ View:      macro
 
 ### `raw_macro` 覆盖什么：**所有非结构调用**
 
-判据只有一条，而且它是语法层面的：**一个调用的实参是否**全部是位置实参**。
+解析先检查名字是否被文档绑定遮蔽，再检查参数形式、配置形状与展开条件。未绑定的未知调用只有在实参全为可结构化的位置实参时才成为 `MacroCall`。
 
 | 情况 | 节点 | 例子 |
 | --- | --- | --- |
 | 名字在配置里 | `MacroCall`，**借用那个形状** | `frac(a, b)`、`sqrt(x)`、`vec(1, 2, 3)` |
 | 名字**不在**配置里，实参全是位置实参 | `MacroCall`，**形状未知 → `raw_macro`** | `bb(A)`、`binom(n, k)`、`text("hello")` |
 | 有具名实参 / 展开 / 尾分号 | `Raw`（一个格子表拼不回原样） | `lr(x, size: #100%)`、`mat(x, delim: #none)` |
-| 名字是个绑定宏 | 宏的那条路（可展 → `macro`，否则 `raw_macro`） | `#let f(a) = …` 之后 `f(x)` |
+| 名字是个绑定宏 | 可静态展开且参数匹配时建 `MacroCall`，投影超限等情况显示 `raw_macro`；不可展开、参数不匹配或把内容值当函数调用时，解析直接保留 `Raw` | `#let f(a) = …` 之后 `f(x)` |
 
-最后一项是**放宽之后的行为变化**：从前"实参落在 `Raw` 里"是让宏不可展的判据（`#f` 在 `Raw` 里 ⇒ 没有槽位可给参数），而未知调用**就是** `Raw`，所以一个内部有未知调用的宏整体不可展。现在那个内部调用是 `MacroCall`（画成 `raw_macro`、参数仍可编辑），参数进了格子，于是**展开是安全的**——`source_modes.rs` 里 `jac`（内部调未定义的 `pd`）从"不可展"变成"可展，展开结果里 `pd(…)` 是 `raw_macro`"。
+未知位置调用的结构化带来一项变化：从前"实参落在 `Raw` 里"是让宏不可展的判据（`#f` 在 `Raw` 里 ⇒ 没有槽位可给参数），而未知调用**就是** `Raw`，所以一个内部有未知调用的宏整体不可展。现在那个内部调用是 `MacroCall`（画成 `raw_macro`、参数仍可编辑），参数进了格子，于是**展开是安全的**——`source_modes.rs` 里 `jac`（内部调未定义的 `pd`）从"不可展"变成"可展，展开结果里 `pd(…)` 是 `raw_macro`"。
 
 这一条也是为什么 `Raw` 仍然存在：**它不是"没有形状的调用"，而是"格子表表达不了的源码"**。`lr(x, size: #100%)` 永远是 `Raw`，因此仓库里"一个没有图像的片段"的范例从 `undefinedfunc(α)`（现在可解析、成了结构节点）换成了**裸标识符** `undefinedname`——标识符永远不会变成调用，所以它是最稳的那个范例。
 
@@ -438,11 +428,11 @@ View:      macro
 
 ### `raw_macro` 有两种画法，取决于光标在哪
 
-它是唯一一个**画法随光标位置变**的节点，而这是它可以做到的原因：两种画法来自**同一棵树**，区别只在用不用孩子。
+它与 style 都会随光标位置切换画法，而这是它可以做到的原因：两种画法来自**同一棵树**，区别只在用不用孩子。
 
 | 光标位置 | 画法 | 用什么 |
 | --- | --- | --- |
-| 在节点**外** | 调用**本身的一张图**（就是文档里那一块） | `text` = 调用的拼写，交给引擎编译 |
+| 在节点**外** | 有图时画调用本身的图；等待时画调用槽；失败时画源码框 | `render_request` 定位，`text` 为绑定后的调用拼写 |
 | 在节点**内** | 宏名 + 若干个参数槽 | 视图里的 children（`symbol` 与各实参格） |
 
 后端为此做两件事：`view.rs` 把 `text` 从**文案**换成**调用的拼写**，并挂上 `edit` 光标；`document.rs` 的 `annotate` 因此把它和 `raw` 一样对待，算出它在文档里的区间并给一个 `render_id`。实测：
@@ -473,15 +463,15 @@ render.raw: [{start:684, end:694}]
 
 第二种最要紧：`cancel(#x)` 是"造一个不可展宏"的手段，它结构化之后那些用例就失去了构造方式。替代范例换成 **`lr(x, size: #100%)`**（按 `git grep -F 'lr('` 数：14 个文件、80 处）：`lr` 带具名实参，而解析器对**非位置实参一律退回原文**，所以它保持 `Raw` 是由语法保证的，不只是"暂时没进配置"。`rawcache.contains_call` 也仍然认它（`标识符` 紧跟 `(`）。
 
-两类容易漏的坑：一是**硬编码的长度**——`test_desktop.py` 里 `definition+9` 是照着 `cancel(a)` 的 9 个字符写的，换范例后静默变成错的偏移（现在改为从字符串本身取长度）。二是**不会变红而是静默失去被测对象**：`round_trip.rs` 与 `structured_input.rs` 的 Raw 清单里也躺着 `cancel(...)`，它们会继续通过，但已经不在测 Raw 了。所以 `tests/round_trip.rs` 另加了一条直接断言——`cancel` 之所以是结构节点**只因为配置文件写了它**，而往返测试看不见这件事（删掉配置项后它变成 `Raw`，照样逐字节往返），与 `math::is_number` 是同一类盲区。
+两类容易漏的坑：一是**硬编码的长度**——`test_desktop.py` 里 `definition+9` 是照着 `cancel(a)` 的 9 个字符写的，换范例后静默变成错的偏移（现在改为从字符串本身取长度）。二是**不会变红而是静默失去被测对象**：`round_trip.rs` 与 `structured_input.rs` 的 Raw 清单里也躺着 `cancel(...)`，它们会继续通过，但已经不在测 Raw 了。所以 `tests/round_trip.rs` 另加了一条直接断言——`cancel` 之所以是结构节点**只因为配置文件写了它**，而往返测试看不见这件事（删掉配置项后它仍是 MacroCall，只失去 decoration 形状，照样往返），与 `math::is_number` 是同一类盲区。
 
 前端另有一张 `ARRANGEMENTS` 白名单：遇到不认识的排布**报告一次**（经 `Typesetter.warn` 到状态栏），而不是静默按横排画错。
 
-回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 **16** 个可往返 Kind 逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿，三者没有 Typst 拼写）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符，`editing.rs` 的单元测试保证编辑规则表与形状表两侧互为全集，且规则引用的每个 `role` 都在那个形状的槽位里存在。
+回写仍是最需要兜底的一环，因为它的结果会写回权威源码。`tests/round_trip.rs` 对 **11** 个可写回源码的 Kind 及借用形状的命令逐一验证"写出去、读回来、必须等于原树"（`TemplateCall`/`Parameter` 只存在于宏模板，`Unknown` 是命令草稿；这三者不作为正常源码树的往返对象）。`tests/caret_navigation.rs` 把表里每一条导航声明钉在真实光标位置上；`slots.rs` 的单元测试保证每一条声明的形状与它自己的 `Kind` 相符，`editing.rs` 的单元测试保证编辑规则表与形状表两侧互为全集，且规则引用的每个 `role` 都在那个形状的槽位里存在。
 
 每个 `Kind` 实际给前端提供了什么、对应的引擎 item 又有什么、两者差在哪，逐条列在 `docs/kind-inventory.md`（从真实后端与真实适配器取回，不是读代码推的）。
 
-## 两条预览路径，别混起来
+## 实时预览与整页导出
 
 **实时预览走 Tinymist，整页 SVG 走我们自己的适配器**，两者互不依赖：
 
@@ -489,14 +479,14 @@ render.raw: [{start:684, end:694}]
 | --- | --- | --- |
 | 入口 | 视图菜单 → 显示 / 隐藏实时预览（默认关） | 文件 → 导出 SVG |
 | 谁渲染 | **Tinymist**（它自己的进程与 WebSocket，增量推送） | native-adapter（`/api/preview`） |
-| 编辑器做什么 | 把 Tinymist 的页面装进 web view | 把返回的页面 SVG 装进 `QSvgWidget` |
+| 编辑器做什么 | 把 Tinymist 的页面装进 web view | 保存返回的页面 SVG；内部 `QSvgWidget` 不作为可见预览入口 |
 | 关闭时 | `tinymist.doKillPreview`（开着的预览就是编译器） | 无状态 |
 
-原生 `RenderRequest.preview` 为 true 时，直接编译原文，不插入结构编辑器的 24pt 字号或映射标签。FontStore 加载随附字体及系统字体；日期由系统提供。已打开的项目内文档与未保存的 import/include 依赖作为 overlays 传入。页面尺寸、字体和正文样式由原文决定。窗口按需请求整页 SVG、保留上次成功页面并显示错误，页面尺寸按编辑区宽度缩放。
+原生 `RenderRequest.preview` 为 true 时，直接编译原文，不插入结构编辑器的 24pt 字号或映射标签。FontStore 加载随附字体及系统字体；日期由系统提供。已打开的项目内文档与未保存的 import/include 依赖作为 overlays 传入。页面尺寸、字体和正文样式由原文决定。窗口在显式导出时请求整页 SVG；内部页面组件可保存页面与定位数据，但没有独立的可见整页 SVG 预览入口。
 
 ## 当前边界
 
-- 公式静态投影在进入公式后缓存；源码输入 `$` 不自动变成控件。
+- 初次载入即为完整、可编辑公式建立静态 View；随后按源码、定义与作用域变化增量更新。输入中的 `$` 不立即强制进入结构编辑。
 - 宏的结构展开仍沿用受限静态分析，任意 Typst 求值由引擎处理。
 - Raw SVG / 附件位置沿用按需刷新策略；不保证任何源码修改后都自动刷新全部数学投影。
 - 代码高亮为轻量 Typst token 高亮，诊断和语义查询由 Tinymist 提供。

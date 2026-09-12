@@ -1,139 +1,123 @@
 # `Kind` 能力清单
 
-这张表回答一个问题：**每个 `Kind` 现在能给前端提供什么信息，以及它对应的 Typst 引擎 item 还能提供什么而编辑器没有。**
+本文区分编辑树的存储 `Kind`、配置和编辑规则使用的形状名，以及前端收到的 View kind。当前事实以 `crates/core/src/math.rs`、`slots.rs`、`editing.rs`、`view.rs` 与 `src/document.rs` 为准；`tools/kind_inventory.py` 用真实后端核对线上排布，第六节保留早期引擎测量及其后续修正。
 
-三列信息来源不同，读的时候要分开：
+## 一、存储 Kind 与借用形状
 
-- **存储 / 声明** 是代码事实，来自 `crates/core/src/math.rs` 的 `Kind` 与 `crates/core/src/slots.rs` 的 `Decl`（唯一一张表，穷尽 `match`）。
-- **线上实测** 是从真实 release 后端取回来的，不是读代码推的：`tools/kind_inventory.py` 驱动 `typformula.exe --desktop-core`，按行发 `{"action":…}` JSON，`set_source` → `activate_formula` → 需要时再发 `input`，然后取 `state` 回来的 `view`。每个 Kind 至少一个能真正产生它的源文（宏那几项见下面的"不能从源码到达的两项"）。
-- **引擎** 一栏来自 `vendor/typst/crates/typst-library/src/math/ir/item.rs`，是编译器自己的 item 形状；表里引用的盒子由 `tools/engine_boxes.py` 用真实适配器量出。
+`Kind` 枚举共有 **14 个变体**：12 个可进入编辑树（含命令草稿 Unknown），另 2 个仅用于注册期模板。正常源码往返覆盖其中 11 个；模板专用项与命令草稿不作为正常源码树写回。
 
-`class` 单独说：只有 `Fraction` 与 `Table` 在表里写死为 `7`，`Multiline` 与其余都是 `0`，而 `Char` 的类是**由字符本身决定**的（`slots::char_class`），表里那一格永远不会被读。
-
-## 一、主表
-
-「视图名」这一列是 **`Shape::view`，也就是*形状*名**——它是 `config/commands.json` 写的那个名字。**它不一定是线上的名字**：`view_atom` 可以把几个形状合并成一个线 kind，八处形状名与线名不同——`sqrt`/`delim`/`decoration`/`line` 都走 `decorated`（靠 `marker` 区分画法）：
-
-| 形状名（`Shape::view`） | 线名（`view_atom`） |
-| --- | --- |
-| `sqrt`、`delim`、`decoration`、`line` | `decorated` |
-| `script` | `scripts` |
-| `grid` | `table` |
-| `aligned` | `multiline` |
-| `macro`（折叠时） | `raw_macro` |
-
-**下表的每一行都是一个真的会被存进树的 `Kind`。** 形状比 `Kind` 多：`sqrt`/`root`/`delim`/`line`/`decoration`/`style` 这六个只有 `Shape` 而没有对应的 `Kind`——`sqrt(x)`、`hat(x)`、`bold(x)`、`abs(x)` 这些**调用形式**一律存成 `MacroCall`（形状由名字查出来），`√x`/`∛x` 也折进同一个 `MacroCall`。它们的槽位、导航、排布名与画法分别在 `Shape` 表和 `config/commands.json` 里（取图数据如 `abs` 的定界符对、`overline` 在上还是在下，就写在配置里）。
-
-`Sqrt`/`Root`/`Accent`/`Line`/`Style` 五个变体**曾经留在 `Kind` 里**当"形状描述符"，现已被删除；判据见 `docs/architecture.md`：一个构造要是自己的 `Kind`，得带着名字与配置都给不出的**实例数据**（`Table.columns`、`Fenced.left/right`、`Multiline.row_lengths`、`Raw.source`……），或者要保住书写形式。`Fraction` 与 `Fenced` 都满足这条，所以它们真的被存下来（`frac(a, b)` 与语法写法 `a/b` 都存 `Kind::Fraction`）。
-
-借形状的命令的线上实测，按形状列在这里：
-
-| 命令 | 借的形状 | 线上排布 | marker |
+| 存储 Kind | 实例字段（子格统一在 MathAtom.cells） | 形状 / 线上 View | 拼写与编辑要点 |
 | --- | --- | --- | --- |
-| `frac` | `fraction` | `fraction` | `-` |
-| `sqrt` | `sqrt` | `decorated` | `radical` |
-| `root` | `root` | `root` | `radical` |
-| `abs` / `norm` | `delim` | `decorated` | `delim` |
-| `hat` / `cancel` | `decoration` | `decorated` | 命令名本身 |
-| `overline` / `underline` | `line` | `decorated` | `overline` / `underline` |
-| `bold` / `upright` | `style` | `style` | 无（用 `style_name`） |
-| `mat` / `vec` / `cases` | `grid` | `table` | 无（见 `Table` 行） |
+| Char | text：一个字形簇 | char / char | 保留字符源码；可有 display_glyph 显示覆盖 |
+| Symbol | name、glyph | symbol / symbol | 按 name 回写，View.text 是 glyph |
+| Number | 无 | number / number | 一个 inner 格，内部逐字 Char；回写连成数字串 |
+| Raw | source | raw / raw | 保留原文；edit 光标用于失败后打开源码 |
+| Text | 无 | text / text | 一个 inner 格，按带引号字符串回写 |
+| MacroCall | name、function | 配置形状或 macro / 配置 View、macro、raw_macro | 函数写 name(args)，内容值写裸名字；实参按绑定或配置确定 |
+| Fraction | 无 | fraction / fraction | 来自语法 a/b；当前规范回写 frac(a, b) |
+| Scripts | 无 | script / scripts | 固定 base、upper、lower 三格；空脚标不写出 |
+| Fenced | left、right | delim / decorated | 保留实际定界符；marker 为 delim |
+| Table | columns、row_lengths、name | grid / table | mat/vec/cases；矩阵逐行补空块至齐行，补齐格可编辑并写回 |
+| Multiline | columns、row_lengths | aligned / multiline | 对齐列用 &、行用反斜杠；保留各行原列数 |
+| Unknown | name、saved、caret、anchor、original | unknown / unknown | 命令或源码草稿；显示为 draft-* 子节点，不是已提交源码 |
+| Parameter（模板专用） | index、name | parameter（仅注册期） | 参数身份为 index，临时拼写为定义中的真实 #name；不上线 |
+| TemplateCall（模板专用） | definition | template-call（仅注册期） | 先前宏版本的模板引用；不能交给正常源码写回，上线前展开 |
 
-| `Kind` | 存储字段 | 槽位（role·scale·可空） | 入口（前进 → / 后退 ←） | 左右 | 上下 | 形状名 | 回写 | 线上实测 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `Char` | `text`（**一个字形簇**） | 无（叶子） | 边界 | 线性 | 无 | `char` | 自己的 `text` | `text`=字符；编辑器里打的 `-` 另带 `display_glyph`=`−`(U+2212) |
-| `Symbol` | `name`, `glyph` | 无 | 边界 | 线性 | 无 | `symbol` | 自己的 `name` | `text`=`glyph`（如 `alpha` → `𝛼`） |
-| `Number` | 无 | `inner`(100%) | 边界 | 线性 | 无 | `number` | 格内字符**不加分隔符**（`Write::Run`） | children 1×`cell@inner`，里面逐字是 `char`（`12.5` 是 4 个）；光标因此能停在数字之间 |
-| `Raw` | `source` | 无 | 边界 | 线性 | 无 | `raw` | 自己的 `source` | `text`=源码片段 + **`edit`**（一个真实光标，前端据此给"打开源码"）；在宏模板里另带 `definitions`/`origin`/`source_range` |
-| `Unknown` | `name`, `saved`, `caret`, `anchor`, `original` | 无 | 边界 | 线性 | 无 | `unknown` | 自己的 `name` | `text`=空串，内容全在 children：`draft-placeholder`/`draft-text`/`draft-caret`，**都不带 role** |
-| `Parameter` | `index` | 无 | 边界 | 线性 | 无 | `parameter` | 占位 `#parameter{n}` | **不上线**（见第五节） |
-| `Text` | 无 | `inner`(100%) | 边界 | 线性 | 无 | `text` | 带引号的字符串 | children 1×`cell@inner`；`text` 为空串 |
-| `MacroCall` | `name`, `function` | `arg`(100%)，可重复 | 边界（首/末格） | 线性 | 无 | `macro` / `raw_macro` | 具名调用或裸名字 | `text`=宏名 + children 1×模板视图；子节点 `macro-argument` 的 `text`=形参名。折叠时 `text`=**调用本身的拼写**（用来取这一段的图），children=`symbol("名(")`、参数 `cell`、`symbol(")")` |
-| `TemplateCall` | `definition` | `arg`，可重复 | 边界 | 线性 | 无 | `template-call` | 模板专用（写入时 `unreachable!`） | **不上线**（见第五节） |
-| `Fraction` | 无 | `numerator`(90%)、`denominator`(90%) | 分子 / 分母 | **锁定** | 互换，落格首 | `fraction` | `frac({0}, {1})` | children 2×`cell@numerator`/`cell@denominator` |
-| `Scripts` | 无 | `base`(100%)、`upper`(70%,可空)、`lower`(70%,可空) | `base` / `base` | **锁定** | 附件专用 | `script` | 自己拼 `^(…)`/`_(…)` | 线名是 **`scripts`**；**`attachment`**（仅顶层根分支）+ children 3：`cell@base`、`cell@upper`、`cell@lower`；缺席的脚标是 `absent`，**也带同一个 role** |
-| `Fenced` | `left`, `right` | `inner`(100%) | 边界 | 线性 | 无 | `delim` | `abs()`/`norm()`/字面定界符 | 线上是 `decorated`/`marker="delim"`，字符仍在 `text`（`"左\n右"`）+ children 1×`cell@inner` |
-| `Table` | `columns`, `row_lengths`, `name` | `cell`(100%)，可重复 | 中行首/末格 | 列内 | 列运算 | `grid` | `name(…)`：`mat` 行用 `;`，`vec`/`cases` 一个参数一行 | 线名是 **`table`**；`columns` + `row_lengths` + `N×cell@cell`，另带 `border`/`is_mat`（由 `name` 查配置得到） |
-| `Multiline` | `columns`, `row_lengths` | `cell`，可重复 | 边界 | 列内 | 列运算 | `aligned` | 行用 `&`、`\` | 线名是 **`multiline`**；`columns` + `row_lengths` + N×`cell@cell`（`row_lengths` 两个 kind 都会上线，前端据此跳过补齐格） |
+`sqrt`、`root`、`decoration`、`line`、`style` 都是形状，没有同名的存储 Kind。配置调用 `frac(a, b)` 同样存为 MacroCall，而不是 Fraction；`√x` / `∛x` 分别折入 sqrt/root 调用。`delim` 既能由配置调用借用，也能由 Fenced 使用。
 
-## 二、线上 `View` 的字段，谁填了什么
-
-`View` 的字段（`crates/core/src/view.rs`）。**没有一个 Kind 填满过**，所以"某个 `Kind` 能提供什么"实际上是逐字段看：
-
-| 字段 | 谁填 | 实测值示例 |
+| 配置命令 | 借用形状 | 线上 View / 绘制字段 |
 | --- | --- | --- |
-| `kind` | 全部 | 视图名（**线名**，可以与*形状名*不同：`sqrt`/`delim`/`decoration`/`line` 都是 `decorated`，`script`/`grid`/`aligned` 分别是 `scripts`/`table`/`multiline`，`macro` 折叠时是 `raw_macro`） |
-| `text` | 每个节点都有这个字段，但**带内容的只有** `Char`/`Symbol`/`Number`/`Raw`/`raw_macro`/`Fenced`/`decorated`/`style`；`Unknown` 与所有结构性 `Kind` 都是空串 | `hat`、`(\n)`、`x`、`12.5`、`layer15(a)`、`bold(upright(a))` |
-| `role` | 父节点填给子节点（`Shape::role_at`）；根节点不填 | `numerator`、`radicand`、`inner` |
-| `display_glyph` | **只有 `Char`**，且只有这个字符在 `config/symbols.json` 里时 | 打的 `-` → `−` |
-| `children` | 除叶子外全部；`Scripts` 恒 3 个（缺席补 `absent`） | — |
-| `cursor` | 每个 `stop` 节点（插入位），不在 Kind 节点上 | — |
-| `active` / `selected` | 全部，由光标与选区决定 | — |
-| `columns` | `Table`(列数)、`Multiline`(列数)、`TemplateCall`(定义序号)、`Parameter`(参数序号)、`macro-argument`(参数序号) | `2` |
-| `row_lengths` | `Table` 与 `Multiline`：**补齐前**每行真正有几格。前端据此**跳过补齐格**，否则会画出源码里没有的空槽 | `mat(a, b; c)` → `[2, 1]` |
-| `marker` | 画法靠名字而不是靠形状的节点：`decorated`（`radical`/`delim`/`hat`/`overline`/`underline`/`cancel`）与 `root` | `radical` |
-| `style_name` | **只有 `style`**：命令名。前端画"光标进入后显示的名字"用它，而**取字用的是 `text`**（整段调用拼写），两者不是一回事 | `bold` |
-| `border` | 表格的定界符，左+右或单边一个 | `mat`/`vec` → `()`；`cases` → `{ ` |
-| `is_mat` | 表格按 `mat` 的方式切行（而不是一个参数一行） | `mat` true，`vec`/`cases` false |
-| `edit` | **`Raw`、`raw_macro` 与 `style`**。前两者靠"源码 + 光标"在文档里定位；`style` **不取图**，它的 `edit` 只对前端有意义，因此**没有** `source_range` | `{slices:[], pos:0, occurrence:"root.a0.edit"}` |
-| `attachment` | **只有顶层 `Scripts`**，值是它的 Typst 拼写 | `x^(2)` |
-| `definitions` / `origin` / `source_range` | **只有位于宏模板里的 `Raw`** | 定义上下文 / 定义源码 / 定义中的区间 |
+| frac | fraction | fraction，marker="-" |
+| sqrt | sqrt | decorated，marker="radical" |
+| root | root | root，marker="radical" |
+| abs / norm | delim | decorated，marker="delim"，text 为定界符对 |
+| hat / cancel | decoration | decorated，marker 为命令名 |
+| overline / underline | line | decorated，marker 为命令名 |
+| bold / upright | style（主体可表示为字形串时） | style，style_name 为命令名；否则 raw_macro |
+| mat / vec / cases | grid | table，border / is_mat 按配置填写 |
 
-## 三、引擎侧：对应 item 与它的字段
+此表以名字未被文档绑定遮蔽、实参形式受支持为前提。未知的位置调用如 `bb(A)` 存为 MacroCall，投影为 raw_macro；具名实参、不可静态展开的已绑定宏、不匹配的绑定实参等在解析期回退 Raw。已存在的 MacroCall 在投影超限或绑定条件变化时也可退为 raw_macro。
 
-| `Kind` | `MathKind` | 引擎 item 的字段 |
+## 二、槽位、导航与空槽
+
+Shape 声明 role、scale、arity、view 与 class/引擎对应信息；导航从 `editing::Rules` 取，实例可达性由是否携带调用点的 stop 决定。`Slot.optional` 已删除。scale 是内核声明，当前 View 不传它，前端排布分支仍独立写出相应缩放比例。
+
+| 形状 | 格子角色（声明比例） | 导航要点 |
 | --- | --- | --- |
-| `Char` | `Glyph` | `GlyphItem`：`text`（**恰好一个字形簇**，构造函数里有 `assert`）、`class`、`stretch`、`mid_stretched`、`flac` |
-| `Symbol` | `Glyph` | 同上 |
-| `Number` | `Number` | `NumberItem`：`text`（数字串；引擎在 `resolve_text` 里按"全 ASCII 数字、至多一个点、至少一个数字"判定） |
-| `Raw` | `Box`、`Mathml`、`External` | `BoxItem`：`elem`、`locator`；`MathmlItem`：`elem`、`body`；`ExternalItem`：`content`、`locator` |
-| `Text` | `Text` | `TextItem`：`text`、`locator` |
-| `Fraction` | `Fraction` | `FractionItem`：`numerator`、`denominator`、`line`、`padding` |
-| `Sqrt` / `Root` | `Radical` | `RadicalItem`：`radicand`、`index: Option`、`sqrt`（根号字形本身） |
-| `Scripts` | `Scripts` | `ScriptsItem`：`base`、`top`、`bottom`、`top_left`、`bottom_left`、`top_right`、`bottom_right` |
-| `Fenced` | `Fenced` | `FencedItem`：`open: Option<MathItem>`、`close: Option<MathItem>`、`body`、`balanced` |
-| `Table` | `Table` | `TableItem`：`cells`、`gap`、`augment`、`align`、`alternator` |
-| `Multiline` | `Multiline` | `MultilineItem`：`rows: Vec<AlignedRow>`、`centered`；`AlignedRow` 是一行的各对齐列 |
-| `Accent` | `Accent` | `AccentItem`：`base`、`accent: MathItem`、`position`、`dotless`、`exact_frame_width` |
-| `Line` | `Line` | `LineItem`：`base`、`position`（没有记号，只有位置，所以编辑器也只存位置） |
-| `Style` | `Glyph` | 同 `Char`：变体在 `resolve` 里就替换成码位了，引擎这一侧**没有"变体"这个 item**——`GlyphItem.text` 直接是 `𝐚`，适配器读回来的就是它 |
-| `MacroCall`/`TemplateCall`/`Parameter`/`Unknown` | — | 编辑器专有，没有对应 item |
+| fraction | numerator / denominator（90%） | 前进进分子、后退进分母；左右锁定，上下换格落格首 |
+| root | index（55%）/ radicand（100%） | 按书写顺序存放；上下换格落格尾 |
+| script | base（100%）/ upper / lower（70%） | 默认从 base 进入，上下按附件规则导航 |
+| grid | 重复 cell（100%） | 列内移动，上下按列换行 |
+| aligned | 重复 cell（100%） | 使用行列导航，未使用的补齐格不显示 |
+| text / number | inner（100%） | Text 两端保留字符串导航；Number 可用左右键进出 |
+| macro | 重复 arg（100%） | 未借配置形状时按实参顺序进入；展开后仅实参可达 |
 
-另外每个 item 还都挂着一份 `MathProperties`：`class`、`size`、`cramped`、`limits`、`lspace`/`rspace`、`ignorant`、`spaced`、`align_form_infix`、`editor_label`、`span`。编辑器这边只搬了 `class`（进 `Decl`）；`limits`（居中极限还是侧挂脚标）是**单独去问**的（`native-adapter` 的 attachments 服务），其余都没有对应物。
+Scripts 恒有三个 View 子节点：有内容的脚标正常投影，未使用的空脚标为带 role 的 absent；光标正在其中编辑时保留 empty-cell 与 stop。因此 `a` 后输入 `^` 或 `_` 立即显示空槽和光标，而另一侧不会凭空显示。
 
-## 四、缺口：引擎有、编辑器没有
+`mat(a, b; c)` 的 columns=2、row_lengths=[2,2]，规范回写 `mat(a, b; c, "")`。Multiline 的 row_lengths 则保留各行原宽度，前端只跳过它未使用的补齐格。进入公式本身不会立即规范化原文。
 
-| `Kind` | 引擎有而我们没有 | 后果 |
+## 三、线上 View 字段及 host 附加字段
+
+| 字段 | 含义与填写者 |
+| --- | --- |
+| kind | 线上排布名；与 Shape.view 不必同名 |
+| text | 字符/字形、宏名、调用拼写、装饰记号或草稿文本等；Number/Text 自身为空串，内容在 children |
+| children / role | 子节点及父形状为它填写的槽位角色 |
+| display_glyph | Char 的显示覆盖；Symbol 的 glyph 直接放在 text |
+| cursor / active / selected | stop 的真实编辑位置，以及当前光标与选区状态 |
+| columns | 表格/对齐列数或 macro-argument 的参数序号；模板中间节点也暂用该字段，但不上线 |
+| row_lengths | Table 为补齐后的行宽，Multiline 为原行宽 |
+| marker / border / is_mat | 装饰类型、表格定界符与行切分方式 |
+| style_name | style 调用名；字形请求使用完整 text |
+| edit | 可达的 raw/raw_macro/style 及 macro 包装节点的源码编辑位置；模板材料没有独立 edit |
+| attachment | 受支持顶层 Scripts 的 Typst 拼写，范围穿过 Multiline；基底非空且不含草稿才发 |
+| definitions / origin / source_range | 模板 raw/raw_macro 的定义前缀、定义原文及字节区间；绑定后转为 style 时可保留 |
+| source_text | 模板片段的定位拼写，或 macro 包装节点的实际调用拼写；区别于绑定后的 text |
+| render_id / render_request | host 为已定位的 raw/raw_macro 附加 id/start/end；没有独立 edit 的模板 raw_macro 另带 call 与 occurrence |
+
+style 不进入 render.raw；即使带有模板来源区间，也不等于有取图请求。host 为外层 raw_macro 内的片段保留定位信息，但批次只选择当前显示所需的非重叠区间。
+
+style 使用 `/api/glyphs`，definitions 固定为空，缓存键为 `("", text, display)`，在途、成功（含空串）和失败分别处理。raw/raw_macro 使用 `/api/render`；带 call 的模板 raw_macro 按调用实例缓存，普通 Raw（包括模板中的 Raw）仍按源码和脚本摘要共享。具体失效规则见 [architecture.md](architecture.md) 与 [desktop.md](desktop.md)。
+
+## 四、引擎对应关系与当前缺口
+
+引擎 item 定义位于 `vendor/typst/crates/typst-library/src/math/ir/item.rs`；内核只有 Shape 中的名字对应，不链接编译器。
+
+| 编辑器节点或形状 | MathKind / 引擎信息 | 当前边界 |
 | --- | --- | --- |
-| `Accent` | `position` 由**记号字符自己**决定（`Accent::is_bottom` 用 ICU 的 `CanonicalCombiningClass::Below`），编辑器不存 | 编辑器只存命令名；今天接受的 `hat` 与 `cancel` 都把记号画在上面，所以这个偏差暂时看不出来 |
-| `Accent` | 记号本身是**已解析的 item**，并带 `dotless`（有帽字母去点的替换）与 `exact_frame_width` | 前端按名字手画记号（`hat` 两条线、`cancel` 一条对角线），拿不到 `accent_base_height`、拉伸量、`accent_attach` 这些字体度量 |
-| `Accent`（`cancel`） | `CancelItem` 的 `length`、`stroke`、`angle`、`inverted`、`cross` | 编辑器只存正文与命令名，前端固定画"内容框的上升对角线 + 0.3em"；`inverted`/`cross`/`angle` 表达不了。实测 `cancel(x)` 与 `x` 的盒子完全相同，所以记号是盖在正文上而不是把盒子撑高 |
-| `Sqrt`/`Root` | 引擎是一个 `Radical`，`index: Option` | 编辑器分成两个 `Kind`（这是**有意保留**的：两者插槽不同，合并反而对前端不友好） |
-| `Scripts` | 6 个附件字段（`top`/`bottom` 是居中极限，`top_right`/`bottom_right` 是侧挂脚标，另有左侧两个） | 编辑器只有 3 格；左侧附件 `native-adapter` 明确报错"暂不支持左侧附件的槽位映射" |
-| `Fenced` | 定界符是 `Option<MathItem>`（`cases` 只有一个） | `Fenced` 存的是 `left`/`right` **两个字符串**，所以单边定界符（右边为空）表达得了；这也是 `Kind::Fenced` 唯一超出"名字加配置"的实例数据 |
-| `Fraction` | `line`（是否有分数线）与 `padding` | 编辑器无法表达"无横线分式" |
-| `Table` | `gap`、`augment`、`align`、`alternator` | 只有列数（`columns`/`row_lengths`）；表内对齐（`align`）与增广线（`augment`）都没有。行方式与定界符来自 `config/commands.json` 里那个名字，不是引擎给的 |
-| `Multiline` | `centered` | 没有 |
-| 全部 | `MathProperties` 里的 `cramped`、`lspace`/`rspace`、`spaced`、`ignorant` | 间距类信息只有 `class` |
+| Char / Symbol / style | Glyph：字形簇、class、stretch 等 | style 读取引擎替换后的码位；未同步所有字形属性 |
+| Number / Text | Number / Text：text 等 | 采用可编辑字符容器 |
+| Raw | Box / Mathml / External | 片段保留源码，通过适配器取图 |
+| fraction | Fraction：numerator、denominator、line、padding | 前端固定画有横线分式，不支持全部 line/padding 设置 |
+| sqrt / root | Radical：radicand、index、sqrt | 两个借用形状、不同槽位；不是两个存储 Kind |
+| Scripts | Scripts：base 与六个附件字段 | 编辑树只有 base/upper/lower；不支持左侧附件映射 |
+| delim / Fenced | Fenced：open、close、body、balanced | 定界符用字符串表示；复杂伸缩可能简化 |
+| grid / Table | Table：cells、gap、augment、align、alternator | 行方式与定界符来自配置，未表示全部引擎选项 |
+| Multiline | Multiline：rows、centered | 前端按行列对齐，未携带 centered 字段 |
+| decoration（hat） | Accent：accent、position、dotless、exact_frame_width | 前端手画 hat，未获取全部重音字体度量 |
+| decoration（cancel） | Cancel：length、stroke、angle、inverted、cross | 前端固定画对角线，不表示全部取消线参数 |
+| line | Line：base、position | 位置按命令配置 above 决定 |
+| macro / 模板 / 草稿 | 无 | 编辑器专有，不对应独立引擎 item |
 
-## 五、不能从源码到达的两项
+附件服务只为公式顶层及 Multiline 对齐单元格顶层获取 limits/scripts 判定，分式、脚标内部等更深层尚未覆盖。请求携带完整公式上下文，适配器在保留封闭作用域的内存源码中求值；前端仍自行计算侧挂移位与盒子布局，并非直接复制引擎的全部坐标。
 
-`Kind::Parameter` 与 `Kind::TemplateCall` 只存在于**宏模板在注册期的那棵原子树**里，可编辑树与显示树都到不了：
+MathProperties 中的 cramped、lspace/rspace、spaced、ignorant 等尚未完整传给前端；class 是内核声明，只有按类跳词使用，不在 View 中。Shape 对账的 UNMODELLED 当前为 Group、Primes、SkewedFraction。
 
-- 解析宏定义体时 `ParseContext { template: true }`，`#x` 变成 `Parameter`、嵌套调用变成 `TemplateCall`；
-- 但定义体只解析这一次：注册期就把它**投影成显示树**存进 `MacroDefinition::template: Arc<ViewTemplate>`，原子树随后丢掉。投影出去的那棵树里，"洞"与"边"是**类型上的变体**（`ViewTemplate::Hole`/`Edge`）而不是两个节点，绑定时洞被实参视图整体替换、边被换成被调宏的展开——显示树里根本没有这种节点。
+## 五、模板专用项不上线
 
-实测：32 个用例的完整 `view` JSON 里，`"kind": "parameter"` 与 `"kind": "template-call"` 出现 **0 次**。它们仍必须有 `Shape`（注册期那次投影要经过 `view_atom`，`template_size` 也要遍历原子树），但**前端永远看不到它们**——`mathview.py` 的 `ARRANGEMENTS` 里已经**没有**这两个名字了，`tools/kind_inventory.py` 的双向对照因此不再需要例外清单：前端能画的名字，恰好等于后端真发出的名字加两个前端自造的。
+Parameter 与 TemplateCall 仅存在于注册期解析的原子树。定义体投影一次后保存为 `Arc<ViewTemplate>`，原子树丢弃；洞与边存为 `ViewTemplate::Hole` / `Edge`，绑定时替换成实参 View 和被调宏的展开。因此正常线上树没有 parameter/template-call 节点。
 
-## 六、探测中发现的十二件事
+`tools/kind_inventory.py` 对真实后端输出与前端 ARRANGEMENTS 做双向核对；symbol/absent 也可由前端合成，并非只由前端产生。新增形状或 View 时要同步核对配置、规则表、投影与前端画法。
 
-1. **`vec` 不是 accent。** `resolve_vec`（`resolve.rs:1018`）把每个参数变成一行再套定界符（`VecElem` 定义在 `matrix.rs`，默认 `delim: DelimiterPair::PAREN`）——它是**列向量**，和 `mat` 同族。`VecElem` 自己的文档就写着："To typeset a symbol that represents a vector, `math.accent[arrow]` and `bold` are commonly used"（`matrix.rs:23-25`）。编辑器把 `vec` 建成 `Accent`，而前端曾经按名字给它画一个箭头——**前端那行是凭名字猜的**（来自本仓库第二个提交 `d15f35d 桌面端`，Rust 侧从来没有 `arrow` 这个 Kind 或命令）。实测：`arrow(x)` 才是引擎的 `Accent`（13.728×17.328pt，宽度不变），`vec(x)` 是 29.5584×23.904pt（定界符被拉伸），两者不是一回事；`vec(x)` 与 `mat(x)` 的**映射 SVG 逐字节相同**，`vec(x, y)` 与 `mat(x; y)` 也相同。箭头已删除。**`vec` 现在进表了**：它是 `grid` 形状的第二个名字（`{"shape":"grid","rows":"each","border":"()"}`），行方式与定界符写在名字旁边，写回仍是 `vec(…)` 而不是 `mat(…; …)`；`cases` 同理，只是定界符是单边 `{ `。同一个形状下的第三个名字是 `mat`，它按分号切行。
+## 六、早期探测记录与后续修正
+
+1. **`vec` 不是 accent。** `resolve_vec`（`resolve.rs:1018`）把每个参数变成一行再套定界符（`VecElem` 定义在 `matrix.rs`，默认 `delim: DelimiterPair::PAREN`）——它是**列向量**，和 `mat` 同族。`VecElem` 自己的文档就写着："To typeset a symbol that represents a vector, `math.accent[arrow]` and `bold` are commonly used"（`matrix.rs:23-25`）。编辑器曾把 `vec` 建成 `Accent`，而前端曾经按名字给它画一个箭头——**前端那行是凭名字猜的**（来自本仓库第二个提交 `d15f35d 桌面端`，Rust 侧从来没有 `arrow` 这个 Kind 或命令）。实测：`arrow(x)` 才是引擎的 `Accent`（13.728×17.328pt，宽度不变），`vec(x)` 是 29.5584×23.904pt（定界符被拉伸），两者不是一回事；`vec(x)` 与 `mat(x)` 的**映射 SVG 逐字节相同**，`vec(x, y)` 与 `mat(x; y)` 也相同。箭头已删除。**`vec` 现在进表了**：它是 `grid` 形状的第二个名字（`{"shape":"grid","rows":"each","border":"()"}`），行方式与定界符写在名字旁边，写回仍是 `vec(…)` 而不是 `mat(…; …)`；`cases` 同理，只是定界符是单边 `{ `。同一个形状下的第三个名字是 `mat`，它按分号切行。
 7. **`mat` 的默认定界符是圆括号，前端曾经一律画方括号（已修正）。** `MatElem::delim` 默认 `DelimiterPair::PAREN`（`matrix.rs:103`）。实测 `(mat(x))` 比 `mat(x)` 宽出正好一对定界符（48.2304 − 29.5584 = 18.672pt，与 `(x)` − `x` 相同），说明 `mat` 自己那对确实画着圆括号。原先 `mathview.py` 的 `grid` 分支画的是两条竖线加四个短横（方括号），因为它拿不到定界符；现在 `View` 带 `border: "()"` 上线，前端按它画，两边一致。
 8. **一条被证伪的怀疑。** 我一度以为映射会漏掉 `vec` 的定界符（因为 `vec(x)` 与 `mat(x)` 完全一样）。查下来不是：`mat` 的默认定界符本来就是圆括号，所以 `mat(x)` 与 `mat(x, delim: "(")` 是同一个东西，两者相同是必然的。当时留下的疑问——`Write::Matrix` 写出的 `mat(…)` 在前端是方括号、在文档里是圆括号——随 `border` 上线一并解决。
 9. **数字串是一个"像 text 一样的容器"。** `Number` 有一个格，里面是逐字的 `Char`，所以光标**能停在数字之间**（`12|34` 插一个 `9` 得到 `12934`），这是叶子模型根本表达不了的。前端仍然只多一个排布名（`number`），通用"有子节点"分支会把那个格画出来；名字必须在 `ARRANGEMENTS` 白名单里，否则整篇带数字的公式都会报"不认识的排布"（`desktop/test_desktop.py::test_a_number_run_is_a_container_with_a_known_arrangement` 守着）。
 10. **普通模式敲出的小数与读进来的小数不是同一棵树**（有意）：读 `12.5` 是一个 `Number`，逐键敲 `1` `2` `.` `5` 是 `Number(12) Char(.) Number(5)`，写出 `12 . 5`。实测四种写法两两渲染完全相同（见下），所以是纯表示差异；命令模式走解析器，得到的是一个 `Number`。
 11. **一个"字符"是一个字形簇，不是一个 Unicode 标量。** 词法把 `e`+U+0301、`👍🏽`、ZWJ 家庭 emoji 各收成一个 `MathText` 节点，而 `GlyphItem.text` 也是一个字形簇；编辑器原先按标量拆成多个 `Char`，于是**回写会在字形簇中间插入分隔符**，敲一个键就把 `é` 变成 `e` + 空格 + 飘在后面的重音符（实测码位 `0x65 0x20 0x7a 0x20 0x301`）。对齐载荷为一个字形簇之后：`0x65 0x301 0x20 0x7a`，字形簇完好。这是"回写义务"那一类缺陷，会改坏文档内容。
-12. **前端"有分支但后端到不了"的名字，一共九个，已全部删除。** 逐个对照命令表（`config/commands.json`）与 `Shape::view`：`decoration` 里的 `widehat`/`dot`/`ddot`/`dddot`/`arrow`/`underline`/`underbrace`/`underbracket`/`underparen` 都不可能出现在线上——后端只产生 `hat` 与 `cancel`（`Accent`，线上都是 `decorated`）以及 `overline`/`underline`（`Line`，线上也是 `decorated`），其余名字会落成 `Raw` 由引擎自己画。反向的检查也做了：`multiline` 的左右交替对齐、`scripts` 的 `_placement`（`limits`/`scripts`）、`unknown` 的 `_string_mode` 都是真的到得了的；`ARRANGEMENTS` 白名单里多出的 `draft-*`/`absent`/`stop`/`cell`/`macro-argument` 是前端自造或后端合成的节点，不在 `Shape` 里，属于白名单该有的成员。后来 View 词汇整体重划（`sqrt`/`delim`/`decoration`/`line` 合并成 `decorated`，`grid`/`aligned`/`script`/`macro-collapsed` 改名），这张白名单也随之换过一遍；`decorated` 内部改用 `marker` 分派，同样只收后端真能产生的记号。
+12. **前端"有分支但后端到不了"的名字，一共九个，已全部删除。** 逐个对照命令表（`config/commands.json`）与 `Shape::view`：`decoration` 里的 `widehat`/`dot`/`ddot`/`dddot`/`arrow`/`underline`/`underbrace`/`underbracket`/`underparen` 都不可能出现在线上——后端只产生 `hat` 与 `cancel`（`Accent`，线上都是 `decorated`）以及 `overline`/`underline`（`Line`，线上也是 `decorated`），其余未配置的位置调用现在成为 `raw_macro`，由引擎取图；具名实参等仍保留 Raw。反向的检查也做了：`multiline` 的左右交替对齐、`scripts` 的 `_placement`（`limits`/`scripts`）、`unknown` 的 `_string_mode` 都是真的到得了的；`ARRANGEMENTS` 白名单里多出的 `draft-*`/`absent`/`stop`/`cell`/`macro-argument` 是前端自造或后端合成的节点，不在 `Shape` 里，属于白名单该有的成员。后来 View 词汇整体重划（`sqrt`/`delim`/`decoration`/`line` 合并成 `decorated`，`grid`/`aligned`/`script`/`macro-collapsed` 改名），这张白名单也随之换过一遍；`decorated` 内部改用 `marker` 分派，同样只收后端真能产生的记号。
 
     这次靠人眼逐个对照，**所以后来把它变成了机器检查**：`tools/kind_inventory.py` 现在把 32 个用例里**实际发出的线名**与 `mathview.py` 的 `ARRANGEMENTS` 做双向对照，任一边多出来就打印并**以非零码退出**。检查本身也验过有牙：往 `ARRANGEMENTS` 里塞一个 `bogus-arm` 立刻报「后端发不出来的排布名」，退出码 1。对照曾经需要一份例外清单——`parameter`/`template-call`（第五节：只存在于宏模板里，上线前就被换掉，但必须有画法）+ `absent`/`symbol`（前端自造）。**现在清单只剩前端自造的那两个**：模板改存视图树之后，前两个在显示树里连节点都不是，前端那两行画法已删，于是"每个线名都有画法、每个画法都有线名"是**确切**的 23 对 23。
 
@@ -162,7 +146,7 @@ python tools/kind_inventory.py            # 第一、二节的线上实测（可
 python tools/engine_boxes.py              # 第三、六节的引擎盒子（可传自己的公式）
 ```
 
-`tools/kind_inventory.py` 里每个 `Kind` 对应一个能真正产生它的源文；只有 `Unknown` 需要额外发一次 `{"action":"input","text":"\\"}`（命令草稿）。两处坑写在该文件里：
+`tools/kind_inventory.py` 的用例同时覆盖存储 Kind、借用形状与特殊 View 状态，标签中的 Sqrt/Style 等是形状标签，不代表当前存在同名 Kind；只有 `Unknown` 需要额外发一次 `{"action":"input","text":"\\"}`（命令草稿）。两处坑写在该文件里：
 
 - **公式要取 `state` 返回的 `equations` 的最后一个**再 `activate_formula`。用 `source.index("$")` 会命中定义里的 `$…$`，整张表会安静地把定义体当成公式（实测踩过）。
 - 输出要 `reconfigure(encoding="utf-8")`：Windows 控制台的默认代码页印不出 `Symbol` 节点带的 `𝛼`。

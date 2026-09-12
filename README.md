@@ -1,61 +1,141 @@
-# TypFormula
+# TypFormula — 公式可视化的 Typst 编辑器
 
-原生 Qt 桌面编辑器：完整 `.typ` 源码是唯一文档模型，正文按普通文本编辑，进入 `$…$` 时用 LyX 式的结构公式编辑器，排版与 PDF 由随附的 Typst 引擎生成。
+TypFormula 是一款支持结构化公式编辑的 Typst 桌面编辑器。你可以直接编辑正文源码，并在公式中通过键盘操作分式、上下标和矩阵。
 
-Rust 核心（`src/`）通过私有管道驱动窗口：`--desktop-core` 提供一个文档与一个活动公式会话，`--stdio <目录>` 提供 Tinymist 语言功能、公式取图和整页编译。没有 WebView、HTTP 端口或 WASM。依赖、操作与当前边界见 [桌面端说明](docs/desktop.md)。
+项目使用 Typst 引擎渲染公式，支持自定义宏和已安装的 Typst 包。可静态展开的宏支持参数编辑，其他受支持片段由引擎渲染显示。
 
-## 构建和启动
+**项目目前处于早期开发阶段，主要在 Windows 上开发和验证，当前提供源码运行方式。欢迎试用与反馈。**
 
-Windows、Python 3.10+、PyQt5 5.15 与 Rust 工具链：
+![TypFormula：正文源码与结构化公式编辑](docs/Figures/preview.png)
+
+## 核心功能
+
+- **结构化公式编辑**：通过键盘进入分式、根式、上下标和矩阵的各个槽位，支持选区、复制粘贴和撤销。
+- **自定义宏**：保留宏调用源码，对可展开的宏直接编辑实参；文档内的宏定义块支持语法高亮，确认后才更新公式。
+- **源码与语言服务**：正文直接编辑 Typst 源码；接入 Tinymist 后支持补全、诊断、悬停、定义跳转和格式化。
+- **预览与导出**：可开启 Tinymist 实时页面预览，也可编译当前未保存内容并导出 PDF/SVG。
+- **文档编辑**：提供源码栏、大纲、分栏、查找替换，以及 Typst 包的浏览与安装。
+
+## 快速开始
+
+### 环境准备
+
+| 依赖 | 说明 |
+| --- | --- |
+| Windows | 当前提供 Windows 构建和启动脚本 |
+| Python 3.10+ | 本机验证版本为 Python 3.11.5 |
+| Rust 与 Cargo | 本机验证版本为 Rust 1.98.1，使用 `x86_64-pc-windows-msvc` 工具链；尚未单独验证项目的最低 Rust 版本 |
+| C++ 构建工具 | MSVC 工具链需要 Visual Studio Build Tools 的 C++ 桌面开发工具及 Windows SDK |
+| PyQt5 / PyQtWebEngine | 通过下方 requirements 命令安装；PyQtWebEngine 用于实时页面预览 |
+| Tinymist（可选） | 提供语言服务和实时页面预览；不影响基本编辑与原生公式渲染、PDF/SVG 导出 |
+
+### 首次构建
+
+克隆或下载仓库后，在仓库根目录打开 PowerShell，执行：
 
 ```powershell
-python -m pip install -r desktop/requirements.txt   # 已安装 PyQt5 时无需重复安装
+# 安装 Python 界面依赖
+python -m pip install -r desktop/requirements.txt
+
+# 首次构建需要联网下载 Rust 依赖；host 和适配器是两个独立工作区
+cargo fetch --locked
+cargo fetch --locked --manifest-path native-adapter/Cargo.toml
+
+# 构建后端与适配器，并检查 Python 依赖
 .\build-desktop.cmd
+```
+
+仓库已包含固定版本的 Typst 引擎源码，无需另外克隆引擎或安装 Typst CLI。其他 Rust 依赖仍需通过 `cargo fetch` 下载；构建脚本使用 `--offline --locked`，因此不能在空依赖缓存上直接运行。首次 release 编译耗时较长，后续构建可复用缓存。
+
+### 启动
+
+```powershell
+# 打开编辑器
 .\start-desktop.cmd
+
+# 或打开指定文档
 .\start-desktop.cmd "D:\documents\article.typ"
 ```
 
-`build-desktop.cmd` 只构建，不启动窗口，尚未打包独立安装器。`TYPFORMULA_PYTHON` 可指定 Python 可执行文件，`TYPFORMULA_BIN` 可指定核心程序。
+构建脚本只构建，不启动窗口；目前尚未提供独立安装器。需要指定 Python 路径或使用其它后端构建时，参见 [桌面端说明](docs/desktop.md)。
 
-Tinymist 从 PATH、VS Code/Cursor 扩展目录或 `TINYMIST_BIN` 查找。没有 Tinymist 时仍能编辑、保存、结构编辑公式并出图，公式命令有内置补全；普通代码的补全、诊断、悬停、定义跳转和格式化需要它。
+### 启用语言服务与实时预览
 
-## 编辑
+安装 Tinymist 后，将其加入 `PATH`，或通过环境变量 `TINYMIST_BIN` 指定可执行文件。程序也会在本机 VS Code / Cursor 扩展目录中查找 Tinymist。
 
-- 正常输入直接编辑 Typst 源码，包含不完整或有语法错误的代码。不会将正文拆成多个输入框，也不会因输入 `$` 自动改变模式。
-- **行内公式**（Ctrl+Alt+I）/ **行间公式**（Ctrl+Alt+B）：在当前选区插入公式，选中文字作为公式内容，随后进入结构编辑器；**完成公式**（Ctrl+Alt+Return）或最外层 Esc 返回正文。
-- 公式内 `\` 输入命令，Enter 确认，Tab 切换槽位，`/` 创建分式，`^` / `_` 创建上下标。有命令草稿时先确认或取消。数学菜单另有"矩阵增加行/列"与"刷新全部 SVG 缓存"。
-- 公式里的普通输入**一个按键一个字符**，源码也一个字符一个空格地写出来：输入 `-` 再输入 `>` 得到 `$- >$`（而不是 `$->$`），输入 `x` `y` 得到 `$x y$`。原因是源码会被重新解析：`->`、`||`、`...`、`index` 这类连写会被 Typst 当成一个整体（箭头、`‖`、`…`、变量名），两个按键就会变成一个不可再拆的片段。只有数字连写（`12`、`1.5`）不加分隔符。`≤`、`≥`、`≠` 这类多字符符号改用命令输入（如 `\>=` 回车）或直接粘贴该字符。
-- 行内公式使用设置里的编辑字号与数学字体；边框和留白紧贴内容，所有 Raw SVG 按该字号缩放。
-- 公式里"合法但结构编辑器不建模"的片段（`sum`、`integral`、`dif` 等）保留为 Raw，由 Typst 渲染成图像，**不是编译失败**。是否建模看的是**名字在不在 `config/commands.json`**，不是写法：`cases(...)`、`cancel(...)`、`vec(...)` 都已进表，是可编辑的结构节点；有具名实参的（`lr(x, size: #100%)`）与未收录的名字才是 Raw。片段是插进源码后整篇编译、再按标签取帧的，所以拼接处不能与后文粘成别的语法（`cal(A)(E)` 这类写法要求块尾留一个空格）；某一个片段自己编译不出来时只放弃它、其余照常出图。排版结果为空白、或后端给不出可见结果的片段（如 `quad`）与"被放弃"的片段一样改为显示源码并标出暖色底 + 红色虚线框：左右键可进入该片段源码修复，Esc 恢复原内容，下一次编辑会自动重试。字体变体（`bold(x)`、`upright(A)`）画的是引擎替换后的字形，不取图。
-- 片段图一律按黑色栅格化：片段是从文档里切出来的图，文档可能把数学排成白色或彩色，浅色编辑区里就看不见了。导出 PDF/SVG 仍用文档自身的颜色。
-- 视图菜单可显示/隐藏源码栏、**实时预览**（Tinymist 提供，默认关闭）、分栏（两栏共享同一份源码）、缩放编辑字号；源码栏与编辑器逐行对齐并双向同步滚动。左侧大纲按标题跳转。
-- Ctrl+Z / Ctrl+Y 覆盖正文、结构公式和包导入。
-- Ctrl+S 保存（原生绝对路径对话框，UTF-8 原子写入，保留 CRLF/LF 风格）；文件被外部修改时拒绝覆盖。文件菜单另有"另存为…"与"导入 Typst / 插入资源…"。
-- Ctrl+H 查找/替换，作用在源码上。
-- 每个 Raw SVG 由后端按其实际环境字号归一化。`base_font_size_pt = 原始宽度(pt) / 环境基准字号(pt)`，显示宽度为 `编辑字号 × base_font_size_pt × SVG 微调`；高度同理。虽然字段名称带 `_pt`，它保存的是无量纲比值。环境字号也以 `environment_font_size_pt` 返回，无需手动填写文章字号。
+- **语言服务**：`Ctrl+Space` 补全，`F12` 跳转定义，`Ctrl+Alt+F` 格式化；鼠标停留可查看诊断和符号说明。
+- **实时预览**：通过“视图 → 显示 / 隐藏实时预览”开启，默认关闭。
+- **包管理**：通过“工具 → 浏览 @local / @preview 包…”安装指定版本；“安装并插入 import”会同时插入导入语句。
 
-## Tinymist 和包
+## 第一个公式
 
-普通代码支持 Ctrl+Space 补全、诊断、悬停、定义跳转（工具菜单"格式化"为 Ctrl+Alt+F）。标准 LSP 使用真实文件 URI 和一个常驻会话进行 `didOpen` / `didChange` 全文同步；切换文件时重建会话。公式命令的临时投影继续使用独立补全查询，避免把草稿投影当作磁盘文件。
+1. 启动编辑器，按 `Ctrl+Alt+B` 插入行间公式并进入编辑。
+2. 输入 `\frac`，按 Enter 确认，显示分子和分母两个空槽。
+3. 在分子中输入 `a`，按 Tab 切换到分母，输入 `b`。
+4. 按 `Ctrl+Alt+Return` 完成公式，返回正文。
+5. 按 F5 编译当前内容，并用系统默认 PDF 阅读器打开结果。
 
-工具菜单"浏览 @local / @preview 包…"从官方 `packages.typst.org` 索引检索版本，**安装并插入 import** 下载指定版本到标准 Typst 缓存（Windows：`%LOCALAPPDATA%/typst/packages`），然后插入 `#import`。支持 `TYPST_PACKAGE_CACHE_PATH`。安装已缓存版本不访问网络，包管理器不隐式升级版本，也不提供卸载。
+更多常用操作：
 
-文件/包导入的诊断和补全由 Tinymist 处理；原生公式渲染支持读取项目文件及已安装包。尚未安装的传递依赖需先安装。F5 编译当前内存源码并交给系统默认阅读器打开原生 Typst PDF。
+| 操作 | 默认按键 |
+| --- | --- |
+| 插入行内公式 | `Ctrl+Alt+I` |
+| 输入公式命令 | `\`，随后输入名称并按 Enter |
+| 创建上标 / 下标 | `^` / `_`，创建后显示当前空槽 |
+| 切换公式槽位 | Tab / Shift+Tab |
+| 完成公式 | `Ctrl+Alt+Return` |
+| 保存 | `Ctrl+S` |
+| 撤销 / 重做 | `Ctrl+Z` / `Ctrl+Y` |
 
-**实时预览**（视图 → 显示 / 隐藏实时预览，默认关闭）用的是 Tinymist 自己的预览：开启时它提供预览页与推送增量渲染的 WebSocket，编辑器只把页面装进一个 web view，所以增量与局部渲染、滚动同步、反色都由它负责；关闭时立即停掉。它需要 `PyQtWebEngine`（见 `desktop/requirements.txt`），缺少时菜单会报告"不可用"而不会崩。预览到源码的跳转由 Tinymist 的滚动同步负责；编辑器自身的"双击页面跳源码"只适用于导出用的整页 SVG。
+相邻的 `#let` 定义会合成紧凑的源码块。点击或用方向键进入，Enter 确认退出、Shift+Enter 换行、Esc 取消；未确认的草稿不会更新公式。快捷键可在“工具 → 设置/快捷键”中调整。
 
-## 独立性与许可
+完整示例见 [TypFormula 使用教程](docs/tutorial.typ)，可直接用编辑器打开：
 
-构建、资源和运行路径均位于正式版自己的 `src/`、`desktop/`、`config/`、`fonts/`、`native-adapter/` 和 `vendor/typst/`。删除 `prototypes/` 不影响正式版构建；没有 `include!`、软链接或依赖路径指回原型（字符字典仍通过本地 build.rs 生成并 include）。Typst 固定源码和透明标签桥接已随仓库保存，构建不需要重新克隆引擎。
+```powershell
+.\start-desktop.cmd .\docs\tutorial.typ
+```
 
-核心沿用 GPL-2.0-or-later，见 [COPYING](COPYING)、[LyX 作者](docs/LYX-CREDITS)。引擎来源与补丁说明见 [vendor/typst/UPSTREAM.md](vendor/typst/UPSTREAM.md)，字体许可见 [fonts/NOTICE](fonts/NOTICE)。`vendor/typst` 保留上游 Apache-2.0 许可，与本项目 GPL-2.0-**or-later** 的兼容路线是取 GPLv3（Apache-2.0 与 GPLv2-only 不兼容）；分发打包产物时需同时保留两份许可文本。
+教程使用 `@preview/latex-lookalike:0.1.4` 包。若提示缺少依赖，请先通过包管理器安装；“第一个公式”的示例不需要额外宏包。
 
-## 验证入口
+## 当前限制
+
+- 编辑区以结构编辑为主，复杂装饰、伸缩定界符和部分布局可能简化；最终排版以 Typst 编译生成的 PDF/SVG 为准。
+- 宏的结构展开采用受限的静态分析，并非所有宏包内容都能逐槽编辑。未建模的受支持片段由引擎取图，失败时可回到源码修复。
+- Tinymist 实时预览尚未接入与编辑源码之间的双向定位。
+- 当前文档所在目录作为编译根目录，外部资源应放在该目录或子目录中；尚未安装的包依赖需要先安装。
+- 目前主要验证 Windows 环境；其他平台尚无完整的构建、运行验证流程。
+
+## 文档与反馈
+
+- [使用教程](docs/tutorial.typ)：公式编辑操作与示例。
+- [桌面端说明](docs/desktop.md)：完整操作、依赖配置及显示行为。
+- [架构说明](docs/architecture.md)：前后端分层、通信与缓存。
+- [编辑模型](docs/editing-model.md)：槽位、光标和宏参数的可编辑性。
+- [Kind 能力清单](docs/kind-inventory.md)：结构支持范围与引擎差异。
+- [验证记录](docs/validation.md)：各轮修复与测试结果。
+
+欢迎通过仓库 Issues 报告问题或提出建议。报告问题时，请尽量提供：
+
+- 能复现问题的最小 `.typ` 源码，以及需要的宏或包版本。
+- 从打开文档开始的操作步骤，特别是公式中的输入顺序与按键。
+- 预期结果与实际结果；显示问题可附截图。
+- 操作系统、Python/Rust/Tinymist 版本，以及使用的提交版本。
+
+### 开发验证
+
+完成上述构建后，可在仓库根目录运行：
 
 ```powershell
 cargo test --offline --locked
-cargo test --offline --locked --manifest-path native-adapter/Cargo.toml --target-dir target/adapter
+cargo test --offline --locked --release --manifest-path native-adapter/Cargo.toml --target-dir target/adapter
+$env:QT_QPA_PLATFORM='offscreen'
 python -m unittest desktop.test_desktop -v
 ```
 
-桌面套件使用离屏 Qt（`QT_QPA_PLATFORM=offscreen`），不打开窗口，但需要先构建原生程序（`build-desktop.cmd`）。需要本机 Tinymist 的服务集成用例默认忽略。输入法、视觉对齐及真实鼠标操作仍需人工体验。架构见 [docs/architecture.md](docs/architecture.md)，各轮实测见 [docs/validation.md](docs/validation.md)。
+Qt 测试使用离屏模式，不打开可见窗口；实时预览测试不构造真实 WebEngine 页面。部分集成测试需要本机 Tinymist，Rust 中相应环境测试默认忽略。输入法预编辑、实际页面显示与交互仍需人工体验。开发约定见 [AGENTS.md](AGENTS.md)。
+
+## 许可与致谢
+
+项目代码采用 **GPL-2.0-or-later**，见 [COPYING](COPYING)。公式编辑模型参考并移植了 LyX 的部分实现，LyX 作者信息见 [LyX 致谢](docs/LYX-CREDITS)。
+
+随附 Typst 引擎保留上游 Apache-2.0 许可，来源与本项目补丁见 [引擎说明](vendor/typst/UPSTREAM.md)。字体的来源与许可见 [fonts/NOTICE](fonts/NOTICE)。

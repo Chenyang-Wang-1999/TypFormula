@@ -16,9 +16,9 @@
 //! * `Unknown` 承载半打完的命令草稿，是纯编辑器状态，没有 Typst 拼写：
 //!   `fra` 不是一个公式。
 //!
-//! 即"可往返的 Kind"共 16 个：Char, Symbol, Number, Raw, MacroCall, Text,
-//! Fraction, Sqrt, Root, Scripts, Fenced, Table, Multiline, Accent, Line, Style。
-//! 其中 `Style` 与 `Sqrt`/`Root`/`Accent`/`Line` 一样，**只作为形状存在**：树里
+//! 即"可往返的 Kind"共 11 个：Char, Symbol, Number, Raw, MacroCall, Text,
+//! Fraction, Scripts, Fenced, Table, Multiline。
+//! `style` 与 `sqrt`/`root`/`decoration`/`line` **只作为形状存在**：树里
 //! 存的是借了它形状的 `MacroCall`（`bold(x)`），回写就是这个调用自己的拼写。
 
 use typformula_core::{Action, Editor, math::{Kind, MathAtom}, typst};
@@ -34,7 +34,7 @@ fn load(source: &str) -> Editor {
 /// 写出整篇文档再读回来，要求得到同一棵树。
 ///
 /// 用文档级拼写（含 `#let` 前缀与 `$…$`）而不是裸片段，因为宏调用必须带着
-/// 定义才能读回成调用：脱离定义，`f(2)` 会退化成 Raw。
+/// 定义才能读回相同的绑定：脱离定义，内容值可能成为 Raw，函数调用则失去模板绑定。
 #[track_caller]
 fn round_trips(source: &str) {
     let original = load(source);

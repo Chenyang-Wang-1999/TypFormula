@@ -640,9 +640,8 @@ fn parse_atom(node: &SyntaxNode, ctx: &ParseContext) -> MathData {
             let mut args = vec![];
             // Cells per **row**, in source order: a comma keeps the count, a
             // semicolon ends a row. So `mat(1, 2, 3)` is one row of three and
-            // `mat(1; 2; 3)` is three rows of one — the *columns* of the table are
-            // the width of its first row, which is why every row has to agree before
-            // this can be a table at all.
+            // `mat(1; 2; 3)` is three rows of one. The column count is the longest
+            // row; each shorter row is padded with real editable empty cells.
             //
             // The two loops below read the same argument list for two different
             // questions: this one wants the **rows** (so it watches the semicolons),

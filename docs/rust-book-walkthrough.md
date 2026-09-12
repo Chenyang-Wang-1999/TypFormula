@@ -1,7 +1,7 @@
 # 《Rust 程序设计语言》逐章导读（面向 C++ 程序员）
 
 教材：[The Rust Programming Language](https://doc.rust-lang.org/book/)（俗称"The Book"），官方入门书，免费，有[中文版](https://kaisery.github.io/trpl-zh-cn/)。
-本导读的目录**扒自官方 `src/SUMMARY.md`**，不是凭记忆写的。
+本导读的章节目录取自编写时的官方 `src/SUMMARY.md`。文中的旧行号和简化片段用于解释语言概念，不是当前实现清单；内核文件位于 `crates/core/src/`，host 文件位于 `src/`，实际行为以 [architecture.md](architecture.md) 和源码为准。
 
 每个章节标一个性质，决定你怎么读它：
 
@@ -637,7 +637,7 @@ C++ 里 `private` 是"类内可访问"；Rust 的隐私是**模块级**的，而
 | `pub(super)` | 父模块 |
 | `pub(in crate::x)` | 指定祖先模块 |
 
-**注意**：结构体字段默认私有，但**枚举变体随枚举一起公开**（枚举公开则变体都公开）。这也是为什么 `Kind` 的构造只能在定义它的模块里写（`math.rs`），别处只能用 `MathAtom::character` 这类关联函数。
+**注意**：结构体字段默认私有，但**枚举变体随枚举一起公开**（枚举公开则变体都公开）。本项目的 `Kind` 是公开枚举，其变体可在其它模块直接构造；`MathAtom::character` 等关联函数用于集中构造逻辑，不是由枚举可见性强制的唯一入口。
 
 #### 细讲 4：多文件模块
 
@@ -663,7 +663,7 @@ pub use cursor::{Action, Editor};     // lib.rs:14
 
 项目里有**两个** crate，正好用来分辨"模块"和"crate"：
 
-- 内核 `crates/core/src/lib.rs` 挂五个模块（`math`/`slots`/`typst`/`cursor`/`view`），并在末尾写 `pub use cursor::{Action, Editor};` 重导出——外部于是能写 `typformula_core::Action`。
+- 内核 `crates/core/src/lib.rs` 挂六个功能模块（`math`/`slots`/`editing`/`typst`/`cursor`/`view`），并在末尾写 `pub use cursor::{Action, Editor};` 重导出——外部于是能写 `typformula_core::Action`。
 - 外围 `src/lib.rs` 挂另外六个（`document`/`services`/`workspace`/`packages`/`rpc`/`desktop`），同一个 package 的 `src/main.rs` 是它的二进制。
 
 分界就在这里：`crate::` 只在**同一个 crate 内**有效。外围的 `src/document.rs` 开头是
@@ -1781,7 +1781,7 @@ fn make() -> impl Fn(i32) -> i32 { |x| x + 1 }          // 返回闭包
 
 **第 12、21 章和附录可以完全不读**，或者只挑我上面标出的那几节。
 
-**一个加速建议**：直接从你项目的 `math.rs`（142 行）开始读。它短、独立、用了 `enum` / `trait` 派生 / 泛型 / 生命周期 / `matches!` / 迭代器——**是第 5、6、10、19 章的综合练习**。读完它再读 `view.rs` 和 `document.rs`，会比按顺序读教材更快建立直觉。
+**一个加速建议**：直接从你项目的 `crates/core/src/math.rs`开始读。它短、独立、用了 `enum` / `trait` 派生 / 泛型 / 生命周期 / `matches!` / 迭代器——**是第 5、6、10、19 章的综合练习**。读完它再读 `view.rs` 和 `document.rs`，会比按顺序读教材更快建立直觉。
 
 ## 附录 B. 相关资料
 

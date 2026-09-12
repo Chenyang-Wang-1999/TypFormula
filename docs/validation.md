@@ -2313,3 +2313,17 @@ pub enum ViewTemplate {
 依次输入 a、^ 时，内核已把光标移入上标格，但 View 用 script_idx 的“非空”判定将该格替换成 absent，连同空槽和 stop 一起隐藏。现在区分未创建的可选附件与正在编辑的空附件：光标所在的空上标/下标保留 empty-cell 与 stop，前端使用现有虚线槽绘制；另一侧未创建的附件仍隐藏。输入内容后槽框消失，删掉最后一个字符后仍可看到当前空槽；未填的可选附件不写入源码。
 
 Rust 默认测试 **155 项通过、6 项忽略**；独立 release 核心上的 Qt 离屏全套 **118 项通过（67.102 秒）**。覆盖 a→^、a→_ 的可见槽与光标、继续输入、删除恢复空槽及原有导航行为，并通过 target/empty-superscript.png 的离屏绘制检查确认实际显示。编译前已告知用户，未操作当前窗口或文档，未使用 computer use。
+
+
+### 2026-09-12：文档、AGENTS 与当前实现一致性核对
+
+本轮只修改文档、产品源码注释和取证探针的展示字段，没有修改编辑器执行逻辑；未编译、未启动可见窗口、未使用 computer use，也未改动用户正在编辑的 `docs/tutorial.typ`。
+
+- 补齐 AGENTS 中的 definitions.py / language.py、教程路径、内核实际依赖与配置加载方式；明确 JSON 管道路由和 Tinymist 实时预览 HTTP/WebSocket 的区别。
+- 统一 README、架构与桌面说明中的矩阵补齐、空脚标、宏定义草稿提交、LSP 接线、会话重放与增量 View 复用规则。
+- 重核 Kind 清单：14 个枚举变体，12 个可进入编辑树（含 Unknown），11 个正常源码往返对象；Parameter/TemplateCall 仅注册期使用。明确形状名与 View kind、Symbol.text、source_text、render_request 的实际含义。
+- 明确 style 的空 definitions、在途/成功/失败缓存及局部字形回包；没有把 Raw、附件和诊断的全局 touch 路径描述成局部重排。模板 raw_macro 的实例缓存与普通 Raw 的共享缓存分别说明；附件服务只覆盖受支持顶层，前端仍自行布局。
+- 修正 Rust 教程中失效的模块路径、Kind 构造可见性和扩展练习；保留语言教学的历史示例并标注性质。style/raw_macro 审查和旧验证计数明确为历史记录，不改写当时结果。
+- `tools/kind_inventory.py` 补出 style、source_text 与 host 渲染字段，修正过时标签。通过导入探针并指定现有隔离 release core，32 个用例全部成功，产生 23 种 View；与前端 ARRANGEMENTS 双向对齐，无缺失或多余项。另验证矩阵 row_lengths=[2,2]、末尾空格规范拼写、激活不改原文以及 a→^ / a→_ 的空槽与 stop。
+- 使用现有隔离 release core / adapter 运行 8 项相关 Qt offscreen 测试：全部通过（5.493 秒），覆盖上下标、值宏命令、多行附件、宏定义草稿/高亮、矩阵补齐、正文编辑复用 View 和真实 LSP 悬停/定义。
+- 27 个本地 Markdown 链接可解析；本轮文件的 `git diff --check` 通过（排除用户正在编辑的 tutorial.typ）。Python AST 与 Rust 差异检查确认产品代码只改注释/文档字符串，不需要重新构建二进制。
