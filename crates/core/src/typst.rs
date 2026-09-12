@@ -473,8 +473,9 @@ pub fn parse_command(text: &str, definitions: &str) -> Result<Parsed, String> {
 /// would have once its arguments were typed.
 pub fn parse_command_invocation(text: &str, definitions: &str) -> Result<Parsed, String> {
     let registry = macro_registry(definitions);
-    if let Some((_, def)) = registry.get(text).filter(|def| def.expandable).map(|def| (0usize, def)) {
-        if !def.params.is_empty() {
+    if let Some(def) = registry.get(text) {
+        if !def.function {return parse_formula(&format!("$ {text} $"),definitions);}
+        if def.expandable {
             let atom = MathAtom {
                 kind: Kind::MacroCall { name: def.name.clone(), function: true },
                 cells: vec![vec![]; def.params.len()],

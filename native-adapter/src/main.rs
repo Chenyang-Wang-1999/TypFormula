@@ -21,7 +21,10 @@ mod render;
 struct Request { #[serde(default="default_path")] path: String, expression: String, #[serde(default)] definitions: String, display: bool,
     /// Ask for the **substituted glyphs** instead of the attachment placement.
     #[serde(default)]
-    glyphs: bool }
+    glyphs: bool,
+    #[serde(default)] context: Option<AttachmentContext> }
+#[derive(Deserialize)]
+struct AttachmentContext { source:String, start:usize, end:usize }
 
 struct FormulaWorld { library: LazyHash<Library>, fonts: typst_kit::fonts::FontStore, source: Source, overlays: std::collections::HashMap<String,String>, time: typst_kit::datetime::Time }
 fn font_store(system:bool)->typst_kit::fonts::FontStore {
@@ -137,7 +140,16 @@ fn collect_glyphs(item: &MathItem, out: &mut String) -> Result<(), String> {
 
 fn resolve(req: Request) -> Result<Value, String> {
     let space = if req.display { " " } else { "" };
-    let source = Source::detached(format!("#set text(font: \"New Computer Modern Math\", size: 24pt)\n{}\n${space}{}{space}$", req.definitions, req.expression));
+    let mut label="typformula-attachment-target".to_string();
+    let document=if let Some(context)=&req.context {
+        let original=context.source.get(context.start..context.end).ok_or("附件公式区间无效")?;
+        if !original.starts_with('$') || !original.ends_with('$') {return Err("附件上下文必须定位一个公式".into());}
+        while context.source.contains(&label) {label.push('x');}
+        let mut source=context.source.clone();
+        source.replace_range(context.start..context.end,&format!("${space}{}{space}$<{label}>",req.expression));
+        source
+    } else {format!("{}\n${space}{}{space}$",req.definitions,req.expression)};
+    let source = Source::detached(format!("#set text(font: \"New Computer Modern Math\", size: 24pt)\n{document}"));
     let source = Source::new(source_id(&req.path)?,source.text().into());
     let world = FormulaWorld { library: LazyHash::new(Library::default()), fonts:font_store(false), source, overlays:Default::default(), time:typst_kit::datetime::Time::system() };
     let world_ref: &dyn World = &world;
@@ -151,7 +163,10 @@ fn resolve(req: Request) -> Result<Value, String> {
     let arenas = Arenas::default();
     let mut equations = vec![];
     collect_equations(&content, styles, &arenas, &mut equations);
-    let (equation, styles) = *equations.last().ok_or("适配请求缺少公式")?;
+    let target=if req.context.is_some() {
+        equations.iter().find(|(equation,_)|equation.label().is_some_and(|l|l.resolve().as_str()==label))
+    } else {equations.last()};
+    let (equation, styles) = *target.ok_or("适配请求缺少公式")?;
     let introspector = EmptyIntrospector;
     let mut engine = Engine { world: world_ref.track(), library: &world.library, introspector: Protected::new(introspector.track()), traced: traced.track(), sink: sink.track_mut(), route: Route::default() };
     let item = resolve_equation(equation, &mut engine, Locator::root(), &arenas, styles).map_err(diagnostics)?;
@@ -200,8 +215,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachments_keep_enclosing_scope_and_select_the_requested_equation() {
+        let source="#[\n#let custom = math.op(\"custom\", limits: true)\n$ H_(\"int\") = & sum_(j) rme() \\\n= & x $\n$ z_2 $\n]";
+        let start=source.find("$ H").unwrap();let end=source.find("$\n$ z").unwrap()+1;
+        for (expression,display,expected) in [("sum_(j)",true,"limits"),("sum_(j)",false,"scripts"),("custom_(j)",true,"limits")] {
+            let context=AttachmentContext{source:source.into(),start,end};
+            let result=resolve(Request{path:"main.typ".into(),expression:expression.into(),definitions:source[..start].into(),display,glyphs:false,context:Some(context)}).unwrap();
+            assert_eq!(result["lower"],expected);
+        }
+    }
     fn query(expression: &str, display: bool) -> Value {
-        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display, glyphs: false }).unwrap()
+        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display, glyphs: false, context:None }).unwrap()
     }
     #[test]
     fn typst_decides_both_defaults_and_explicit_overrides() {
@@ -216,7 +241,7 @@ mod tests {
     fn lim_branch_ignores_document_blank_lines_but_keeps_its_math_styles() {
         for definitions in ["", "\n\n", "#let unrelated = 1\n\n"] {
             for display in [true, false] {
-                let result = resolve(Request { path:"main.typ".into(), expression: "lim_(x -> oo)".into(), definitions: definitions.into(), display, glyphs: false }).unwrap();
+                let result = resolve(Request { path:"main.typ".into(), expression: "lim_(x -> oo)".into(), definitions: definitions.into(), display, glyphs: false, context:None }).unwrap();
                 assert_eq!(result["lower"], if display { "limits" } else { "scripts" });
             }
         }
@@ -224,9 +249,9 @@ mod tests {
     #[test]
     fn empty_slots_still_get_a_position_and_definitions_are_evaluated() {
         assert_eq!(query("sum_()", true)["lower"], "limits");
-        let custom = resolve(Request { path:"main.typ".into(), expression: "my_1".into(), definitions: "#let my = math.op(\"my\", limits: true)".into(), display: true, glyphs: false }).unwrap();
+        let custom = resolve(Request { path:"main.typ".into(), expression: "my_1".into(), definitions: "#let my = math.op(\"my\", limits: true)".into(), display: true, glyphs: false, context:None }).unwrap();
         assert_eq!(custom["lower"], "limits");
-        assert!(resolve(Request { path:"main.typ".into(), expression: "unknown_name_1".into(), definitions: String::new(), display: true, glyphs: false }).is_err());
+        assert!(resolve(Request { path:"main.typ".into(), expression: "unknown_name_1".into(), definitions: String::new(), display: true, glyphs: false, context:None }).is_err());
     }
     #[test]
     fn attachment_service_returns_only_placement_even_for_stretch() {
@@ -236,7 +261,7 @@ mod tests {
         assert!(long.get("base").is_none());
     }
     fn glyphs(expression: &str) -> Result<String, String> {
-        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display: true, glyphs: true })
+        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display: true, glyphs: true, context:None })
             .map(|value| value["glyphs"].as_str().unwrap_or_default().to_string())
     }
     /// A font variant is applied by substituting codepoints, and the substitution has

@@ -31,6 +31,14 @@ pub fn find_tinymist() -> Result<PathBuf, String> {
 }
 
 struct DocumentLsp { lsp: Lsp, path: String, source: String, version: i64, preview: Value }
+
+fn tinymist_path(file:&Path)->Result<PathBuf,String> {
+    // Windows canonicalize produces a verbatim (\\?\) path, while didOpen's
+    // file URI resolves to a normal path. Tinymist must see the same VFS key in
+    // pinMain/preview and didOpen, or pinning silently switches to disk content.
+    url::Url::from_file_path(file).map_err(|_|"无效文件 URI")?
+        .to_file_path().map_err(|_|"无效本地文件 URI".into())
+}
 impl DocumentLsp {
     /// The one LSP session, started on first use and reused while the file stays the
     /// same. Both the language methods and the live preview hang off it: Tinymist hosts
@@ -40,7 +48,7 @@ impl DocumentLsp {
             let mut lsp = Lsp::start(bin, workspace)?;
             lsp.uri = url::Url::from_file_path(file).map_err(|_|"无效文件 URI")?.into();
             lsp.notify("textDocument/didOpen", json!({"textDocument":{"uri":lsp.uri,"languageId":"typst","version":1,"text":source}}))?;
-            lsp.request("workspace/executeCommand", json!({"command":"tinymist.pinMain","arguments":[file]}))?;
+            lsp.request("workspace/executeCommand", json!({"command":"tinymist.pinMain","arguments":[tinymist_path(file)?]}))?;
             *slot = Some(DocumentLsp { lsp, path: path.into(), source: source.into(), version: 1, preview: Value::Null });
         }
         let session = slot.as_mut().unwrap();
@@ -77,7 +85,7 @@ impl Services {
                     // The argument list is passed as **one** array element, the way
                     // Tinymist's own client does it. `--data-plane-host 127.0.0.1:0` asks
                     // the OS to pick a free port, so two windows never collide.
-                    let arguments = json!([["--task-id", "typformula", "--data-plane-host", "127.0.0.1:0", file.to_string_lossy()]]);
+                    let arguments = json!([["--task-id", "typformula", "--data-plane-host", "127.0.0.1:0", tinymist_path(&file)?.to_string_lossy()]]);
                     let result = session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doStartPreview","arguments":arguments}))?;
                     session.preview = result.clone();
                     Ok(result)
@@ -257,7 +265,13 @@ impl RenderAdapter {
 }
 
 #[derive(Deserialize, Serialize)]
-pub struct AttachmentRequest { #[serde(default="default_path")] pub path: String, pub expression: String, #[serde(default)] pub definitions: String, pub display: bool }
+pub struct AttachmentRequest {
+    #[serde(default="default_path")] pub path: String, pub expression: String,
+    #[serde(default)] pub definitions: String, pub display: bool,
+    #[serde(default,skip_serializing_if="Option::is_none")] pub context: Option<AttachmentContext>,
+}
+#[derive(Deserialize,Serialize)]
+pub struct AttachmentContext { pub source:String, pub start:usize, pub end:usize }
 
 /// The substituted glyphs of one font variant (`bold(A)` → `𝑨`).
 ///
@@ -275,7 +289,8 @@ impl Services {
         let packaged=self.root.join(name); if packaged.is_file() { return packaged; }
         self.root.join("target/adapter").join(if cfg!(debug_assertions) { "debug" } else { "release" }).join(if cfg!(windows) { "typformula-layout.exe" } else { "typformula-layout" }) }
     pub fn status(&self) -> Value { match &self.bin { Ok(path) => json!({"available":true,"attachments":self.adapter_bin().is_file(),"engine":"Tinymist LSP + Typst","path":path}), Err(error) => json!({"available":false,"attachments":self.adapter_bin().is_file(),"error":error}) } }
-    pub fn attachments(&self, req: AttachmentRequest) -> Result<Value, String> {
+    pub fn attachments(&self, mut req: AttachmentRequest) -> Result<Value, String> {
+        if let Some(context)=&mut req.context {context.source=context_source(&context.source,context.end)?;}
         self.ask_adapter(serde_json::to_value(&req).map_err(|e| e.to_string())?, "Typst 附件布局超时；保留原编辑结构")
     }
     /// The substituted glyphs of a font variant: `bold(upright(a))` → `𝐚`.
@@ -449,6 +464,14 @@ pub fn offset(source: &str, position: &Value) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(windows)]
+    fn tinymist_command_paths_match_the_open_document_uri() {
+        let verbatim=Path::new(r"\\?\C:\project\未保存.typ");
+        let normal=tinymist_path(verbatim).unwrap();
+        assert_eq!(normal,PathBuf::from(r"C:\project\未保存.typ"));
+        assert_eq!(url::Url::from_file_path(verbatim).unwrap(),url::Url::from_file_path(&normal).unwrap());
+    }
     #[test]
     fn utf16_positions_roundtrip_across_lines_and_non_bmp_characters() {
         let source="α𝑥\nbeta";

@@ -8,6 +8,41 @@ fn modified_key(e: &mut Editor, key: &str, shift: bool, ctrl: bool) {
 }
 
 #[test]
+fn content_bindings_never_get_call_parentheses_or_parameter_slots() {
+    let definitions="#let mathbf(x) = $bold(upright(#x))$\n#let rme = $upright(e)$\n#let rmi = $upright(i)$";
+    for name in ["rme","rmi"] {
+        for insert in [false,true] {
+            let mut e=Editor::default();e.apply(Action::Import{source:format!("{definitions}\n$ $")}).unwrap();
+            if insert {e.apply(Action::Insert{name:name.into()}).unwrap();}
+            else {input(&mut e,&format!("\\{name}"));key(&mut e,"Enter");}
+            assert_eq!(typst::write_cell(&e.root),name);
+            assert!(matches!(&e.root[0].kind,Kind::MacroCall{function:false,..}));
+            assert!(e.root[0].cells.is_empty());assert!(e.cursor.slices.is_empty());
+        }
+        let mut e=Editor::default();e.apply(Action::Import{source:format!("{definitions}\n$ $")}).unwrap();
+        input(&mut e,&format!("\\{name} + 1"));key(&mut e,"Enter");
+        assert_eq!(typst::write_cell(&e.root),format!("{name} + 1"));
+        assert!(e.root[0].cells.is_empty(),"a value in a larger expression must not acquire four slots");
+    }
+}
+
+#[test]
+fn command_arity_comes_from_definition_or_config_not_generic_repeat_shape() {
+    for (defs,command,expected,slots) in [
+        ("#let zero() = $x$","zero","zero()",0),
+        ("#let pair(x,y) = $#x+#y$","pair","pair(\"\", \"\")",2),
+        ("","unrecognized()","unrecognized()",0),
+        ("","bold","bold(\"\")",1),
+        ("","frac","frac(\"\", \"\")",2),
+    ] {
+        let mut e=Editor::default();e.apply(Action::Import{source:format!("{defs}\n$ $")}).unwrap();
+        input(&mut e,&format!("\\{command}"));key(&mut e,"Enter");
+        assert_eq!(typst::write_cell(&e.root),expected,"{command}");
+        assert_eq!(e.root[0].cells.len(),slots,"{command}");
+    }
+}
+
+#[test]
 fn only_enter_parses_spaces_and_parentheses() {
     let mut e = Editor::default();
     input(&mut e, "\\frac(a, b) + alpha beta");
@@ -175,5 +210,3 @@ fn command_context_includes_opaque_definitions_and_utf8_caret() {
     assert!(matches!(&e.root[1].kind,Kind::MacroCall {name, ..} if name=="twice"));
     assert_eq!(typst::write_atom(&e.root[1]), "twice(b)");
 }
-
-

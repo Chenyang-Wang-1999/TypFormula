@@ -1,5 +1,9 @@
 # 原生桌面端
 
+正文编辑器与源码栏均接入 Tinymist：错误显示红色波浪线、警告显示黄色波浪线，鼠标停留可查看诊断和符号说明。`Ctrl+K` 后按 `Ctrl+I` 可查看光标处说明；`F12` 或右键“跳转定义”定位声明。同文件定义在源码栏中精确选中（不展开宏定义草稿），跨文件定义在新窗口打开，保留当前文档的修改和撤销历史。补全仍用 `Ctrl+Space`，格式化用 `Ctrl+Alt+F`。
+
+新建文档与未保存修改直接通过 LSP 内存同步，不创建占位文件。宏定义块内的未提交草稿仍在 Enter 确认后才同步，不在草稿输入中触发语言服务或公式更新。
+
 公式投影按源码复用：普通正文编辑即使触发相邻公式的语法重解析，也不重新请求 `analyze_formula`；公式内容、宏定义或作用域边界变化时才更新对应 View。未改变的 View 保留排版缓存，退出公式编辑不再单独清空这些缓存。`style` 字形请求使用空 `definitions`，按表达式与显示模式跨公式复用，并合并同一键的在途请求。
 
 前端使用 Qt Widgets / PyQt5，直接绘制文本和公式。Rust 核心通过私有标准输入输出管道提供一个文档与一个活动公式会话；Tinymist 和 Typst 编译在独立后台管道执行。整个程序不监听任何端口，也没有浏览器或 WebView 组件。
@@ -81,7 +85,7 @@ Raw SVG 按可见公式/活动公式按需加载。**取图的节点有两种**�
 
 `desktop/model.py` 维护 Unicode 源码与 Qt UTF-16 对象位置的映射，公式在投影里只是一个替换字符；剪贴板从源码取值，避免 Qt 默认复制丢失自定义对象。Qt 自定义文本对象机制见 [QTextObjectInterface 文档](https://doc.qt.io/qt-6/qtextobjectinterface.html)。
 
-`desktop/editor.py` 提供正文和静态对象；`desktop/mathview.py` 用 QPainter 绘制分式、根式、上下标、矩阵、Raw SVG，并向 Rust 回传光标几何。只有一个活动 MathCanvas 和滚动区域。静态视图没有独立编辑状态。Typst 附件服务继续决定受支持顶层脚本的 limits/scripts 位置。
+`desktop/editor.py` 提供正文和静态对象；`desktop/mathview.py` 用 QPainter 绘制分式、根式、上下标、矩阵、Raw SVG，并向 Rust 回传光标几何。只有一个活动 MathCanvas 和滚动区域。静态视图没有独立编辑状态。Typst 附件服务决定受支持顶层脚本（包括 multiline 对齐单元格内的顶层脚本）的 limits/scripts 位置。附件请求带完整公式上下文，在封闭作用域中求值，保持行内/行间模式。
 
 Qt 5 的 SVG Tiny 加载器不支持 Typst 输出中的 glyph `<symbol>`，会报告 `qt.svg: link #g… is undefined`。`desktop/svg.py` 仅在 Raw 和显式 SVG 导出的 Qt 加载边界做兼容转换。PDF 直接由 Typst 生成，不经过这个 SVG 适配。
 

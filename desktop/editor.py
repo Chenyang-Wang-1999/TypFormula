@@ -34,6 +34,13 @@ class SourceEditor(QTextEdit):
     def keyPressEvent(self,event):
         if not completion_key(self,event):super().keyPressEvent(event)
 
+    def contextMenuEvent(self,event):
+        menu=self.createStandardContextMenu();owner=self.window()
+        if hasattr(owner,'language_help'):
+            position=from_u16(owner.source,self.cursorForPosition(event.pos()).position())
+            menu.addSeparator();menu.addAction('跳转定义',lambda:owner.language_help.goto(self,position))
+        menu.exec_(event.globalPos());menu.deleteLater()
+
 class LineNumberArea(QWidget):
     def __init__(self,editor):super().__init__(editor);self.editor=editor
     def sizeHint(self):return QSize(self.editor.line_number_width(),0)
@@ -252,6 +259,9 @@ class Editor(QTextEdit):
     def contextMenuEvent(self,event):
         menu=QMenu(self)
         for title,callback in [("撤销",self.owner.undo),("重做",self.owner.redo),("复制",self.copy),("剪切",self.cut),("粘贴",self.paste),("全选",self.selectAll)]:menu.addAction(title,callback)
+        menu.addSeparator()
+        position=self.mapping.source_position(self.cursorForPosition(event.pos()).position())
+        menu.addAction('跳转定义',lambda:self.owner.language_help.goto(self,position))
         menu.exec_(event.globalPos())
 
     def cut(self):

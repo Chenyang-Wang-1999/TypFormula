@@ -84,6 +84,162 @@ class NativeTest(unittest.TestCase):
         window=self.window;window.replace(0,len(window.source),source)
         window.compile_timer.stop()
 
+    def test_typing_a_then_script_shows_an_empty_slot_and_visible_caret(self):
+        window=self.window
+        for key,role in (('^','upper'),('_','lower')):
+            window.finish_formula();self.load('$ $');window.activate(0)
+            window.math_action('input',text='a');window.math_action('input',text=key)
+            node=next(n for n in window.view_nodes(window.math_state['view']) if n['kind']=='scripts')
+            slot=next(c for c in node['children'] if c.get('role')==role)
+            self.assertEqual(slot['kind'],'empty-cell')
+            self.assertTrue(any(op[0]=='slot' and op[3][0]>0 and op[3][1]>0 for op in window.math_canvas.box.operations))
+            self.assertTrue(any(stop[4] for stop in window.math_canvas.box.stops))
+            window.math_action('input',text='2')
+            self.assertIn('a'+key+'(2)',window.source)
+            self.assertFalse(any(op[0]=='slot' for op in window.math_canvas.box.operations))
+
+    def test_scoped_value_commands_remain_values_after_real_lsp_completion(self):
+        window=self.window
+        definitions='#[\n#let mathbf(x) = $bold(upright(#x))$\n#let rme = $upright(e)$\n#let rmi = $upright(i)$\n'
+        for command in ('rme','rmi','rmi + 1'):
+            window.finish_formula();self.load(definitions+'$ x $\n]')
+            window.activate(window.analysis['formulas'][-1]['start'])
+            window.math_action('input',text='\\'+command)
+            ctx=window.math_state['command']
+            if command in ('rme','rmi'):
+                result=self.service('/api/completion',{key:ctx[key] for key in ('source','start','end','caret')},window.lsp)
+                window.math_action('lsp_completions',draft=ctx['draft'],caret=ctx['draft_caret'],items=result.get('items',[]))
+            window.math_action('key',key='Enter')
+            self.assertFalse(window.math_state['pending'])
+            self.assertEqual(window.source,definitions+f'$ {command} x $\n]')
+            self.assertFalse(any(n['kind']=='empty-cell' for n in window.view_nodes(window.math_state['view'])))
+            values=[n for n in window.view_nodes(window.math_state['view']) if n['kind']=='macro' and n['text'] in ('rme','rmi')]
+            self.assertEqual(len(values),1)
+
+    def test_multiline_sum_uses_engine_limits_in_scoped_document(self):
+        window=self.window
+        source='#[\n#let mathbf(x) = $bold(upright(#x))$\n#let rme = $upright(e)$\n#let rmi = $upright(i)$\n\n$ H_("int") = & g sum_(j) sigma_(x) (a rme^(i) + a^(dagger)) '+chr(92)+'\n= & x $\n]'
+        self.load(source);formula=window.analysis['formulas'][-1]
+        window.activate(formula['start']);window.background()
+        key=(source[:from_byte(source,formula['start'])],'sum_(j)',True)
+        loop=QEventLoop();timer=QTimer()
+        timer.timeout.connect(lambda:loop.quit() if key in window.typesetter.placements else None)
+        deadline=QTimer();deadline.setSingleShot(True);deadline.timeout.connect(loop.quit)
+        timer.start(10);deadline.start(15000);loop.exec_();timer.stop();deadline.stop()
+        self.assertEqual(window.typesetter.placements.get(key,{}).get('lower'),'limits')
+        node=next(n for n in window.view_nodes(window.math_state['view']) if n.get('attachment')=='sum_(j)')
+        self.assertEqual(node['_placement']['lower'],'limits')
+        centered=window.typesetter.layout(node)
+        side=window.typesetter.layout(dict(node,_placement={}))
+        xpos=lambda box:next(x for kind,x,y,value in box.operations if kind=='text' and value[0]=='\U0001D457')
+        self.assertLess(xpos(centered),xpos(side))
+        preview=self.service('/api/preview',window.body()|{'preview':True})
+        self.assertTrue(preview['pages'])
+        self.assertEqual(window.source,source,'排版和取图不应修改用户源码')
+
+    def test_text_diagnostics_underline_both_editors_with_unicode_projection(self):
+        self.load('中文😀 $x$\n#unknownname');window=self.window
+        from PyQt5.QtGui import QTextCharFormat
+        diagnostic={'range':{'start':{'line':1,'character':1},'end':{'line':1,'character':12}},'message':'unknown name','severity':1}
+        window.source_dock.show();window.mark_diagnostics([diagnostic])
+        for editor in (window.editor,window.source_view):
+            marks=[s for s in editor.extraSelections() if s.format.underlineStyle()==QTextCharFormat.WaveUnderline]
+            self.assertEqual(len(marks),1)
+            self.assertEqual(marks[0].cursor.selectedText(),'unknownname')
+            self.assertEqual(marks[0].format.toolTip(),'unknown name')
+            self.assertEqual(marks[0].format.underlineColor().name(),'#c43e3e')
+        window.mark_diagnostics([dict(diagnostic,severity=2)])
+        self.assertEqual(window.diagnostic_spans,[],'警告不应让公式变成失败源码框')
+        self.assertEqual(window.editor.extraSelections()[-1].format.underlineColor().name(),'#ad7800')
+        window.mark_diagnostics([])
+        self.assertFalse(any(s.format.underlineStyle()==QTextCharFormat.WaveUnderline for s in window.editor.extraSelections()))
+
+    def test_hover_maps_source_position_and_discards_old_tooltips(self):
+        from PyQt5.QtWidgets import QToolTip
+        self.load('中文😀 $x$ #text("ok")');window=self.window;asked=[]
+        at=window.source.index('text')+2
+        cursor=window.editor.textCursor();cursor.setPosition(window.editor.mapping.display_position(at));window.editor.setTextCursor(cursor)
+        def request(route,body,callback,key=None):asked.append((body,callback))
+        with patch.object(window.lsp,'request',side_effect=request),patch.object(QToolTip,'showText') as shown:
+            window.language_help.hover(window.editor)
+            self.assertEqual(asked[0][0]['position'],{'line':0,'character':u16(window.source[:at])})
+            asked[0][1]({'result':{'contents':{'kind':'markdown','value':'text <script>literal</script>'}}},None)
+            self.assertIn('&lt;script&gt;',shown.call_args.args[1])
+            shown.reset_mock();window.language_help.hover(window.editor);window.language_help.cancel()
+            asked[1][1]({'result':{'contents':'obsolete'}},None)
+            shown.assert_not_called()
+        self.assertEqual(window.commands['definition'][0].shortcut().toString(),'F12')
+
+    def test_definition_link_reveals_folded_definition_without_opening_draft(self):
+        self.load('#let fnn(x) = x\n#fnn(1)');window=self.window
+        bounds={'start':{'line':0,'character':5},'end':{'line':0,'character':8}}
+        result={'targetUri':(window.workspace/'untitled.typ').as_uri(),'targetSelectionRange':bounds,'targetRange':bounds}
+        def request(route,body,callback,key=None):callback({'result':[result]},None)
+        with patch.object(window.lsp,'request',side_effect=request):window.language_help.goto(position=window.source.rindex('fnn'))
+        self.assertIsNone(window.definition_draft)
+        self.assertFalse(window.source_dock.isHidden())
+        self.assertEqual(window.source_view.textCursor().selectedText(),'fnn')
+
+    def test_real_lsp_diagnoses_a_missing_file_and_its_unsaved_changes(self):
+        import uuid
+        window=self.window;window.compile_timer.stop();window.diagnostic_timer.stop()
+        name='lsp-unsaved-'+uuid.uuid4().hex+'.typ'
+        body=window.body()|{'path':name,'source':'#unknownname','method':'diagnostics'}
+        first=self.service('/api/lsp',body,window.lsp)
+        self.assertTrue(any('unknownname' in d['message'] for d in first['diagnostics']))
+        second=self.service('/api/lsp',body|{'source':'#otherunknown'},window.lsp)
+        self.assertEqual(second['version'],first['version']+1)
+        self.assertTrue(any('otherunknown' in d['message'] for d in second['diagnostics']))
+        self.assertFalse((window.workspace/name).exists(),'LSP 同步不应创建占位文件')
+
+    def test_real_lsp_hover_and_definition_reach_text_editor(self):
+        from PyQt5.QtWidgets import QToolTip
+        window=self.window
+        with TemporaryDirectory() as directory:
+            path=Path(directory)/'main.typ';path.write_text('#let named = 1\n#named',encoding='utf8')
+            try:
+                window.load(path);window.compile_timer.stop();window.diagnostic_timer.stop()
+                at=window.source.rindex('named')+2
+                cursor=window.editor.textCursor();cursor.setPosition(window.editor.mapping.display_position(at));window.editor.setTextCursor(cursor)
+                def wait_for(predicate):
+                    loop=QEventLoop();timer=QTimer();timer.timeout.connect(lambda:loop.quit() if predicate() else None)
+                    deadline=QTimer();deadline.setSingleShot(True);deadline.timeout.connect(loop.quit)
+                    timer.start(10);deadline.start(10000);loop.exec_();timer.stop();deadline.stop();self.assertTrue(predicate())
+                with patch.object(QToolTip,'showText') as shown:
+                    window.language_help.hover(window.editor);wait_for(lambda:shown.called)
+                    self.assertTrue(shown.call_args.args[1])
+                window.language_help.goto(position=at)
+                wait_for(lambda:window.source_view.textCursor().selectedText()=='named')
+                self.assertFalse(window.source_dock.isHidden())
+            finally:window.load()
+
+    def test_cross_file_definition_preserves_unsaved_source_and_history(self):
+        window=self.window;opened=[]
+        with TemporaryDirectory() as directory:
+            main=Path(directory)/'main.typ';target=Path(directory)/'defs.typ'
+            main.write_text('#import "defs.typ": named\n#named',encoding='utf8')
+            target.write_text('#let named = 1',encoding='utf8')
+            try:
+                window.load(main);window.replace(len(window.source),len(window.source),'\nUnsaved')
+                source=window.source;history=list(window.history)
+                window.compile_timer.stop();window.diagnostic_timer.stop()
+                previous=set(Window.windows)
+                window.language_help.goto(position=source.rindex('#named')+3)
+                loop=QEventLoop();timer=QTimer()
+                def check():
+                    opened[:]=[w for w in Window.windows if w not in previous]
+                    if opened:loop.quit()
+                timer.timeout.connect(check);timer.start(10)
+                deadline=QTimer();deadline.setSingleShot(True);deadline.timeout.connect(loop.quit);deadline.start(10000)
+                loop.exec_();timer.stop();deadline.stop()
+                self.assertEqual(len(opened),1)
+                self.assertEqual(opened[0].path,target.resolve())
+                self.assertEqual(opened[0].source_view.textCursor().selectedText(),'named')
+                self.assertEqual(window.source,source);self.assertEqual(window.history,history)
+            finally:
+                for child in opened:child.saved=child.source;child.close();child.deleteLater()
+                window.load()
+
     def test_bound_style_has_a_visible_editable_argument_caret(self):
         window=self.window;calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request):

@@ -81,9 +81,15 @@ const NEW_MATRIX_ROWS: usize = 2;
 /// the `fraction` shape has two slots, `decoration` one, and a grid repeats its
 /// one-cell pattern up to the default matrix the editor has always built. A leaf
 /// has no slots, so it is left empty.
-fn fill_command_cells(atom: &mut MathAtom) {
+fn fill_command_cells(atom: &mut MathAtom, registry: &typst::MacroRegistry) {
     if !atom.cells.is_empty() { return; }
-    let shape = atom.shape();
+    let shape = if let Kind::MacroCall { name, function } = &atom.kind {
+        // User bindings own their arity, including zero. A repeatable macro
+        // parameter list is not a request for the default four matrix cells.
+        if !function || registry.is_bound(name) {return;}
+        let Some(shape)=atom.command_shape_ignoring_body() else {return;};
+        shape
+    } else {atom.shape()};
     let want = match shape.arity {
         slots::Arity::Exact => shape.slots.len(),
         slots::Arity::Repeat => NEW_MATRIX_COLUMNS * NEW_MATRIX_ROWS,
@@ -472,7 +478,8 @@ impl Editor {
                 // `frac(a, b)` parse to the same kind, and only the first needs cells
                 // added. `fill_command_cells` leaves a node that already has them
                 // alone, so this is safe for both.
-                for atom in &mut data { fill_command_cells(atom); }
+                let registry=typst::macro_registry(&self.definitions);
+                for atom in &mut data { fill_command_cells(atom,&registry); }
                 let n = data.len(); self.data_mut().splice(pos..pos, data); self.cursor.pos += n;
                 // A lone command node is entered at its first slot, the way a
                 // factory-built one used to be, so `\frac` + Enter leaves the caret
@@ -559,7 +566,7 @@ impl Editor {
                 if self.quoted_draft() { self.interpret_char('"'); return; }
                 // Built-in exact names still create empty, editable LyX slots; a
                 // macro name comes from the completion list instead.
-                let exact = self.pending().map(str::trim).is_some_and(|s| self.is_command_name(s))
+                let exact = self.pending().map(str::trim).is_some_and(|s| self.is_command_name(s) || typst::macro_registry(&self.definitions).is_bound(s))
                     || list.iter().any(|name| Some(name.as_str()) == self.pending().map(str::trim));
                 let single_name = self.pending().is_some_and(|s| !s.trim().is_empty() && s.trim().chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_'));
                 if !exact && single_name {
@@ -624,8 +631,9 @@ impl Editor {
     /// name a node the editor can put slots in; a variable or an unknown name is left
     /// as the text it is.
     fn is_callable(&self, name: &str) -> bool {
+        let registry=typst::macro_registry(&self.definitions);
+        if registry.is_bound(name) {return registry.get(name).is_some_and(|def|def.function);}
         self.is_command_name(name)
-            || typst::macro_registry(&self.definitions).get(name).is_some_and(|def| def.expandable)
     }
     fn nice_insert(&mut self, name: &str) {
         if name == "sup" || name == "sub" { self.script(name == "sup"); return; }
@@ -658,7 +666,8 @@ impl Editor {
                 let previous = self.definitions.clone();
                 self.definitions = doc.definitions;
                 let mut data = doc.root;
-                for atom in &mut data { fill_command_cells(atom); }
+                let registry=typst::macro_registry(&self.definitions);
+                for atom in &mut data { fill_command_cells(atom,&registry); }
                 // The caret enters the node when it has a first slot to sit in, which
                 // is what makes a fresh `\frac` land in the numerator whether the
                 // parser supplied the cells (`frac`) or `fill_command_cells` did.

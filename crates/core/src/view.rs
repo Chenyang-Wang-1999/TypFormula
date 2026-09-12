@@ -234,7 +234,7 @@ impl Editor {
                 registry: &registry,
                 session: Some(Session { slices: &self.cursor.slices, selection: self.selection() }),
             };
-            projector.view_cell(&self.root, Some(&[]), "root")
+            projector.view_cell(&self.root, Some(&[]), "root", true)
         };
         let mut candidates = vec![];
         fn collect(view: &View, cursor: &Cursor, out: &mut Vec<Cursor>) {
@@ -307,7 +307,7 @@ impl Projector<'_> {
     fn selection(&self) -> Option<(usize, usize)> {
         self.session.and_then(|session| session.selection)
     }
-    fn view_cell(&self, data: &MathData, path: Option<&[CursorSlice]>, occurrence: &str) -> View {
+    fn view_cell(&self, data: &MathData, path: Option<&[CursorSlice]>, occurrence: &str, attachment_level: bool) -> View {
         let mut children = vec![];
         for p in 0..=data.len() {
             if let Some(path) = path {
@@ -316,14 +316,14 @@ impl Projector<'_> {
                 children.push(stop);
             }
             if let Some(atom) = data.get(p) {
-                let mut view = self.view_atom(atom, path, p, &format!("{occurrence}.a{p}"));
+                let mut view = self.view_atom(atom, path, p, &format!("{occurrence}.a{p}"), attachment_level);
                 view.selected = path == Some(self.slices()) && self.selection().is_some_and(|(a,b)| a <= p && p < b);
                 children.push(view);
             }
         }
         View::new(if data.is_empty() { "empty-cell" } else { "cell" }, "", children)
     }
-    fn view_atom(&self, atom: &MathAtom, path: Option<&[CursorSlice]>, pos: usize, occurrence: &str) -> View {
+    fn view_atom(&self, atom: &MathAtom, path: Option<&[CursorSlice]>, pos: usize, occurrence: &str, attachment_level: bool) -> View {
         let child_path = |idx| path.map(|p| { let mut p = p.to_vec(); p.push(CursorSlice { atom: pos, cell: idx }); p });
         let shape = atom.shape();
         // The layout strategy is declared per shape (`slots::Shape::view`); only
@@ -341,7 +341,7 @@ impl Projector<'_> {
             let draw = atom.command_shape().and_then(|_| crate::slots::configured_draw(name));
             if let Some(draw) = draw {
                 let children = atom.cells.iter().enumerate().map(|(idx, data)| {
-                    let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"));
+                    let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"), attachment_level && matches!(atom.kind, Kind::Multiline {..}));
                     child.role = shape.role_at(idx).map(Role::name);
                     child
                 }).collect();
@@ -356,7 +356,7 @@ impl Projector<'_> {
             let bound = definition.filter(|def| def.params.len() == atom.cells.len());
             if let Some(def) = bound.filter(|_| typst::projection_size(atom, self.registry, typst::PROJECTION_LIMIT) <= typst::PROJECTION_LIMIT) {
                 let args: Vec<_> = atom.cells.iter().enumerate().map(|(i, arg)| {
-                    let mut view = View::new("macro-argument", def.params.get(i).map_or("", String::as_str), vec![self.view_cell(arg, child_path(i).as_deref(), occurrence)]);
+                    let mut view = View::new("macro-argument", def.params.get(i).map_or("", String::as_str), vec![self.view_cell(arg, child_path(i).as_deref(), occurrence, false)]);
                     view.columns = i;
                     view
                 }).collect();
@@ -380,7 +380,7 @@ impl Projector<'_> {
             let mut children = vec![View::new("symbol", format!("{name}{}", if *function { "(" } else { "" }), vec![])];
             for (i, arg) in atom.cells.iter().enumerate() {
                 if i > 0 { children.push(View::new("symbol", ", ", vec![])); }
-                children.push(self.view_cell(arg, child_path(i).as_deref(), &format!("{occurrence}.c{i}")));
+                children.push(self.view_cell(arg, child_path(i).as_deref(), &format!("{occurrence}.c{i}"), false));
             }
             if *function { children.push(View::new("symbol", ")", vec![])); }
             let mut view = View::new(MACRO_COLLAPSED, typst::write_atom(atom), children);
@@ -390,7 +390,7 @@ impl Projector<'_> {
         // Every cell is a slot of this node, and its role comes from the node's
         // own shape, so the frontend can place it without counting cells.
         let children: Vec<_> = atom.cells.iter().enumerate().map(|(idx, data)| {
-            let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"));
+            let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"), attachment_level && matches!(atom.kind, Kind::Multiline {..}));
             child.role = shape.role_at(idx).map(Role::name);
             child
         }).collect();
@@ -435,7 +435,14 @@ impl Projector<'_> {
                 let mut slots = vec![children[0].clone_view()];
                 for up in [true, false] {
                     let index = script_cell(up);
-                    let mut slot = match atom.script_idx(up) { Some(i) => children[i].clone_view(), None => View::new("absent", "", vec![]) };
+                    // Optional empty scripts are absent only when they are not
+                    // being edited. Creating a^ moves the caret into an empty
+                    // upper cell, whose placeholder and stop must remain visible.
+                    let editing_empty = child_path(index).as_deref()
+                        .is_some_and(|p| self.session.is_some() && p == self.slices());
+                    let mut slot = if atom.script_idx(up).is_some() || editing_empty {
+                        children[index].clone_view()
+                    } else {View::new("absent", "", vec![])};
                     // An empty attachment is a slot too, so it carries the role
                     // of the cell it stands in for.
                     slot.role = atom.shape().role_at(index).map(Role::name);
@@ -445,9 +452,9 @@ impl Projector<'_> {
                 fn has_draft(atom: &MathAtom) -> bool {
                     matches!(atom.kind, Kind::Unknown { .. }) || atom.cells.iter().flatten().any(has_draft)
                 }
-                // Phase one: top-level branches only. Nested math styles must
-                // be passed through Typst before this scope can be broadened.
-                if path.is_some_and(|p| p.is_empty()) && !has_draft(atom) && !atom.cells[0].is_empty() {
+                // Alignment cells keep their equation's math style; fractions,
+                // scripts and other nests still require their own engine context.
+                if attachment_level && path.is_some() && !has_draft(atom) && !atom.cells[0].is_empty() {
                     view.attachment = Some(typst::write_atom(atom));
                 }
                 view
@@ -624,7 +631,7 @@ impl Projector<'_> {
 /// it expands to is a display tree. Passing `session: None` is not a mode — there is no
 /// session at registration, so there is nothing else it could be.
 pub fn template_tree(template: &MathData, registry: &MacroRegistry) -> ViewTemplate {
-    ViewTemplate::of(&Projector { registry, session: None }.view_cell(template, None, ""))
+    ViewTemplate::of(&Projector { registry, session: None }.view_cell(template, None, "", false))
 }
 impl View {
     fn glyph_run(&self) -> bool {

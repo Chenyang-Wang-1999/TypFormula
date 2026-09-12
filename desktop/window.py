@@ -19,6 +19,7 @@ from .svg import qt_svg
 from .rawcache import RawCache,signature,reusable,raw_key,signature_digest
 from .incremental import merge as incremental_merge
 from .definitions import blocks as definition_blocks, DefinitionDraft
+from .language import LanguageHelp
 
 def initial_window_geometry(available):
     """Fit and center a top-level window inside one screen's work area."""
@@ -52,7 +53,7 @@ class Window(QMainWindow):
     def __init__(self,path=None,screen=None):
         super().__init__();self.loading=True;self.source="";self.saved="";self.path=None
         self.history=[];self.future=[];self.revision=0;self.analysis={};self.math_state=None
-        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
+        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[];self.text_diagnostics=[]
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
         self.definition_draft=None
         self.settings=load_settings();self.typesetter=Typesetter(self.settings);self.typesetter.warn=self.report
@@ -85,6 +86,8 @@ class Window(QMainWindow):
         # coloured at once instead of paying for a hidden widget on every reply.
         self.source_dock.visibilityChanged.connect(self.dock_visibility_changed)
         self.source_view.textChanged.connect(self.source_changed)
+        self.language_help=LanguageHelp(self)
+        self.language_help.install(self.editor);self.language_help.install(self.source_view)
         self.outline=QTreeWidget();self.outline.setHeaderHidden(True)
         dock=QDockWidget("大纲",self);dock.setWidget(self.outline);self.addDockWidget(Qt.LeftDockWidgetArea,dock)
         self.outline.itemClicked.connect(lambda item,_:self.jump_byte(item.data(0,Qt.UserRole)))
@@ -153,6 +156,8 @@ class Window(QMainWindow):
             (tools,"compilePdf","编译 PDF 并打开",self.compile_pdf,"F5",bar),
             (tools,"completion","自动补全",self.complete,"Ctrl+Space",None),
             (tools,"format","格式化",self.format_source,"Ctrl+Alt+F",None),
+            (tools,"hover","显示符号说明",lambda:self.language_help.hover(self.source_view if self.source_view.hasFocus() else self.focused_editor()),"Ctrl+K, Ctrl+I",None),
+            (tools,"definition","跳转定义",self.language_help.goto,"F12",None),
             (tools,"settings","设置 / 快捷键…",self.configure,None,None),
             (tools,"packages","浏览 @local / @preview 包…",self.packages,None,None)]
         for entry in entries:self.action(*entry)
@@ -174,13 +179,14 @@ class Window(QMainWindow):
 
     def load(self,path=None):
         if not self.finish_formula(focus=False):return
+        self.language_help.cancel()
         if path:
             path=Path(path).resolve()
             with path.open("r",encoding="utf-8-sig",newline="") as stream:text=stream.read()
             self.newline="\r\n" if "\r\n" in text else "\n";text=text.replace("\r\n","\n")
         else:text="";self.newline="\n"
         self.stop_preview()
-        self.path=path;self.source=text;self.saved=text;self.history=[];self.future=[];self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
+        self.path=path;self.source=text;self.saved=text;self.history=[];self.future=[];self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[];self.text_diagnostics=[]
         self.typesetter.cache.clear();self.typesetter.svg.clear();self.typesetter.placements.clear();self.typesetter.glyphs.clear();self.glyph_pending.clear();self.ensure_services()
         self.core.call("set_source",source=text)
         self.analysis=self.core.call("analyze");self.bind_formula_ids({},self.analysis);self.raw_cache.edits.clear();self.load_glyphs();self.raw_cache.rebind({},self.analysis);self.raw_pending.clear();self.revision+=1
@@ -328,6 +334,7 @@ class Window(QMainWindow):
         if len(self.history)>500:self.history.pop(0)
 
     def update_analysis(self,old_source,start,end,replacement,core_current=False):
+        self.language_help.cancel()
         byte_start=to_byte(old_source,start);byte_end=to_byte(old_source,end)
         state=None if core_current else self.core.call("edit_source",start=byte_start,end=byte_end,text=replacement)
         reparsed=(self.math_state if core_current else state).get('reparsed_range',{'start':0,'end':len(self.source.encode('utf-8'))})
@@ -377,7 +384,7 @@ class Window(QMainWindow):
             self.project();return
         self.checkpoint()
         old_source=self.source;self.source=self.source[:a]+text+self.source[b:];self.revision+=1
-        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
+        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[];self.text_diagnostics=[]
         old=self.analysis
         self.analysis=self.update_analysis(old_source,a,b,text);self.raw_cache.rebind(old,self.analysis)
         caret=a+len(text)
@@ -403,7 +410,7 @@ class Window(QMainWindow):
         if not self.finish_formula(focus=False):return
         other.append((self.source,self.focused_editor().source_selection()))
         old_source=self.source;self.source,selection=stack.pop();self.revision+=1
-        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
+        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[];self.text_diagnostics=[]
         old=self.analysis
         a,b,text=difference(old_source,self.source)
         self.analysis=self.update_analysis(old_source,a,b,text);self.raw_cache.rebind(old,self.analysis)
@@ -439,7 +446,7 @@ class Window(QMainWindow):
         self.math_state=state
         if state["source"]!=before:
             self.checkpoint();self.source=state["source"];self.revision+=1
-            self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
+            self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[];self.text_diagnostics=[]
             for key,value in list(self.typesetter.cache.items()):
                 if value is None:del self.typesetter.cache[key]
             self.typesetter.touch()
@@ -548,6 +555,7 @@ class Window(QMainWindow):
             other=self.editors.pop();other.setParent(None);other.deleteLater()
         else:
             editor=Editor(self);self.editors.append(editor);self.splitter.addWidget(editor);editor.project((0,0))
+            self.language_help.install(editor)
             editor.verticalScrollBar().valueChanged.connect(self.reposition_math)
             editor.verticalScrollBar().valueChanged.connect(lambda _:self.raw_timer.start())
             editor.verticalScrollBar().valueChanged.connect(lambda _,editor=editor:self.mirror_scroll(editor))
@@ -577,7 +585,8 @@ class Window(QMainWindow):
                     self.typesetter.placements[key]=value if not error else {}
                     self.typesetter.touch()
                     self.repaint_formulas()
-                self.services.request("/api/attachments",{"path":body["path"],"expression":expression,"definitions":definitions,"display":display},attached,key="attachment:"+str(key))
+                context={'source':self.source,'start':formula['start'],'end':formula['end']}
+                self.services.request("/api/attachments",{"path":body["path"],"expression":expression,"definitions":definitions,"display":display,'context':context},attached,key="attachment:"+str(key))
         self.semantic_highlight()
 
     @staticmethod
@@ -825,17 +834,21 @@ class Window(QMainWindow):
         (`start:end`) in **document bytes**, which `document::annotate` computed from the
         same document — so the position is mapped to an index and then to bytes.
         """
-        spans=[]
+        spans=[];text_diagnostics=[]
         for item in diagnostics:
             bounds=item.get("range")
             if not isinstance(bounds,dict):continue
-            if item.get('severity',1)!=1:continue
-            start=to_byte(self.source,self.lsp_position(bounds["start"]))
-            end=to_byte(self.source,self.lsp_position(bounds["end"]))
+            a=self.lsp_position(bounds['start']);b=self.lsp_position(bounds['end'])
+            severity=item.get('severity',1)
+            text_diagnostics.append({'start':a,'end':b,'severity':severity,'message':item.get('message','')})
+            if severity!=1:continue
+            start=to_byte(self.source,a)
+            end=to_byte(self.source,b)
             if end<=start:continue
             spans.append((start,end,item.get("message","")))
         changed=False
         self.diagnostic_spans=spans
+        self.text_diagnostics=text_diagnostics
         views=[f.get('view') for f in self.analysis.get('formulas',[])]
         if self.math_state:views.append(self.math_state['view'])
         for view in views:
@@ -848,6 +861,7 @@ class Window(QMainWindow):
                 if node.get("error")!=hit:changed=True
                 node["error"]=hit
         if changed:self.typesetter.touch();self.repaint_formulas()
+        self.apply_highlights()
 
     def stamp_diagnostics(self,view):
         for node in self.view_nodes(view):
@@ -1226,15 +1240,25 @@ class Window(QMainWindow):
             except Exception as failure:QMessageBox.warning(self,"导出失败",str(failure))
         self.compile(exported)
 
-    def request_language(self,method,callback):
-        position=from_u16(self.source,self.source_view.textCursor().position()) if self.source_view.hasFocus() else self.focused_editor().source_selection()[1]
+    def request_language(self,method,callback,position=None):
+        if position is None:position=from_u16(self.source,self.source_view.textCursor().position()) if self.source_view.hasFocus() else self.focused_editor().source_selection()[1]
         prefix=self.source[:position];line=prefix.count("\n");character=u16(prefix.rsplit("\n",1)[-1])
-        revision=self.revision
+        revision=self.revision;path=self.path
         def done(result,error):
-            if revision!=self.revision:return
+            if revision!=self.revision or path!=self.path:return
             if error:self.report(error);return
             callback(result)
         self.lsp.request("/api/lsp",self.body()|{"method":method,"position":{"line":line,"character":character}},done,key=method)
+
+    def reveal_definition(self,bounds):
+        if not self.finish_formula():return
+        a=self.lsp_position(bounds['start']);b=self.lsp_position(bounds['end'])
+        # A definition may be inside a folded source object. Reveal exact source
+        # in the existing dock rather than opening or committing an edit draft.
+        self.source_dock.show();self.source_view.setFocus()
+        cursor=self.source_view.textCursor();cursor.setPosition(u16(self.source[:a]))
+        cursor.setPosition(u16(self.source[:b]),QTextCursor.KeepAnchor)
+        self.source_view.setTextCursor(cursor);self.source_view.ensureCursorVisible()
 
     def lsp_position(self,position):
         lines=self.source.splitlines(keepends=True);line=position["line"]
@@ -1357,6 +1381,17 @@ class Window(QMainWindow):
                 selection=QTextEdit.ExtraSelection();selection.cursor=QTextCursor(editor.document())
                 selection.cursor.setPosition(convert(a));selection.cursor.setPosition(convert(b),QTextCursor.KeepAnchor)
                 selection.format=fmt;selections.append(selection)
+            for item in self.text_diagnostics:
+                a,b=item['start'],item['end']
+                if b<=a:
+                    a=min(a,max(0,len(self.source)-1));b=min(len(self.source),a+1)
+                start,end=convert(a),convert(b)
+                if end<=start:continue
+                selection=QTextEdit.ExtraSelection();selection.cursor=QTextCursor(editor.document())
+                selection.cursor.setPosition(start);selection.cursor.setPosition(end,QTextCursor.KeepAnchor)
+                fmt=QTextCharFormat();fmt.setUnderlineStyle(QTextCharFormat.WaveUnderline)
+                fmt.setUnderlineColor(QColor('#c43e3e' if item['severity']==1 else '#ad7800'))
+                fmt.setToolTip(item['message']);selection.format=fmt;selections.append(selection)
             editor.setExtraSelections((editor.base_selections if isinstance(editor,Editor) else [])+selections)
             # Definition sources are painted inside text objects, so their token
             # colours must repaint even when a span maps to one collapsed position.
