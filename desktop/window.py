@@ -106,6 +106,10 @@ class Window(QMainWindow):
         self.completion_timer.timeout.connect(lambda:self.complete(automatic=True))
         self.compile_timer=QTimer(self);self.compile_timer.setSingleShot(True);self.compile_timer.setInterval(550)
         self.compile_timer.timeout.connect(self.background)
+        # Diagnostics run after the document has settled: one request per pause, not one
+        # per keystroke, and never before an analysis exists to mark up.
+        self.diagnostic_timer=QTimer(self);self.diagnostic_timer.setSingleShot(True);self.diagnostic_timer.setInterval(400)
+        self.diagnostic_timer.timeout.connect(self.request_diagnostics)
         for editor in self.editors:
             editor.verticalScrollBar().valueChanged.connect(self.reposition_math)
             editor.verticalScrollBar().valueChanged.connect(lambda _:self.raw_timer.start())
@@ -206,6 +210,7 @@ class Window(QMainWindow):
         self.setWindowTitle(("* " if self.source!=self.saved else "")+(self.path.name if self.path else "未命名.typ")+" — TypFormula")
         self.loading=False;self.reposition_math();self.apply_highlights()
         self.loading=True;self.sync_source_lines();self.loading=False
+        self.diagnostic_timer.start()
 
     def dock_visibility_changed(self):
         """Colour the dock as it opens and re-height its lines.
@@ -713,6 +718,55 @@ class Window(QMainWindow):
         if not bounds:return
         formula=next((f for f in self.analysis.get('formulas',[]) if f['start']==bounds['start']),None)
         if formula:self.raw_cache.bind(formula.get('view',{}),state['view'])
+
+    def request_diagnostics(self):
+        """Ask the language service about the document and mark what it rejects.
+
+        A formula the service refuses is drawn the way a fragment whose image failed is
+        drawn: its own source, on warm ground, inside the dashed frame. Same format,
+        because it is the same situation — the editor has nothing it can draw there.
+
+        Only nodes that already carry a **located range** are marked, which is exactly the
+        nodes the engine has to evaluate (a call the kernel cannot shape, a fragment it
+        does not model). An editable slot is never marked, so a half-typed argument does
+        not turn red while it is being typed.
+        """
+        revision=self.revision
+        def done(reply,error):
+            # A language service that is not running is not a document error: the marks
+            # simply stay as they were rather than reporting on every keystroke.
+            if error or revision!=self.revision:return
+            self.mark_diagnostics(reply.get("diagnostics") or [])
+        self.lsp.request("/api/lsp",self.body()|{"method":"diagnostics","position":{"line":0,"character":0}},done,key="diagnostics")
+
+    def mark_diagnostics(self,diagnostics):
+        """Stamp the view node each diagnostic falls in, and clear the rest.
+
+        The two coordinate systems meet here: a diagnostic arrives as an LSP position
+        (line and UTF-16 character) and a view node is located by its own `render_id`
+        (`start:end`) in **document bytes**, which `document::annotate` computed from the
+        same document — so the position is mapped to an index and then to bytes.
+        """
+        spans=[]
+        for item in diagnostics:
+            bounds=item.get("range")
+            if not isinstance(bounds,dict):continue
+            start=from_byte(self.source,self.lsp_position(bounds["start"]))
+            end=from_byte(self.source,self.lsp_position(bounds["end"]))
+            if end<=start:continue
+            spans.append((start,end,item.get("message","")))
+        changed=False
+        for formula in self.analysis.get("formulas",[]):
+            view=formula.get("view")
+            if not view:continue
+            for node in self.view_nodes(view):
+                identity=node.get("render_id")
+                if not identity:continue
+                start,end=(int(part) for part in identity.split(":")[:2])
+                hit=next((message for a,b,message in spans if a<end and start<b),None)
+                if node.get("error")!=hit:changed=True
+                node["error"]=hit
+        if changed:self.typesetter.touch();self.repaint_formulas()
 
     def report_raw_fragments(self,state=None,force=False):
         """Tell the core which Raw fragments of the active formula have no image.

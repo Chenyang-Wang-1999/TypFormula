@@ -2185,6 +2185,66 @@ pub enum ViewTemplate {
 
 **仍然不解决的（分开记账）**：`bold(frac(a, b))` 这类结构体**仍然是整段调用的图**——这是设计决定，不是遗留缺陷（本地排版画不出引擎的分数线与根号钩子）。要让结构体也换成字形，得走当时讨论过的 (C) 路：让引擎逐叶子回答字形，结构仍由引擎的图或本地排版负责。本次做的是 (A)，即"变体套普通字符"这一类的定形。
 
+## `#let` 体一律保留源码 + 公式接上 LSP 诊断 · 2026-09-12
+
+### 一、`#let` 体里的 `$$` 不再是公式框
+
+原来只有**不可展**定义体被 blocked：
+
+```
+#let dbl(x) = $#x + 1$\n$dbl(y)$
+  formula 14..22  editable=true     ← 定义体自己，一个公式框
+  let      1..22
+```
+
+`#let dbl(x) = $#x + 1$` 是**可展**的，于是它整个区间不 blocked，`$$` 就拿到了 `editable=true`。
+
+**改动**：`scan_syntax` 里任何 `LetBinding` 的区间都 blocked，理由是两层的——不可展定义体是任意 Typst（`$$` 不是能投影的公式），可展定义体更强：它是**宏模板**（`Kind::Parameter`/`TemplateCall` 的树），而那不是文档公式可以写回的树。把模板体投影成公式框，等于把模板专用节点放在离文档一步的位置，正是 `docs/editing-model.md` §6 要防的事。`blocked` 因此带上 reason，两种定义给两句话。
+
+**不损失任何东西**：定义体里的片段在**调用点**渲染，而调用点的视图本来就带着它、外加它在定义里的区间（上一轮 `Projector` 写 `definitions`/`origin`/`source_range` 正是为此）。实测：
+
+```
+#let fixed(x) = $#x + lr(a, size: #100%)$\n$fixed(y)$
+  formula 16..41 editable=false                       ← 定义体，保留源码
+  formula 42..52 editable=true                        ← 调用点
+    raw text="lr(a, size: #100%)" render_id="22:40:0:0" source_range=[22,40]
+      render.raw id="22:40" 22..40                    ← 要的仍是定义里的那段
+```
+
+### 二、公式接上 LSP 诊断
+
+**LSP 管线早就在跑**（`services.language` 的 `diagnostics` 支持 push 诊断的等待与版本校验），缺的是接线：诊断回来了，没有任何东西把它变成视图节点。
+
+- `Window.request_diagnostics` 在 `project()` 之后由单发的 `diagnostic_timer`（400ms）触发，一次停顿一个请求；
+- `Window.mark_diagnostics` 把 LSP 位置（行 + UTF-16 字符）**经 `lsp_position` → `from_byte`** 换成文档字节，再与每个节点的 `render_id`(`start:end`) 比对——两套坐标因此对齐；
+- 命中的节点盖 `error`，没命中的清掉。
+
+**只有带 `render_id` 的节点会被标**，而那就是引擎必须求值的那些（内核画不出、退成图的调用）。**可编辑槽位永远不会被标**，所以打字打到一半不会变红——这是"只拦结构公式的展开结果"这条要求的落地方式。
+
+### 三、画法：一个函数，一个状态
+
+`mathview.py` 新增 `failed_box`，被两处调用：图的请求被拒绝的 `raw`，和语言服务拒绝的节点。两者都是"编辑器在这里没有东西可以排"，所以用一种样子——源码、暖底、虚线框，加进 `box.raws` 因而还能双击进源码修。**两处共用一个函数是刻意的**：读者不该为一个状态学两个信号。
+
+### 四、三条既有用例的语义变化（不是回归）
+
+| 用例 | 处理 |
+| --- | --- |
+| `tests/desktop.rs` 的投影用例 | 断言从 `formulas[1].editable == true` 改为 `false`（**这就是需求**），并断言 reason 提到"宏模板"；用例改名以说明它现在守什么 |
+| `test_a_macro_fragment_is_rendered_from_its_call_site_like_any_other` | 从**调用点**的视图取 `raw` 节点（定义体不再是公式）。断言本身不变：要的区间仍是定义里的那段 |
+| `test_a_definition_fragment_keeps_the_call_that_renders_it` | 前提（"只有定义体在屏幕上"）消失了。改成"调用点在屏幕上、片段的区间在定义里"，`context_end` 仍是整篇——意图保留 |
+| `test_let_edit_rebuilds_affected_following_projections` | 顺带发现它**一直是假通过**：fixture 用单字母名 `f`，而单字母名被词法读成 `MathText`，`$f(a)$` 根本不是调用，所以"后续投影变了"其实是被**定义体自己的视图**变出来的。改用 `dbl` 之后它守的才是它声称的事 |
+
+### 五、验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **144 通过 / 0 失败 / 6 忽略**（+1 新用例） |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过** |
+| `python -m unittest desktop.test_desktop` | **88 通过**（+1 新用例） |
+| `python tools/kind_inventory.py` | 退出码 0 |
+
+改动文件：`src/desktop.rs`、`desktop/{window,mathview,test_desktop}.py`、`tests/desktop.rs`、`docs/validation.md`。
+
 
 
 

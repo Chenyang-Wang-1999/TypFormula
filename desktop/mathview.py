@@ -286,6 +286,19 @@ class Typesetter:
             box.operations.insert(0, ("corners", 0, 0, (box.width, box.height)))
         return box
 
+    def failed_box(self, node, em, ascent, factor, kind):
+        """A node the editor cannot draw: its source, on warm ground, inside dashes.
+
+        One function because it is one state. A fragment whose image was refused and a
+        node the language service rejected are both "the editor has nothing to lay out
+        here", and the reader should not have to learn two signals for that.
+        """
+        glyph, draw_font, width = self.source_run(node.get("text", ""), factor)
+        box = Box(width, em, ascent, [("text",0,ascent,(glyph,draw_font,kind))])
+        box.operations.insert(0,("failed",0,0,(width,em)))
+        box.raws.append((QRectF(0,0,width,em),node))
+        return box
+
     def layout_node(self, node, factor=1.0, text_mode=False):
         font, metrics, em, ascent, descent = self.line(factor)
         kind = node.get("kind", "cell")
@@ -305,6 +318,13 @@ class Typesetter:
             return box
         if kind == "stop":
             return Box(2,em,ascent,stops=[(1,0,em,node["cursor"],node.get("active",False))])
+        if kind in ("raw","raw_macro") and node.get("error"):
+            # The language service rejected this one, so the editor draws what it can
+            # vouch for: the node's own source, in the failure dress. That is the same
+            # drawing a fragment whose image never came back gets, which is the point --
+            # both mean "there is nothing here the editor can lay out", and one format
+            # for both is what keeps the reader from learning two signals for one state.
+            return self.failed_box(node, em, ascent, factor, kind)
         if kind == "raw":
             box = self.image_box(node, metrics, factor)
             if box is not None: return box
@@ -313,11 +333,7 @@ class Typesetter:
                 # Asked for and refused. Its source is shown instead, marked with
                 # dashes and warm ground, and the core lets a horizontal key enter
                 # it so it can be repaired in place.
-                glyph, draw_font, width = self.source_run(node.get("text", ""), factor)
-                box = Box(width,em,ascent,[("text",0,ascent,(glyph,draw_font,kind))])
-                box.operations.insert(0,("failed",0,0,(width,em)))
-                box.raws.append((QRectF(0,0,width,em),node))
-                return box
+                return self.failed_box(node, em, ascent, factor, kind)
         if kind == "raw_macro" and not node.get("_active"):
             # A call the kernel declines to expand is drawn as *the document has it* --
             # one compiled image of the call's own source -- while the caret is outside

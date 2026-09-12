@@ -352,13 +352,20 @@ class NativeTest(unittest.TestCase):
 
         The fragment's own text lives in the definition, so that is the range the
         batch asks for; the document's call to the macro is what compiles it.
+
+        A definition body is **source**, not a formula, so the fragment reaches the
+        batch through the *call site's* view -- which carries it together with the
+        range in the definition it came from (`view::Projector` writes
+        `definitions`/`origin`/`source_range` for exactly that).
         """
         fragment='lr(a, size: #100%)'
         self.load(f'#let fixed(x) = $#x + {fragment}$\n$fixed(y)$')
         window=self.window;window.compile_timer.stop()
         before=window.source;history=len(window.history)
+        call=next(formula for formula in window.analysis['formulas'] if formula.get('view'))
         calls,request=self.fake_render()
-        with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+        with patch.object(window,'visible_formula_starts',return_value={call['start']}), \
+             patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
             window.load_raw()
         self.assertEqual(len(calls),1)
         # The range is derived from the fragment rather than written out: an opaque
@@ -366,24 +373,29 @@ class NativeTest(unittest.TestCase):
         definition=window.source.index(fragment)
         end=definition+len(fragment)
         self.assertIn({'id':f'{definition}:{end}','start':definition,'end':end},calls[0]['raw'])
-        node=next(node for node in window.view_nodes(window.analysis['formulas'][0]['view']) if node['kind']=='raw')
+        node=next(node for node in window.view_nodes(call['view']) if node['kind']=='raw')
         self.assertIsInstance(window.typesetter.raw(node),dict,'the batch result is what this fragment draws')
         self.assertEqual(window.preview_revision,-1,'an image request must not touch the preview')
         self.assertEqual(window.source,before);self.assertEqual(len(window.history),history,'asking for an image never edits the document')
 
     def test_a_definition_fragment_keeps_the_call_that_renders_it(self):
         """Typst typesets a definition's fragment where the macro is called, so the
-        context cut may not drop a call that is later in the document."""
+        context cut may not drop a call that is later in the document.
+
+        The request is made from the call site -- that is the only formula the fragment
+        appears in -- but its **range** lies in the definition, and that is what makes
+        the whole document the compiled context.
+        """
         self.load('#let fixed(x) = $#x + lr(a, size: #100%)$\n\n$ fixed(y) $')
         window=self.window;window.compile_timer.stop();window.raw_timer.stop()
-        # Only the definition's own formula is on screen; its call sits below it.
-        with patch.object(window,'visible_formula_starts',return_value={window.source.index('$#x')}):
-            calls,request=self.fake_render()
-            with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
-                window.load_raw()
+        call=next(formula for formula in window.analysis['formulas'] if formula.get('view'))
+        calls,request=self.fake_render()
+        with patch.object(window,'visible_formula_starts',return_value={call['start']}), \
+             patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            window.load_raw()
         self.assertEqual(len(calls),1)
         self.assertEqual(calls[0]['context_end'],len(window.source.encode('utf-8')),'the call must stay inside the compiled source')
-        node=next(node for node in window.view_nodes(window.analysis['formulas'][0]['view']) if node['kind']=='raw')
+        node=next(node for node in window.view_nodes(call['view']) if node['kind']=='raw')
         self.assertIsInstance(window.typesetter.raw(node),dict)
 
     def test_typst_controls_native_limit_placement(self):
@@ -1355,15 +1367,54 @@ class NativeTest(unittest.TestCase):
             for index in range(2):
                 self.assertEqual((shifted[view][index][0]-built[view][index][0],shifted[view][index][1]-built[view][index][1]),(3,3),f'view {view} span {index}')
 
+    def test_a_formula_the_language_service_rejects_is_drawn_like_a_failed_fragment(self):
+        """Only a node the engine has to evaluate can be marked.
+
+        It is the node that carries a located range, so a half-typed argument is never
+        dressed as broken -- and the drawing is the one a fragment whose image never came
+        back gets, because both mean "there is nothing here the editor can lay out".
+        """
+        self.load('$ x + lr(a, size: #100%) $')
+        window=self.window;window.compile_timer.stop();window.diagnostic_timer.stop()
+        formula=next(f for f in window.analysis['formulas'] if f.get('view'))
+        marked=next(n for n in window.view_nodes(formula['view']) if n.get('render_id'))
+        start,end=(int(part) for part in marked['render_id'].split(':')[:2])
+        prefix=window.source[:start];line=prefix.count('\n');line_start=prefix.rfind('\n')+1
+        character=u16(window.source[line_start:start]);length=u16(window.source[line_start:end])
+        diagnostic={'range':{'start':{'line':line,'character':character},
+                             'end':{'line':line,'character':character+length}},
+                    'message':'unknown variable'}
+        asked=[]
+        def request(route,body,callback,key=None):
+            asked.append((route,body.get('method'),key));callback({'diagnostics':[diagnostic]},None)
+        with patch.object(window.lsp,'request',side_effect=request):
+            window.request_diagnostics()
+        self.assertEqual(asked,[('/api/lsp','diagnostics','diagnostics')],'诊断要真的问出去')
+        self.assertEqual(marked.get('error'),'unknown variable','诊断落在哪个节点就标哪个')
+        # The editable part of the same formula is untouched.
+        for node in window.view_nodes(formula['view']):
+            if not node.get('render_id'):
+                self.assertIsNone(node.get('error'),f'可编辑节点不该被标：{node.get("kind")}')
+        box=window.typesetter.layout(formula['view'])
+        self.assertTrue(any(op[0]=='failed' for op in box.operations),'按失败片段的样式画')
+        # An answer that clears must clear the mark, not leave the last one standing.
+        with patch.object(window.lsp,'request',side_effect=lambda route,body,callback,key=None:callback({'diagnostics':[]},None)):
+            window.request_diagnostics()
+        self.assertIsNone(marked.get('error'))
+
     def test_let_edit_rebuilds_affected_following_projections(self):
-        source='#let f(x) = $#x + 1$\nBefore $f(a)$\nAfter $f(b)$'
+        # A name of **two or more** graphemes: a one-letter name is lexed as `MathText`,
+        # so `$f(a)$` is never a call and this fixture used to pass for the wrong reason
+        # (the *definition's* own projection changed, not the call sites').
+        source='#let dbl(x) = $#x + 1$\nBefore $dbl(a)$\nAfter $dbl(b)$'
         self.load(source);window=self.window
-        before=[signature(formula['view']) for formula in window.analysis['formulas']]
+        # The definition body is source, so only the two call sites have a view.
+        before=[signature(formula.get('view') or {}) for formula in window.analysis['formulas']]
         at=source.index('+');calls=[];original=window.core.call
         def observed(action,**arguments):calls.append(action);return original(action,**arguments)
         with patch.object(window.core,'call',side_effect=observed):window.replace(at,at+1,'-')
-        after=[signature(formula['view']) for formula in window.analysis['formulas']]
-        self.assertNotEqual(after,before)
+        after=[signature(formula.get('view') or {}) for formula in window.analysis['formulas']]
+        self.assertNotEqual(after,before,'改宏定义体必须重建后续调用点的投影')
         self.assertGreaterEqual(calls.count('analyze_formula'),2)
         self.assertNotIn('analyze',calls)
 

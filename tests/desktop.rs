@@ -2,7 +2,10 @@ use serde_json::json;
 use typformula::{desktop::analyze, document::Document};
 
 #[test]
-fn native_projection_keeps_opaque_definitions_in_source_and_preserves_active_session() {
+fn native_projection_keeps_every_let_body_in_source_and_preserves_active_session() {
+    // A `#let` body is source whether or not the definition expands, and the formula
+    // **after** it is unaffected: an expandable body is a macro *template*, parsed with
+    // holes, and that tree is not one a document formula may be projected from.
     let source="#let opaque(x) = $lr(#x, size: #100%)$\n#let expanded(x) = $#x + lr(a, size: #100%)$\n中文 $expanded(y)$";
     let mut document=Document::default();
     document.apply(json!({"action":"set_source","source":source})).unwrap();
@@ -15,7 +18,8 @@ fn native_projection_keeps_opaque_definitions_in_source_and_preserves_active_ses
     let formulas=projection["formulas"].as_array().unwrap();
     assert_eq!(formulas.len(),3);
     assert_eq!(formulas[0]["editable"],false);
-    assert_eq!(formulas[1]["editable"],true);
+    assert_eq!(formulas[1]["editable"],false,"let 定义体一律保留源码，可展的也不例外");
+    assert!(formulas[1]["reason"].as_str().unwrap().contains("宏模板"),"{:?}",formulas[1]["reason"]);
     assert!(formulas[2]["view"].is_object());
 }
 
@@ -39,6 +43,40 @@ fn source_edits_use_typsts_incremental_reparse_and_keep_distant_equations() {
     let after=document.equations();assert_eq!(after.len(),before.len());
     assert_eq!(after.last().unwrap().start,before.last().unwrap().start+8);
     assert_eq!(document.syntax().text(),document.source);
+}
+
+/// 每一个 `#let` 体里的 `$$` 都保留源码，**可展的也不例外**。
+///
+/// 可展定义的体是一个**宏模板**（`Kind::Parameter`/`TemplateCall` 的树，不是文档能写回的
+/// 树），不可展定义体是任意 Typst —— 两者都不该在正文里变成公式框。定义之后的公式不受
+/// 影响，那一条是本用例的另一半。
+#[test]
+fn every_dollar_inside_a_let_body_stays_source() {
+    for source in [
+        "#let dbl(x) = $#x + 1$\n$dbl(y)$",
+        "#let title = [\n  $ x + 1 $\n]\n$title$ + $z$",
+        "#let calc(a) = {\n  let t = $ a $\n  t\n}\n$calc(1) + $w$",
+    ] {
+        let mut document=Document::default();
+        document.apply(json!({"action":"set_source","source":source})).unwrap();
+        let analysis=analyze(&mut document);
+        let lets:Vec<(usize,usize)>=analysis["styles"].as_array().unwrap().iter()
+            .filter(|v|v["kind"]=="let")
+            .map(|v|(v["start"].as_u64().unwrap() as usize,v["end"].as_u64().unwrap() as usize)).collect();
+        assert!(!lets.is_empty(),"{source} 里应当有 let");
+        let mut outside=0;
+        for formula in analysis["formulas"].as_array().unwrap() {
+            let start=formula["start"].as_u64().unwrap() as usize;
+            let end=formula["end"].as_u64().unwrap() as usize;
+            let inside=lets.iter().any(|&(a,b)|a<=start&&end<=b);
+            assert_eq!(formula["editable"],json!(!inside),"{source}\n{start}..{end} 的可编辑性不对：{formula}");
+            if inside {
+                assert!(formula["view"].is_null(),"let 定义体不该有视图：{formula}");
+                assert!(formula["reason"].as_str().unwrap().contains("let"),"{formula}");
+            } else { outside+=1; }
+        }
+        assert!(outside>0,"{source}：定义之外的公式必须仍然是公式框");
+    }
 }
 
 #[test]
