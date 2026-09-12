@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (QApplication,QMainWindow,QWidget,QSplitter,QDockWid
     QPlainTextEdit,QScrollArea,QVBoxLayout,QAction,QFileDialog,QMessageBox,QInputDialog,QDialog,QDialogButtonBox,
     QLineEdit,QPushButton,QFormLayout,QComboBox,QListWidget,QTextEdit)
 from .model import ROOT,load_settings,validate_settings,config_path,atomic_write,from_byte,to_byte,u16,from_u16,difference
+from .runtime import default_workspace
 from .bridge import Core,Services
 from . import preview
 from .editor import Editor,SourceEditor
@@ -169,7 +170,8 @@ class Window(QMainWindow):
         except Exception as error:self.report(error);return None
 
     def ensure_services(self):
-        workspace=self.path.parent if self.path else ROOT/"workspace"
+        workspace=self.path.parent if self.path else default_workspace()
+        if self.path is None:workspace.mkdir(parents=True,exist_ok=True)
         if workspace==self.workspace:return
         if self.services:self.services.close()
         if self.lsp:self.lsp.close()

@@ -4,7 +4,7 @@ TypFormula 是一款支持结构化公式编辑的 Typst 桌面编辑器。你�
 
 项目使用 Typst 引擎渲染公式，支持自定义宏和已安装的 Typst 包。可静态展开的宏支持参数编辑，其他受支持片段由引擎渲染显示。
 
-**项目目前处于早期开发阶段，主要在 Windows 上开发和验证，当前提供源码运行方式。欢迎试用与反馈。**
+**项目目前处于早期开发阶段，主要在 Windows 上开发和验证，提供源码运行方式和便携版打包脚本。欢迎试用与反馈。**
 
 ![TypFormula：正文源码与结构化公式编辑](docs/Figures/preview.png)
 
@@ -122,6 +122,8 @@ cargo fetch --locked --manifest-path native-adapter/Cargo.toml
 - 操作系统、Python/Rust/Tinymist 版本，以及使用的提交版本。
 
 ### 开发验证
+
+生成 Windows 解压即用版请参见 [便携版打包说明](docs/releasing.md)。入口为 `build-release.cmd`，默认包含 Tinymist，并在压缩前运行离屏自检。
 
 完成上述构建后，可在仓库根目录运行：
 

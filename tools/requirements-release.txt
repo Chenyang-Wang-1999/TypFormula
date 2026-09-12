@@ -1,0 +1,4 @@
+-r ../desktop/requirements.txt
+# Validated with Python 3.11 and the project's PyQt5 runtime.
+PyInstaller==6.10.0
+pyinstaller-hooks-contrib==2024.8

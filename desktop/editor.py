@@ -110,6 +110,7 @@ class Editor(QTextEdit):
         scroll=self.verticalScrollBar().value()
         source=self.owner.source
         self.mapping=Projection(source,() if self.source_only else self.owner.projected_objects(),self.expanded)
+        self.index_objects()
         self.clear();font=QFont(self.owner.settings["font_family"]);font.setPointSizeF(self.owner.settings["font_size"])
         self.setFont(font);self.document().setDefaultFont(font)
         cursor=QTextCursor(self.document());cursor.insertText(self.mapping.text)
@@ -122,21 +123,27 @@ class Editor(QTextEdit):
         current=self.toPlainText()
         a,b,replacement=difference(current,projected.text)
         self.loading=True
+        # Qt may ask intrinsicSize synchronously during insertText/setCharFormat.
+        # Publish the complete new source ranges before any document mutation.
+        self.mapping=projected
+        self.index_objects()
         cursor=QTextCursor(self.document())
         cursor.setPosition(u16(current[:a]));cursor.setPosition(u16(current[:b]),QTextCursor.KeepAnchor)
         cursor.insertText(replacement)
-        self.mapping=projected
         self.decorate_incremental(source,selection,scroll,schedule_raw,reparsed)
 
-    def install_objects(self,force=False,dirty=None):
+    def index_objects(self):
         # Unchanged formulas retain their Views and boxes even if the surrounding
         # paragraph was reparsed. Only discard entries whose Views are no longer live.
         live={id(f['view']) for f in self.mapping.objects.values() if 'view' in f}
         self.handler.boxes={key:value for key,value in self.handler.boxes.items() if key in live}
-        self.object_data={};self.object_by_id={}
-        for index,formula in self.mapping.objects.items():
-            position=u16(self.mapping.text[:index]);identifier=formula['_object_id']
-            self.object_data[position]=formula;self.object_by_id[identifier]=formula
+        self.object_data={u16(self.mapping.text[:index]):formula for index,formula in self.mapping.objects.items()}
+        self.object_by_id={formula['_object_id']:formula for formula in self.object_data.values()}
+
+    def install_objects(self,force=False,dirty=None):
+        self.index_objects()
+        for position,formula in self.object_data.items():
+            identifier=formula['_object_id']
             cursor=QTextCursor(self.document());cursor.setPosition(position);cursor.setPosition(position+1,QTextCursor.KeepAnchor)
             current=cursor.charFormat()
             if force or current.objectType()!=OBJECT or current.property(OBJECT_ID)!=identifier:

@@ -28,7 +28,7 @@ typformula/
 │       ├── cursor.rs           `Editor` 与 `Action`：所有编辑动作（含命令草稿、选区、历史）
 │       └── view.rs             `View`/`Response`：交给前端的显示树（`view_atom` 把形状合并成线名）；
 │                               注册期存下的模板也是显示树（`ViewTemplate`，洞与边是它的**变体**）
-├── desktop/                    Qt 前端（PyQt5，源码运行）
+├── desktop/                    Qt 前端（PyQt5，源码运行或 PyInstaller 便携版）
 │   ├── __main__.py             入口：注册随附字体、装异常钩子、开窗口
 │   ├── window.py               主窗口：源码/编辑区投影、公式会话驱动、Raw 取图调度、源码栏、大纲、预览、菜单
 │   ├── editor.py               编辑区控件：自定义公式对象、投影与光标映射、行号、语法高亮
@@ -39,6 +39,8 @@ typformula/
 │   ├── mathfont.py             字体家族解析与字形映射（`glyph(..., substituted=True)` 是"引擎给的串原样画"的分界）
 │   ├── model.py                UTF-8 / UTF-16 / Qt 位置映射（`to_byte`/`from_byte`/`u16`/`from_u16`）、`Projection`、设置读写
 │   ├── bridge.py               子进程桥：`Core`（`--desktop-core`）、`Services`（`--stdio`）
+│   ├── runtime.py              源码/冻结程序的资源、后端和可写工作目录定位
+│   ├── release_smoke.py        冻结发布包的离屏自检，不创建 WebEngine 页面
 │   ├── rawcache.py             Raw 片段的稳定身份（`raw_key`）与脚本形状摘要、失效判定
 │   ├── incremental.py          增量合并：只重建受影响的公式视图
 │   ├── svg.py                  Qt 5 SVG 兼容（Typst 的 glyph `<symbol>` 会报 link is undefined）
@@ -74,6 +76,10 @@ typformula/
 │   ├── services.rs             服务路由；含对着真 Tinymist 钉住实时预览返回形状的用例
 │   └── workspace.rs            路径解析
 ├── tools/                      用真实 release 二进制取证据的脚本
+│   ├── build_release.py        Windows 便携版构建、PyInstaller 打包、自检、ZIP/SHA256
+│   ├── release_entry.py        打包入口（正常启动或 --self-test）
+│   ├── requirements-release.txt  独立打包环境依赖
+│   ├── test_release.py         打包路径与输入校验测试
 │   ├── kind_inventory.py       线上实测：每个 Kind 的 view JSON + 排布名双向对照（不一致则退出码 1）
 │   └── engine_boxes.py         用真实适配器量公式盒子的宽高与基线
 ├── docs/
@@ -81,6 +87,7 @@ typformula/
 │   ├── editing-model.md        三层职责的分工：为什么光标与可编辑性不属于 `Shape`
 │   ├── kind-inventory.md       每个 Kind 的能力清单：存储字段、线上字段、引擎 item、缺口
 │   ├── desktop.md              桌面端操作、字体、投影、构建运行与边界
+│   ├── releasing.md            Windows 便携版构建、产物与验收
 │   ├── style-raw-macro-review.md  style/raw_macro 修复前的审查记录（当前行为见 architecture.md）
 │   ├── tutorial.typ            编辑器教程文档
 │   ├── Figures/                教程插图
@@ -91,8 +98,9 @@ typformula/
 │   └── LYX-CREDITS             LyX 作者与许可
 ├── vendor/typst/               固定版本的 Typst 引擎（含本项目的数学 IR 标签桥接补丁，见 UPSTREAM.md）
 ├── fonts/                      随附数学字体（NewCM Math 与 NewCM10 Italic）与 NOTICE
-├── workspace/                  运行时的默认工作目录（未跟踪）
+├── workspace/                  源码运行的默认工作目录（未跟踪）；便携版使用 LOCALAPPDATA
 ├── build-desktop.cmd           构建 release 后端 + 适配器，并检查 PyQt5（只构建，不启动）
+├── build-release.cmd           构建便携版并离屏自检，默认包含 Tinymist，不上传发布
 ├── start-desktop.cmd           启动窗口（`python -m desktop`）
 ├── Cargo.toml                  根 workspace（成员 `.` 与 `crates/core`；排除 vendor 与 native-adapter）
 ├── COPYING                     GPL-2.0-or-later

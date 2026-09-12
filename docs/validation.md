@@ -2327,3 +2327,28 @@ Rust 默认测试 **155 项通过、6 项忽略**；独立 release 核心上的 
 - `tools/kind_inventory.py` 补出 style、source_text 与 host 渲染字段，修正过时标签。通过导入探针并指定现有隔离 release core，32 个用例全部成功，产生 23 种 View；与前端 ARRANGEMENTS 双向对齐，无缺失或多余项。另验证矩阵 row_lengths=[2,2]、末尾空格规范拼写、激活不改原文以及 a→^ / a→_ 的空槽与 stop。
 - 使用现有隔离 release core / adapter 运行 8 项相关 Qt offscreen 测试：全部通过（5.493 秒），覆盖上下标、值宏命令、多行附件、宏定义草稿/高亮、矩阵补齐、正文编辑复用 View 和真实 LSP 悬停/定义。
 - 27 个本地 Markdown 链接可解析；本轮文件的 `git diff --check` 通过（排除用户正在编辑的 tutorial.typ）。Python AST 与 Rust 差异检查确认产品代码只改注释/文档字符串，不需要重新构建二进制。
+
+
+### 2026-09-12：Windows 便携版打包脚本与冻结程序自检
+
+新增 `build-release.cmd` / `tools/build_release.py`：在独立 target/package-build 目录构建 Rust 后端，或通过 --skip-build 使用已有 release 程序；用 PyInstaller 目录模式收集 Qt、WebEngine、字体和配置，默认附带本机指定/发现的 Tinymist。支持显式基础版，拒绝覆盖已有产物，检查 x64 架构，生成 ZIP、SHA256 和发布清单。工具依赖与用法见 tools/requirements-release.txt、docs/releasing.md。
+
+前端增加 runtime.py，区分源码资源目录与冻结程序资源目录；发布包后端位于 _internal/bin，保留环境变量覆盖。发布版新文档工作目录移至 LOCALAPPDATA/TypFormula/workspace，并在首次使用时创建。冻结入口提供 --self-test，不创建可见窗口或 WebEngine 页面。
+
+- 5 项打包路径与输入校验测试通过，覆盖冻结路径、后端显式覆盖、用户工作目录、Tinymist 指定错误、x64 校验、中文/空格/引号 spec 路径。
+- 完整桌面 Qt offscreen 回归：118 项通过（65.291 秒），未重新编译 Rust 后端。
+- 在独立 venv 安装 PyInstaller 6.10.0、hooks 2024.8、PyQt5 5.15.11、PyQtWebEngine 5.15.7；实际打包使用现有 release 后端与 Tinymist 0.15.8。安装环境与原开发环境分离。
+- 完整测试包冻结程序自检通过：字体注册、文档解析、公式激活与排版、真实字形、SVG/PDF 编译和 Tinymist LSP。自检使用隔离用户目录、受限 PATH 与包缓存；返回路径均指向发布包自身。
+- ZIP `TypFormula-0.1.0-packaging-test.2-windows-x64.zip`：169,203,929 字节，SHA256 `ce0fd01ce3d3ba91d5f97b761a77b2076936853e457b84bb7ae008f078393446`。压缩包 CRC 与 SHA256 通过；解压到中文和空格路径后冻结自检再次通过。不含 Tinymist 的另一个隔离副本也通过基础功能自检，没有借用开发机的 Tinymist。
+- `git diff --check`、Python 语法与发布文档本地链接检查通过。本轮未使用 computer use、未打开可见窗口、未上传或发布 GitHub Release；真实 Windows 页面显示与 WebEngine 交互仍需人工验收。测试包使用 --skip-build，发布清单如实标明，不视为从干净提交完整重编译的正式发行版。
+
+
+### 2026-09-12：确认 dots 命令时的 UTF-8 解码异常
+
+用户报告便携版命令模式输入 dots 并回车时报 UTF-8 unexpected end of data。在随附教程中用真实 Tinymist 补全及 Qt offscreen 复现了完全相同的 position 1252 / byte 0xe6 异常。调用栈为 QTextCursor.setCharFormat → FormulaObject.intrinsicSize → stamp_formula → from_byte：新源码已经生效，公式对象索引仍携带后续公式的旧字节位置，恰好截入中文字符。异常来自 Qt 同步重排，不是管道 JSON 解码；源码运行同样受影响。
+
+Editor 现在在 clear/insertText/setCharFormat 等 Qt 文档操作前，发布新投影与完整对象索引；install_objects 不再边设格式边填半张索引。UTF-8 转换保持严格，不使用 errors=ignore 掩盖错误。
+
+新增回归用例在修复前捕获 18 次 Qt 回调异常，修复后通过，覆盖双栏、命令确认、撤销/重做、正文插入与全量投影。完整桌面离屏测试 119 项通过（60.669 秒）；随附教程加真实 Tinymist 补全验证通过。打包自检也加入中文上下文中的 dots 命令确认，并捕获 Qt excepthook 异常。
+
+使用已有 release 后端重新打包为 TypFormula-0.1.0-dots-fix-windows-x64.zip，冻结自检 unicode_command_edit=true，字体、字形、SVG/PDF、LSP 均通过。ZIP CRC 与 SHA256 核对通过。没有重编译 Rust，没有使用 computer use 或可见桌面测试，没有修改教程文档。

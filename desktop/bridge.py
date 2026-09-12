@@ -1,27 +1,25 @@
 """Private pipes to the native backends. Qt owns child lifetime."""
 import json
-import os
 import time
 from copy import deepcopy
-from pathlib import Path
 from PyQt5.QtCore import QObject, QProcess, QTimer
-from .model import ROOT
+from .runtime import helper, bundled_tinymist, frozen
 
 def backend():
-    default=ROOT/"target/server/release/typformula.exe"
-    if not default.is_file():default=ROOT/"target/server/debug/typformula.exe"
-    path = Path(os.environ.get("TYPFORMULA_BIN", default))
+    path = helper("typformula.exe", "TYPFORMULA_BIN", "server")
     if not path.is_file():
-        raise RuntimeError("请先运行 build-desktop.cmd：缺少 " + str(path))
+        message = "发布包不完整，请重新解压：缺少 " if frozen() else "请先运行 build-desktop.cmd：缺少 "
+        raise RuntimeError(message + str(path))
     return str(path)
 
 def process(parent, arguments, workspace=None):
     from PyQt5.QtCore import QProcessEnvironment
     environment = QProcessEnvironment.systemEnvironment()
-    adapter=ROOT/"target/adapter/release/typformula-layout.exe"
-    if not adapter.is_file():adapter=ROOT/"target/adapter/debug/typformula-layout.exe"
-    adapter=Path(os.environ.get("TYPFORMULA_ADAPTER",adapter))
+    adapter=helper("typformula-layout.exe", "TYPFORMULA_ADAPTER", "adapter")
     environment.insert("TYPFORMULA_ADAPTER", str(adapter))
+    tinymist = bundled_tinymist()
+    if tinymist and not environment.contains("TINYMIST_BIN"):
+        environment.insert("TINYMIST_BIN", str(tinymist))
     child = QProcess(parent)
     child.setProcessEnvironment(environment)
     # A backend that dies says why on stderr. Forwarded to the terminal it never

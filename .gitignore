@@ -3,6 +3,7 @@ target
 prototypes/lyx-rust/upstream
 *.otf
 /workspace/
+/dist/
 !/Cargo.lock
 !/native-adapter/Cargo.lock
 !/fonts/*.otf

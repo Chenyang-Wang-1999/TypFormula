@@ -84,6 +84,30 @@ class NativeTest(unittest.TestCase):
         window=self.window;window.replace(0,len(window.source),source)
         window.compile_timer.stop()
 
+    def test_command_commit_updates_all_formula_objects_before_qt_relayout(self):
+        import sys
+        errors=[]
+        window=self.window
+        self.load('中文 $ x $ 后面正文 $ y $')
+        window.split();window.show();APPLICATION.processEvents()
+        # Exceptions in Qt virtual callbacks go to excepthook, not the caller.
+        with patch.object(sys,'excepthook',side_effect=lambda kind,error,tb:errors.append(error)):
+            window.activate(window.analysis['formulas'][0]['start'])
+            window.math_action('input',text='\\dots')
+            window.math_action('key',key='Enter')
+            APPLICATION.processEvents()
+            self.assertEqual(window.source,'中文 $ dots x $ 后面正文 $ y $')
+            window.finish_formula()
+            window.undo();APPLICATION.processEvents()
+            window.redo();APPLICATION.processEvents()
+            # Also exercise insertText (body edits) and full projection (load).
+            window.replace(0,0,'😀中文 ');APPLICATION.processEvents()
+            self.load('短 $ z $ 后面 $ q $');APPLICATION.processEvents()
+        self.assertEqual(errors,[],str(errors))
+        for editor in window.editors:
+            for formula in editor.object_by_id.values():
+                self.assertEqual(window.source.encode()[formula['start']:formula['end']].decode()[0],'$')
+
     def test_typing_a_then_script_shows_an_empty_slot_and_visible_caret(self):
         window=self.window
         for key,role in (('^','upper'),('_','lower')):

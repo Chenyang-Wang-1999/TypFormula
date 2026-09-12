@@ -10,6 +10,8 @@
 
 ## 启动
 
+Windows 便携版可通过 `build-release.cmd` 生成，构建与发布检查见 [releasing.md](releasing.md)。便携版解压整个目录后运行 `TypFormula.exe`；随附程序在 `_internal/bin/`，新建文档的工作目录位于 `%LOCALAPPDATA%/TypFormula/workspace`。下文的源码启动方式仍然可用。
+
 Windows、Python 3.10+、PyQt5 5.15、现有 Rust 工具链：
 
 ```powershell

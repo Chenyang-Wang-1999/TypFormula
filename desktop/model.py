@@ -2,8 +2,9 @@
 import json
 import os
 from pathlib import Path
+from .runtime import resource_root
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = resource_root()
 DEFAULTS = json.loads((ROOT / "config/desktop-settings.json").read_text("utf-8"))
 
 def u16(text):
