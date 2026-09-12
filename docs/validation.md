@@ -1,5 +1,7 @@
 # 验证记录 · 2026-09-09
 
+> **改名说明（2026-09-12）**：项目原名 Visual Typst，现名 **TypFormula**。本文按日期保留当时的实测记录，因此**下面正文里出现的 `visual-typst` / `visual_typst` / `VISUAL_TYPST_*` 一律是当日的名字**，不是当前可用名。当前名字对照：crate `visual-typst`→`typformula`、`visual-typst-core`→`typformula-core`、`visual-typst-layout`→`typformula-layout`，二进制 `visual-typst.exe`→`typformula.exe`，环境变量 `VISUAL_TYPST_*`→`TYPFORMULA_*`，协议标签 `visual-typst-raw-`/`visual-typst-origin-v1`→`typformula-raw-`/`typformula-origin-v1`。改名的当轮实测见文末 2026-09-12 一节。
+
 > **当前状态（2026-09-10 之后）**：仓库只维护原生桌面编辑器。Web 前端（`web/`）、VS Code 扩展（`extensions/`）、VSIX 产物（`dist/`）、HTTP 模式（`start.cmd`）、WASM 桥（`src/wasm.rs`）和 npm 工具链（`package.json`、`scripts/`、`tests/*.test.mjs`）已删除，随附字体从 `web/fonts/` 移到 `fonts/`。下面按时间顺序保留当时的实测记录：其中 Web/VSIX 相关的构建、`npm test`、`build.cmd`/`start.cmd`、`web/core.wasm` 等条目属于历史证据，不再是可执行的验证入口；当前可用的入口见 [README「验证入口」](../README.md)。
 
 ## 原生 Qt 桌面端
@@ -1777,6 +1779,64 @@ $ ab(y) $    → Math → [MathCall → MathIdent "ab", MathArgs "(y)"]
 最后一条与 `src/desktop.rs::scan_syntax` / `analyze_formula` 里那段 `blocked` 判定对应：公式落在**不可展开**的 `#let` 里时按源码保留，`opaque()` 会沿语法树找出这个位置。
 
 **这一轮没有代码改动**（探针已删，工作区只剩上一轮预览的改动）。
+
+## 改名：Visual Typst → TypFormula · 2026-09-12
+
+### 改了什么
+
+| 类别 | 旧 | 新 | 处数 |
+| --- | --- | --- | --- |
+| 包名 | `visual-typst` / `-core` / `-layout` | `typformula` / `typformula-core` / `typformula-layout` | 3 个 `Cargo.toml` + 2 个 lock（用 `cargo update` 重生成，未手改） |
+| Rust 模块路径 | `visual_typst::` / `visual_typst_core::` | `typformula::` / `typformula_core::` | 25 个文件 |
+| 二进制 | `visual-typst.exe` / `visual-typst-layout.exe` | `typformula.exe` / `typformula-layout.exe` | `bridge.py`、`services.rs`、两个 `.cmd`、两个 `tools/*.py` |
+| 环境变量 | `VISUAL_TYPST_{BIN,ADAPTER,CONFIG,RAW_CACHE,WORKSPACE,PYTHON}` | `TYPFORMULA_*` | 6 个变量、5 个文件 |
+| 设置目录 | `%APPDATA%/VisualTypst/` | `%APPDATA%/TypFormula/` | `model.py`、`window.py`（临时 PDF 目录） |
+| 界面标题 | `Visual Typst` | `TypFormula` | `window.py`、`__main__.py` |
+| 文档 | `Visual Typst` | `TypFormula` | 7 份文档的正文 |
+
+### 最需要小心的一处：vendor 里的协议串
+
+`vendor/typst/` 里的三个字符串**不是名字，是适配器与引擎之间的协议**：
+
+| 字符串 | 谁发 | 谁认 |
+| --- | --- | --- |
+| `visual-typst-raw-<i>` | `native-adapter/src/render.rs` | `typst-library/ir/resolve.rs`、`typst-realize/lib.rs` |
+| `visual-typst-origin-v1` | `typst-eval/src/math.rs`（哈希键） | 同上 |
+| `visual-typst-formula-<i>` | adapter | adapter 自己读回 |
+
+**只改一边就等于协议断了**，而且不会编译失败——引擎只是再也认不出 Raw 片段，界面会静默退回源码。所以四处**同时**改成 `typformula-raw-` / `typformula-origin-v1`，并把 `native-adapter/engine-patches.json`（补丁对照表）里同一批字符串一起改，否则那份表就不再反映 `vendor/` 的实际内容。改完用**真适配器**实测映射仍然有效：
+
+```
+frac(a, b)  {"width": 15.216, "height": 25.3128, "baseline": 16.8648}
+x           {"width": 13.728, "height": 10.872, "baseline": 10.608}
+```
+
+### 一个把我误导了一阵的坑：旧二进制留在 target 里
+
+桌面套件第一次跑 **81 个 ERROR**，报"公式核心已退出（退出码 0）；请求 set_source 在重建公式核心后仍未成功"。我先后怀疑了两件事，都是错的：
+
+1. **怀疑 `bridge.py` 的路径**——查过 `git show HEAD:desktop/bridge.py`，改名前的路径解析就该是那个样子，逐字对得上；
+2. **怀疑 `target/adapter/debug/` 里的旧名二进制**——`debug` 构建确实会去找 `typformula-layout.exe` 而那里只有旧名，于是补了 debug 构建、删了旧名产物。**但重跑仍是 81 ERROR。**
+
+真正的原因是**第三条**：`QProcess: CreateFile failed.（拒绝访问。）`——**沙箱拦了 QProcess 的命名管道**。这正是本文档**已经记过两次**的那件事（第 1162 行、第 1645 行），原文就写着"那不是回归，是 `QProcess` 管道被沙箱拒绝；放开 IPC 后全绿"。放开后 **87 个用例一次全过**。
+
+教训和第 1643 行那句是同一个，但这次我自己踩了：**整片失败的报错，先看错误文本里的系统级线索（`CreateFile failed`），再怀疑自己的改动**。我花在"逐个排查旧名产物"上的时间，本可以用第一行 stderr 省掉。
+
+### 保留旧名的地方（故意的）
+
+`docs/validation.md` 正文里仍留着 `visual-typst`/`visual_typst`/`VISUAL_TYPST_*` 共 12 处，**这是历史记录，不改写**：它们分别是当时的 VSIX 产物名、一段真实的编译错误输出（`unresolved import visual_typst`）、以及描述当日代码结构的表述。已在本文件开头加了一段"改名说明"，声明这些一律是当日的名字并给出新旧对照。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **137 通过 / 0 失败** |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过** |
+| `python -m unittest desktop.test_desktop` | **87 通过**（需放开沙箱 IPC） |
+| `python tools/kind_inventory.py` | 退出码 0，两个方向都对齐 |
+| 真适配器映射 | `frac(a, b)` 与 `x` 的宽高基线正常（证明改名后的协议串仍然有效） |
+
+改动文件：`Cargo.toml`、`crates/core/Cargo.toml`、`native-adapter/Cargo.toml`、`Cargo.lock`、`native-adapter/Cargo.lock`、`src/{lib,main,document,desktop,services}.rs`、`native-adapter/src/render.rs`、`native-adapter/engine-patches.json`、`vendor/typst/crates/{typst-eval/src/math,typst-layout/src/lib,typst-layout/src/math/mod,typst-library/src/math/ir/resolve,typst-realize/src/lib}.rs`、`desktop/{__init__,__main__,bridge,model,rawcache,window,test_desktop}.py`、`tools/{engine_boxes,kind_inventory}.py`、`tests/*.rs`（13 个）、`build-desktop.cmd`、`start-desktop.cmd`、`AGENTS.md`、`README.md`、`docs/{architecture,desktop,kind-inventory,lyx-desktop-rendering-study,rust-book-walkthrough,validation}.md`。
 
 
 

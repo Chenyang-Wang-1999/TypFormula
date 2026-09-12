@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-use visual_typst_core::{Action, Editor, view::View};
+use typformula_core::{Action, Editor, view::View};
 
 fn branches(view: &View) -> usize {
     usize::from(view.attachment.is_some()) + view.children.iter().map(branches).sum::<usize>()

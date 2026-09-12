@@ -111,7 +111,7 @@ LyX 的高保真公式预览是第二条、可选的显示路径。启用即时�
 - `D:\tool-base\lyx\src\graphics\PreviewLoader.cpp:574`
 - `D:\tool-base\lyx\src\insets\RenderPreview.cpp`
 
-## 5. 与当前 Visual Typst 桌面端的差异
+## 5. 与当前 TypFormula 桌面端的差异
 
 当前实现已经采用 Typst `Source::edit`，并且只对 Typst 报告的重解析区间重建公式投影。这解决了“每次重新解析所有公式”的主要问题。不过，显示层仍有几处比 LyX 粗：
 
@@ -168,7 +168,7 @@ attachment 只在表达式或其可见作用域依赖改变时运行。Raw 仅�
 
 ## 7. 不应照搬的部分
 
-LyX 的原生公式 painter 是对 TeX 数学模型的长期实现，不能简单替代 Typst 的完整排版语义。Visual Typst 应继续采用混合策略：已支持的结构结点用原生 painter 保证编辑速度；引擎排版结果用于**叶子**显示来源（Raw、附件位置），最终 PDF 始终交给 Typst engine。
+LyX 的原生公式 painter 是对 TeX 数学模型的长期实现，不能简单替代 Typst 的完整排版语义。TypFormula 应继续采用混合策略：已支持的结构结点用原生 painter 保证编辑速度；引擎排版结果用于**叶子**显示来源（Raw、附件位置），最终 PDF 始终交给 Typst engine。
 
 需要更正一点：LyX 不会把无法结构化的内容变成位图。`InsetMathUnknown` 保留源码文本并用原生字体直接画出来（未完成时画成红色），`metricsStrRedBlack` 直接给出尺寸，因此它始终可继续编辑。
 

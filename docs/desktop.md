@@ -15,7 +15,7 @@ python -m pip install -r desktop/requirements.txt  # 已安装 PyQt5 时无需�
 
 首次创建窗口时，程序使用鼠标指针所在显示器的可用工作区（排除任务栏），在保留边距的前提下取不超过 1400×900 的尺寸并居中。通过“新窗口”创建的窗口沿用当前窗口所在显示器。计算使用 Qt 的逻辑像素，因此会自动适应 Windows 的 DPI 缩放和具有负坐标的多显示器布局。
 
-构建脚本只构建，不启动窗口。当前提供源码运行入口，尚未打包独立安装器。`VISUAL_TYPST_PYTHON` 可指定 Python 可执行文件；`VISUAL_TYPST_BIN` 可指定核心程序。未设置时优先用 `target/server/release/visual-typst.exe`（`build-desktop.cmd` 构建的就是它），不存在才退回 `target/server/debug/visual-typst.exe`；原生渲染器同理，`target/adapter/release/visual-typst-layout.exe` 优先，其次 `debug`。Tinymist 的查找规则与正式版后端相同。
+构建脚本只构建，不启动窗口。当前提供源码运行入口，尚未打包独立安装器。`TYPFORMULA_PYTHON` 可指定 Python 可执行文件；`TYPFORMULA_BIN` 可指定核心程序。未设置时优先用 `target/server/release/typformula.exe`（`build-desktop.cmd` 构建的就是它），不存在才退回 `target/server/debug/typformula.exe`；原生渲染器同理，`target/adapter/release/typformula-layout.exe` 优先，其次 `debug`。Tinymist 的查找规则与正式版后端相同。
 
 正式版代码与资源不依赖 `prototypes/`。随附数学字体位于 `fonts/`，桌面端只从这里加载字体，不载入任何前端代码。`desktop/mathfont.py` 启动时注册随附字体并读回 Qt 报告的真实家族名（数学字体为 `NewComputerModern Math`；同一文件在 Windows 上还以 `NewComputerModernMath` 出现），公式用哪一款由设置项 `math_font` 决定，未安装的名字不会被交给 `QFont`——Qt 对找不到的家族名会静默换成系统字体，随后逐字回退又会在同一个公式里混入第三、第四种设计。`math_font` 需要是有数学字形覆盖的字体，换成正文文本字体会让 `≤`、`∑` 这类字符再次逐字回退。
 
@@ -45,7 +45,7 @@ python -m pip install -r desktop/requirements.txt  # 已安装 PyQt5 时无需�
 | JSON 设置 | 工具 → 设置/快捷键，可编辑所有菜单和工具栏命令的快捷键、正文字体名称/字号、公式字体（`math_font`）、SVG 微调倍率 |
 | 包浏览 | 工具 → 浏览包；`@local` 枚举标准本机目录，`@preview` 查询官方索引，安装精确版本 |
 
-设置默认位于 `%APPDATA%/VisualTypst/settings.json`。可通过 `VISUAL_TYPST_CONFIG` 改路径。快捷键留空表示禁用；设置对话框拒绝重复键。Ctrl+滚轮是当前窗口的临时显示调整，设置文件控制新窗口默认值。
+设置默认位于 `%APPDATA%/TypFormula/settings.json`。可通过 `TYPFORMULA_CONFIG` 改路径。快捷键留空表示禁用；设置对话框拒绝重复键。Ctrl+滚轮是当前窗口的临时显示调整，设置文件控制新窗口默认值。
 
 补全覆盖正文源码、刚输入的公式源码以及公式内的 `\` 命令模式。源码候选可用 Enter/Tab 接受；公式候选由方向键选择、点击填入、Enter 确认，内置候选即时出现，Tinymist 使用独立命令投影补充候选。字符串模式不弹出命令补全。命令区域采用淡蓝衬底/细边框，字符串区域采用淡米色衬底/细边框。
 
@@ -55,7 +55,7 @@ Raw SVG 按可见公式/活动公式按需加载。**取图的节点有两种**�
 
 相同 Raw 源码在编辑器内共享一份排版结果：首次可见的实例请求 Typst，其他实例直接引用 `("raw", source)` 缓存；脚标导致失效时更新该共享项。**唯一不按这条共享的是 attach 里的片段**：片段是被插回原位置编译的，`stretch(->)^x` 的基底会拉伸到脚标 `x` 的宽度，同一段源码在不同的 `script` 下就是两张图。这类片段的键是 `("raw", 源码, script 形状摘要)`（`rawcache.raw_key`），形状取 `rawcache.signature(script)`（基底、脚标、上下标方向；跳过 stop，所以移动光标不改键），因此改脚标会重取基底，而**公式里别的分支怎么改都不影响它**——分式的分子变宽不会重取分母的图，行宽变化也不会（实测见 [validation.md](validation.md)）。宏定义体里的片段仍然跨调用点共享一张图：上下文只在**定义所在的公式视图**里索引（只索引该公式自己定义的区间），定义视图与调用点视图因此算出同一个键。脚本形状一变就叫新上下文，旧上下文在下一轮 `load_raw` 里清掉，不会积压。重取期间该片段先按"无图"画自己的源码（实测 172 ms ≈ 160 ms 去抖 + 一次编译），和不含调用的片段**自己文本**改变时一致。SVG 仅作为后端交换格式，Qt 首次绘制时按当前逻辑尺寸和设备像素比栅格化为 `QPixmap`，后续重绘不再遍历 SVG 路径。位图采用 64MiB LRU 上限，单边最多 4096 设备像素；字号、DPI 或 SVG 内容变化会生成不同缓存键。
 
-`VISUAL_TYPST_RAW_CACHE=plain` 把这层复用限制到**源码里不含函数调用**的片段上（`rawcache.contains_call` 只看文本里有没有 `标识符(`；`cancel(a)`、`mat(1, 2)`、`#pd(f, x)` 都算，`partial`、`#f`、`x_1` 不算）。这是一枚**实验开关**（默认 `all`，不是设置项），用来量"不再复用含调用片段的图"要付多少代价：含调用的片段每一轮 `load_raw` 都重新请求一次，但上一张图仍留在缓存里继续绘制，所以画面不会退回源码，唯一的差别是多出来的编译；被拒（`False`）的片段不受影响，仍然只在下一次编辑后重试。量完可删。
+`TYPFORMULA_RAW_CACHE=plain` 把这层复用限制到**源码里不含函数调用**的片段上（`rawcache.contains_call` 只看文本里有没有 `标识符(`；`cancel(a)`、`mat(1, 2)`、`#pd(f, x)` 都算，`partial`、`#f`、`x_1` 不算）。这是一枚**实验开关**（默认 `all`，不是设置项），用来量"不再复用含调用片段的图"要付多少代价：含调用的片段每一轮 `load_raw` 都重新请求一次，但上一张图仍留在缓存里继续绘制，所以画面不会退回源码，唯一的差别是多出来的编译；被拒（`False`）的片段不受影响，仍然只在下一次编辑后重试。量完可删。
 
 所有当前可见且尚未缓存的 Raw 合并为一次 Typst 编译，不再按公式逐个编译全文。这次编译只覆盖到"最后一个需要出图的公式"为止：请求带 `context_end`，服务端把源码截到包含该片段的最外层顶层节点末尾再编译，因此公式之后的任何错误（`#panic`、缺失的 import、坏包）不再让整个视口退回源码，而前缀逐字节不变、区间与容器上下文照旧。正式桌面构建使用 release Rust/Typst 后端；首次 release 构建会较久，后续为增量构建。失败后这批片段按"无图"显示，并且只在**源码版本变化后**才重试（同一次编辑之前不重复请求，避免每次滚动都重试一份坏文档）。取图路径、前缀合成文档方案与 SVG/PNG、SVG 精简方案的对照见 [validation.md](validation.md)。
 
@@ -97,7 +97,7 @@ Qt 5 的 SVG Tiny 加载器不支持 Typst 输出中的 glyph `<symbol>`，会�
 
 因为预览页是 HTML，需要 `PyQtWebEngine`（已写进 `desktop/requirements.txt`），并且 **QtWebEngine 必须在 `QApplication` 之前导入、同时设 `AA_ShareOpenGLContexts`**（`desktop/__main__.py` 里的 `preview.prepare()`）；缺这个 wheel 时预览报"不可用"而不是崩掉。注意 QtWebEngine **在 `QT_QPA_PLATFORM=offscreen` 下无法构造**（是访问违例而不是异常），所以测试套件用替身 web view 跑启停逻辑（`Window.preview_widget` 就是为此可替换），真窗口的行为由实测探针验证。
 
-F5 通过 `/api/pdf` 编译当前内存源码，原生 PDF 保留可搜索文字、链接及 Typst 提供的文档结构；临时文件位于系统临时目录的 `VisualTypst` 子目录。文件菜单“导出 PDF”可选择永久保存位置。
+F5 通过 `/api/pdf` 编译当前内存源码，原生 PDF 保留可搜索文字、链接及 Typst 提供的文档结构；临时文件位于系统临时目录的 `TypFormula` 子目录。文件菜单“导出 PDF”可选择永久保存位置。
 
 当前边界：
 

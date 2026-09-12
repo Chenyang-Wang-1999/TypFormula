@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 # behaviour: every fragment is reused by its source text. `plain` is an
 # experiment switch, not a setting -- it exists to measure what dropping the
 # reuse of the fragments that hold a call costs.
-MODE = os.environ.get("VISUAL_TYPST_RAW_CACHE", "all").strip()
+MODE = os.environ.get("TYPFORMULA_RAW_CACHE", "all").strip()
 
 # One identifier followed by an opening parenthesis. The text of a Raw is the
 # source the renderer is asked for, so `cancel(a)`, `mat(1, 2)` and `#pd(f, x)`

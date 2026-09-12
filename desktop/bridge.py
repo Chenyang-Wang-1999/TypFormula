@@ -7,9 +7,9 @@ from PyQt5.QtCore import QObject, QProcess, QTimer
 from .model import ROOT
 
 def backend():
-    default=ROOT/"target/server/release/visual-typst.exe"
-    if not default.is_file():default=ROOT/"target/server/debug/visual-typst.exe"
-    path = Path(os.environ.get("VISUAL_TYPST_BIN", default))
+    default=ROOT/"target/server/release/typformula.exe"
+    if not default.is_file():default=ROOT/"target/server/debug/typformula.exe"
+    path = Path(os.environ.get("TYPFORMULA_BIN", default))
     if not path.is_file():
         raise RuntimeError("请先运行 build-desktop.cmd：缺少 " + str(path))
     return str(path)
@@ -17,9 +17,9 @@ def backend():
 def process(parent, arguments, workspace=None):
     from PyQt5.QtCore import QProcessEnvironment
     environment = QProcessEnvironment.systemEnvironment()
-    adapter=ROOT/"target/adapter/release/visual-typst-layout.exe"
-    if not adapter.is_file():adapter=ROOT/"target/adapter/debug/visual-typst-layout.exe"
-    environment.insert("VISUAL_TYPST_ADAPTER", str(adapter))
+    adapter=ROOT/"target/adapter/release/typformula-layout.exe"
+    if not adapter.is_file():adapter=ROOT/"target/adapter/debug/typformula-layout.exe"
+    environment.insert("TYPFORMULA_ADAPTER", str(adapter))
     child = QProcess(parent)
     child.setProcessEnvironment(environment)
     # A backend that dies says why on stderr. Forwarded to the terminal it never

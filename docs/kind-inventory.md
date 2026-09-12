@@ -5,7 +5,7 @@
 三列信息来源不同，读的时候要分开：
 
 - **存储 / 声明** 是代码事实，来自 `crates/core/src/math.rs` 的 `Kind` 与 `crates/core/src/slots.rs` 的 `Decl`（唯一一张表，穷尽 `match`）。
-- **线上实测** 是从真实 release 后端取回来的，不是读代码推的：`tools/kind_inventory.py` 驱动 `visual-typst.exe --desktop-core`，按行发 `{"action":…}` JSON，`set_source` → `activate_formula` → 需要时再发 `input`，然后取 `state` 回来的 `view`。每个 Kind 至少一个能真正产生它的源文（宏那几项见下面的"不能从源码到达的两项"）。
+- **线上实测** 是从真实 release 后端取回来的，不是读代码推的：`tools/kind_inventory.py` 驱动 `typformula.exe --desktop-core`，按行发 `{"action":…}` JSON，`set_source` → `activate_formula` → 需要时再发 `input`，然后取 `state` 回来的 `view`。每个 Kind 至少一个能真正产生它的源文（宏那几项见下面的"不能从源码到达的两项"）。
 - **引擎** 一栏来自 `vendor/typst/crates/typst-library/src/math/ir/item.rs`，是编译器自己的 item 形状；表里引用的盒子由 `tools/engine_boxes.py` 用真实适配器量出。
 
 `class` 单独说：只有 `Fraction` 与 `Table` 在表里写死为 `7`，`Multiline`/`Sqrt`/其余都是 `0`，而 `Char` 的类是**由字符本身决定**的（`slots::char_class`），表里那一格永远不会被读。
@@ -146,7 +146,7 @@
 两个探针都在 `tools/` 下，不需要 Qt，只驱动刚构建出的可执行文件：
 
 ```powershell
-cargo build --offline --locked --release --bin visual-typst --target-dir target/server
+cargo build --offline --locked --release --bin typformula --target-dir target/server
 cargo build --offline --locked --release --manifest-path native-adapter/Cargo.toml --target-dir target/adapter
 python tools/kind_inventory.py            # 第一、二节的线上实测（可加 --json 存全量）
 python tools/engine_boxes.py              # 第三、六节的引擎盒子（可传自己的公式）
@@ -157,4 +157,4 @@ python tools/engine_boxes.py              # 第三、六节的引擎盒子（可
 - **公式要取 `state` 返回的 `equations` 的最后一个**再 `activate_formula`。用 `source.index("$")` 会命中定义里的 `$…$`，整张表会安静地把定义体当成公式（实测踩过）。
 - 输出要 `reconfigure(encoding="utf-8")`：Windows 控制台的默认代码页印不出 `Symbol` 节点带的 `𝛼`。
 
-`tools/engine_boxes.py` 默认那组公式就是本文档比较用的：一个基准、几种记号、以及"数字串之间的空格算不算数"的那几对。它走真实适配器：`target/adapter/release/visual-typst-layout.exe --server`，请求体是 `{"path","source","raw":[{id,start,end}]}`，返回的 `items` 里有 `width`/`height`/`baseline`（pt）。
+`tools/engine_boxes.py` 默认那组公式就是本文档比较用的：一个基准、几种记号、以及"数字串之间的空格算不算数"的那几对。它走真实适配器：`target/adapter/release/typformula-layout.exe --server`，请求体是 `{"path","source","raw":[{id,start,end}]}`，返回的 `items` 里有 `width`/`height`/`baseline`（pt）。

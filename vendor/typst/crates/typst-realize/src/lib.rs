@@ -310,7 +310,7 @@ fn visit_kind_rules<'a>(
         // ```
         if let Some(elem) = content.to_packed::<EquationElem>() {
             // Editor markers carry identity only; resolve their body in math IR.
-            if content.label().is_some_and(|l| l.resolve().starts_with("visual-typst-raw-")) {
+            if content.label().is_some_and(|l| l.resolve().starts_with("typformula-raw-")) {
                 s.sink.push((content, styles));
                 return Ok(true);
             }

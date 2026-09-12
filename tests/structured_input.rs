@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-use visual_typst_core::{Action,Editor,math::*,typst};
+use typformula_core::{Action,Editor,math::*,typst};
 fn key(e:&mut Editor,k:&str){e.apply(Action::Key{key:k.into(),shift:false,ctrl:false}).unwrap();}
 fn input(e:&mut Editor,s:&str){e.apply(Action::Input{text:s.into()}).unwrap();}
 fn command(s:&str)->Editor{let mut e=Editor::default();input(&mut e,&format!("\\{s}"));key(&mut e,"Enter");assert!(e.pending().is_none(),"{s}: {}",e.message);e}

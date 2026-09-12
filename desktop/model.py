@@ -63,7 +63,7 @@ def difference(before, after):
 
 def config_path():
     base = Path(os.environ.get("APPDATA", Path.home() / ".config"))
-    return Path(os.environ.get("VISUAL_TYPST_CONFIG", base / "VisualTypst" / "settings.json"))
+    return Path(os.environ.get("TYPFORMULA_CONFIG", base / "TypFormula" / "settings.json"))
 
 def validate_settings(value):
     if not isinstance(value, dict):

@@ -21,7 +21,7 @@
 //! 其中 `Style` 与 `Sqrt`/`Root`/`Accent`/`Line` 一样，**只作为形状存在**：树里
 //! 存的是借了它形状的 `MacroCall`（`bold(x)`），回写就是这个调用自己的拼写。
 
-use visual_typst_core::{Action, Editor, math::{Kind, MathAtom}, typst};
+use typformula_core::{Action, Editor, math::{Kind, MathAtom}, typst};
 
 fn load(source: &str) -> Editor {
     let mut editor = Editor::default();

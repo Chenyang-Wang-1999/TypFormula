@@ -6,7 +6,7 @@
 //! 在外画自己的一张图、进去画名字与参数槽），所以 `undefinedname` 现在**是可编辑
 //! 的结构节点**，不再是"没有图像的片段"。标识符永远不会变成调用，因此它是"编辑器不
 //! 建模的片段"里最稳的那个范例——`docs/desktop.md` 举的 `sum`/`dif` 也是这一类。
-use visual_typst_core::{Action,Editor,typst};
+use typformula_core::{Action,Editor,typst};
 fn key(e:&mut Editor,k:&str){e.apply(Action::Key{key:k.into(),shift:false,ctrl:false}).unwrap();}
 fn load()->Editor{let mut e=Editor::default();e.apply(Action::Import{source:"undefinedname".into()}).unwrap();e}
 fn status(e:&mut Editor,failed:bool){e.apply(Action::PreviewResult{source:"undefinedname".into(),definitions:e.definitions.clone(),display:e.display,failed}).unwrap();}

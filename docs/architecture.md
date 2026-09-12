@@ -59,10 +59,10 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 
 | 层 | crate | 内容 | 依赖 |
 | --- | --- | --- | --- |
-| 内核 | `visual-typst-core`（`crates/core/`） | `math`（可编辑树）、`slots`（每个 `Kind` 的唯一一张声明表）、`typst`（解析与回写）、`cursor`（`Editor` 与全部编辑动作）、`view`（交给前端的形状） | 只有 `typst-syntax` + serde |
-| 外围 | `visual-typst`（仓库根） | `document`（源码即权威）、`desktop`/`rpc`（两条私有管道）、`services`/`packages`/`workspace`（进程、网络、路径）、`visual-typst` 二进制 | 内核 + std/网络/压缩 |
+| 内核 | `typformula-core`（`crates/core/`） | `math`（可编辑树）、`slots`（每个 `Kind` 的唯一一张声明表）、`typst`（解析与回写）、`cursor`（`Editor` 与全部编辑动作）、`view`（交给前端的形状） | 只有 `typst-syntax` + serde |
+| 外围 | `typformula`（仓库根） | `document`（源码即权威）、`desktop`/`rpc`（两条私有管道）、`services`/`packages`/`workspace`（进程、网络、路径）、`typformula` 二进制 | 内核 + std/网络/压缩 |
 
-方向是单向的：外围可以依赖内核，内核**不能**依赖外围。这条不是纸面规则：在 `crates/core/src/lib.rs` 里写 `use visual_typst::…` 会编译失败（`unresolved import`，实测）。所以"只改外围、不动内核"是编译器保证的——加一个新前端、新传输或新文件功能时，内核的五个模块不需要打开。
+方向是单向的：外围可以依赖内核，内核**不能**依赖外围。这条不是纸面规则：在 `crates/core/src/lib.rs` 里写 `use typformula::…` 会编译失败（`unresolved import`，实测）。所以"只改外围、不动内核"是编译器保证的——加一个新前端、新传输或新文件功能时，内核的五个模块不需要打开。
 
 内核里**不许出现**的东西（出现就说明该往上挪）：`std::process`、`std::fs`、网络、任何"传输/协议"形状的类型。给它定量身标准会更清楚：内核只回答两件事——**这棵树是什么**，以及**它该怎么写成 Typst**。
 
@@ -73,7 +73,7 @@ Rust / Typst 字节区间使用 UTF-8；Qt 字符位置与 LSP character 使用 
 
 ## 后端
 
-后端没有网络端口：`visual-typst --stdio <目录>` 由窗口启动，请求按 id 匹配回包，`src/rpc.rs` 每请求分发一个线程，`Services` 通过互斥量共享，因此整页编译不会把公式取图和语言请求排在它后面。项目目录由启动参数指定，窗口把当前文档所在目录作为编译根；`src/workspace.rs` 用规范化路径限制项目边界，任何越界或含父级步骤的路径都被拒绝。
+后端没有网络端口：`typformula --stdio <目录>` 由窗口启动，请求按 id 匹配回包，`src/rpc.rs` 每请求分发一个线程，`Services` 通过互斥量共享，因此整页编译不会把公式取图和语言请求排在它后面。项目目录由启动参数指定，窗口把当前文档所在目录作为编译根；`src/workspace.rs` 用规范化路径限制项目边界，任何越界或含父级步骤的路径都被拒绝。
 
 `/api/lsp` 提供 completion / hover / definition / formatting / diagnostics / semanticTokens。一个文档使用一个常驻 Tinymist 进程，版本递增并全文同步；换文件或协议失败时重建。诊断来自 publishDiagnostics，窗口防抖、版本检查和过期结果丢弃。公式补全仍使用隔离的临时源码投影，以保留原型已验证的命令行为。
 
@@ -118,7 +118,7 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 那"它是什么"在哪回答？在 **`typst-eval`**：把 callee 求值成作用域里的 `Func`，实参求值成 `Content`，得到 `Content::Elem(FracElem{…})`。**`MathKind` 还要更晚**：它是布局期的中间表示，`resolve_equation` 的调用点全在 `typst-layout`（`math/mod.rs:68`、`:123`）和 `typst-html`（`rules.rs:824`），`typst-library/src/math/ir/mod.rs:23` 只提供函数本身。到那里才由 `resolve.rs:197` 起的一长串 `to_packed::<FracElem>()` / `to_packed::<CancelElem>()`（`:222`）按**元素类型**分派。
 
-**所以内核拿不到它。** `visual-typst-core` 只依赖 `typst-syntax`，`typst-eval`/`typst-library`/`typst-layout` 只有 `native-adapter` 那一侧才链接。名字→结构这件事必须由内核自己回答，`config/commands.json` 就是那个答案：
+**所以内核拿不到它。** `typformula-core` 只依赖 `typst-syntax`，`typst-eval`/`typst-library`/`typst-layout` 只有 `native-adapter` 那一侧才链接。名字→结构这件事必须由内核自己回答，`config/commands.json` 就是那个答案：
 
 ```
 "frac(1, 2)"

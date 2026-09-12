@@ -657,22 +657,22 @@ src/math/mod.rs + src/math/symbols.rs  →  子模块
 pub use cursor::{Action, Editor};     // lib.rs:14
 ```
 
-把子模块的项**在本层重新公开**，这样外部用 `visual_typst_core::Action` 而不必写 `visual_typst_core::cursor::Action`。这是**设计对外 API 的关键手段**：内部结构随便摆，对外只暴露想给的那几个名字。
+把子模块的项**在本层重新公开**，这样外部用 `typformula_core::Action` 而不必写 `typformula_core::cursor::Action`。这是**设计对外 API 的关键手段**：内部结构随便摆，对外只暴露想给的那几个名字。
 
 #### 本项目
 
 项目里有**两个** crate，正好用来分辨"模块"和"crate"：
 
-- 内核 `crates/core/src/lib.rs` 挂五个模块（`math`/`slots`/`typst`/`cursor`/`view`），并在末尾写 `pub use cursor::{Action, Editor};` 重导出——外部于是能写 `visual_typst_core::Action`。
+- 内核 `crates/core/src/lib.rs` 挂五个模块（`math`/`slots`/`typst`/`cursor`/`view`），并在末尾写 `pub use cursor::{Action, Editor};` 重导出——外部于是能写 `typformula_core::Action`。
 - 外围 `src/lib.rs` 挂另外六个（`document`/`services`/`workspace`/`packages`/`rpc`/`desktop`），同一个 package 的 `src/main.rs` 是它的二进制。
 
 分界就在这里：`crate::` 只在**同一个 crate 内**有效。外围的 `src/document.rs` 开头是
 
 ```rust
-use visual_typst_core::{Action, Editor, math::*, typst};
+use typformula_core::{Action, Editor, math::*, typst};
 ```
 
-——引用另一个 crate 必须用它自己的名字，不能写 `crate::`；反过来内核里写 `use visual_typst::…` 会直接编译失败。`math::*` 这种通配把 `math.rs` 里所有 `pub` 项引进来，你项目里用得很重。这条边界不是写在文档里的约定，是编译器守着的：见 `docs/architecture.md` 的"分层：内核与外围"。
+——引用另一个 crate 必须用它自己的名字，不能写 `crate::`；反过来内核里写 `use typformula::…` 会直接编译失败。`math::*` 这种通配把 `math.rs` 里所有 `pub` 项引进来，你项目里用得很重。这条边界不是写在文档里的约定，是编译器守着的：见 `docs/architecture.md` 的"分层：内核与外围"。
 
 ### 第 8 章 · 常见集合 【对照】
 

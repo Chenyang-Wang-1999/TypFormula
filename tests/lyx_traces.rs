@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Golden traces derived from the named LyX functions in PORTING.md.
-use visual_typst_core::{Action, Editor, cursor::StopGeometry, math::*, typst};
+use typformula_core::{Action, Editor, cursor::StopGeometry, math::*, typst};
 
 fn input(e: &mut Editor, text: &str) { e.apply(Action::Input { text: text.into() }).unwrap(); }
 fn key(e: &mut Editor, key: &str) { e.apply(Action::Key { key: key.into(), shift: false, ctrl: false }).unwrap(); }

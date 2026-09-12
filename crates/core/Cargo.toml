@@ -1,10 +1,10 @@
 [package]
-name = "visual-typst-core"
+name = "typformula-core"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-or-later"
 publish = false
-description = "The visual-typst editing kernel: model, declarations, parser and writer"
+description = "The TypFormula editing kernel: model, declarations, parser and writer"
 
 # The kernel is the half a frontend is written against, so it must not be able to
 # reach a transport, a process or the network. Only `typst-syntax` is needed from

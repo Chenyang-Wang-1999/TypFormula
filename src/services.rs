@@ -77,10 +77,10 @@ impl Services {
                     // The argument list is passed as **one** array element, the way
                     // Tinymist's own client does it. `--data-plane-host 127.0.0.1:0` asks
                     // the OS to pick a free port, so two windows never collide.
-                    let arguments = json!([["--task-id", "visual-typst", "--data-plane-host", "127.0.0.1:0", file.to_string_lossy()]]);
+                    let arguments = json!([["--task-id", "typformula", "--data-plane-host", "127.0.0.1:0", file.to_string_lossy()]]);
                     session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doStartPreview","arguments":arguments}))
                 }
-                "kill" => { session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doKillPreview","arguments":["visual-typst"]})) }
+                "kill" => { session.lsp.request("workspace/executeCommand", json!({"command":"tinymist.doKillPreview","arguments":["typformula"]})) }
                 other => Err(format!("不支持的预览动作 {other}")),
             }
         })();
@@ -183,7 +183,7 @@ impl Lsp {
 #[derive(Deserialize)]
 pub struct CompletionRequest { pub source: String, pub start: usize, pub end: usize, pub caret: usize }
 #[derive(Serialize)]
-pub struct CompletionReply { pub engine: &'static str, pub items: Vec<visual_typst_core::cursor::CommandCompletion> }
+pub struct CompletionReply { pub engine: &'static str, pub items: Vec<typformula_core::cursor::CommandCompletion> }
 #[derive(Deserialize, Serialize)]
 pub struct RenderRequest { #[serde(default)] pub preview: bool, #[serde(default)] pub pdf:bool, #[serde(default)] pub overlays: std::collections::HashMap<String,String>, #[serde(default="default_path")] pub path: String, pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange>, #[serde(default)] pub preview_hashes:Vec<String>,
     /// Render the requested fragments on a source cut after this byte offset.
@@ -258,12 +258,12 @@ pub struct GlyphRequest { #[serde(default="default_path")] pub path: String, pub
 
 pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, document_lsp: Mutex<Option<DocumentLsp>>, pub workspace: PathBuf, render_adapter: Mutex<Option<RenderAdapter>> }
 impl Services {
-    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("VISUAL_TYPST_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None) } }
+    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("TYPFORMULA_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None) } }
     fn adapter_bin(&self) -> PathBuf {
-        if let Some(path)=std::env::var_os("VISUAL_TYPST_ADAPTER") { return path.into(); }
-        let name=if cfg!(windows) { "visual-typst-layout.exe" } else { "visual-typst-layout" };
+        if let Some(path)=std::env::var_os("TYPFORMULA_ADAPTER") { return path.into(); }
+        let name=if cfg!(windows) { "typformula-layout.exe" } else { "typformula-layout" };
         let packaged=self.root.join(name); if packaged.is_file() { return packaged; }
-        self.root.join("target/adapter").join(if cfg!(debug_assertions) { "debug" } else { "release" }).join(if cfg!(windows) { "visual-typst-layout.exe" } else { "visual-typst-layout" }) }
+        self.root.join("target/adapter").join(if cfg!(debug_assertions) { "debug" } else { "release" }).join(if cfg!(windows) { "typformula-layout.exe" } else { "typformula-layout" }) }
     pub fn status(&self) -> Value { match &self.bin { Ok(path) => json!({"available":true,"attachments":self.adapter_bin().is_file(),"engine":"Tinymist LSP + Typst","path":path}), Err(error) => json!({"available":false,"attachments":self.adapter_bin().is_file(),"error":error}) } }
     pub fn attachments(&self, req: AttachmentRequest) -> Result<Value, String> {
         self.ask_adapter(serde_json::to_value(&req).map_err(|e| e.to_string())?, "Typst 附件布局超时；保留原编辑结构")
@@ -357,7 +357,7 @@ impl Services {
                 let Some((text, cursor)) = (if item["insertTextFormat"].as_u64() == Some(2) { snippet_text(text) } else { Some((text.to_string(), text.len())) }) else { continue; };
                 let mut replacement = req.source[req.start..req.end].to_string();
                 replacement.replace_range(start-req.start..end-req.start, &text);
-                items.push(visual_typst_core::cursor::CommandCompletion { label: label.into(), replacement, caret: start-req.start+cursor });
+                items.push(typformula_core::cursor::CommandCompletion { label: label.into(), replacement, caret: start-req.start+cursor });
             }
         }
         let prefix = req.source[req.start..req.caret].rsplit(|c:char| !c.is_alphanumeric() && c != '_' && c != '-').next().unwrap_or("");

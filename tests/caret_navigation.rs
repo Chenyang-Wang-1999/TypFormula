@@ -16,7 +16,7 @@
 //! * `Grid`     — `entry: GridMiddle`, `horizontal`/`vertical: Column`
 //! * `Aligned`  — `entry: Edge`
 
-use visual_typst_core::{Action, Editor};
+use typformula_core::{Action, Editor};
 
 fn load(source: &str) -> Editor {
     let mut editor = Editor::default();

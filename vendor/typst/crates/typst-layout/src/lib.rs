@@ -23,5 +23,5 @@ pub use self::introspect::PagedIntrospector;
 pub use self::pages::{layout_document, layout_document_for_bundle};
 pub use self::rules::register;
 
-// visual-typst editor bridge
+// TypFormula editor bridge
 

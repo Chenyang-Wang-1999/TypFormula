@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-use visual_typst_core::{Action, Editor, math::{Cursor, Kind}, typst};
+use typformula_core::{Action, Editor, math::{Cursor, Kind}, typst};
 
 fn input(e: &mut Editor, text: &str) { e.apply(Action::Input { text: text.into() }).unwrap(); }
 fn key(e: &mut Editor, key: &str) { modified_key(e, key, false, false); }
@@ -127,7 +127,7 @@ fn selection_and_caret_are_rendered_inside_draft() {
 
 #[test]
 fn lsp_replaces_only_the_token_and_keeps_command_mode() {
-    use visual_typst_core::cursor::CommandCompletion;
+    use typformula_core::cursor::CommandCompletion;
     let mut e=Editor::default();input(&mut e,"\\cases(alph");
     let context=e.command_context().unwrap();
     assert_eq!(&context.source[context.start..context.end], "cases(alph");
@@ -144,7 +144,7 @@ fn lsp_replaces_only_the_token_and_keeps_command_mode() {
 
 #[test]
 fn late_lsp_response_cannot_overwrite_a_new_draft() {
-    use visual_typst_core::cursor::CommandCompletion;
+    use typformula_core::cursor::CommandCompletion;
     let mut e=Editor::default();input(&mut e,"\\alph");let context=e.command_context().unwrap();
     input(&mut e,"a + beta");
     e.apply(Action::LspCompletions {draft:context.draft,caret:context.draft_caret,items:vec![CommandCompletion {label:"WRONG".into(),replacement:"wrong".into(),caret:5}]}).unwrap();

@@ -16,8 +16,8 @@
 //! （`docs/kind-inventory.md` 第五节），这里读的是可编辑树，所以看不到它们。
 
 use std::collections::BTreeSet;
-use visual_typst_core::math::Kind;
-use visual_typst_core::{Action, Editor};
+use typformula_core::math::Kind;
+use typformula_core::{Action, Editor};
 
 fn variant(kind: &Kind) -> &'static str {
     // 穷尽 match：新增一个 `Kind` 时编译器会要求在这里给它一个名字，
@@ -49,7 +49,7 @@ fn variant(kind: &Kind) -> &'static str {
     }
 }
 
-fn collect(data: &[visual_typst_core::math::MathAtom], out: &mut BTreeSet<&'static str>) {
+fn collect(data: &[typformula_core::math::MathAtom], out: &mut BTreeSet<&'static str>) {
     for atom in data {
         out.insert(variant(&atom.kind));
         for cell in &atom.cells { collect(cell, out); }
@@ -119,7 +119,7 @@ fn four_kinds_are_shape_descriptors_that_are_never_stored() {
     for (name, shape) in [
         ("sqrt", "Sqrt"), ("root", "Root"), ("hat", "Accent"), ("overline", "Line"),
     ] {
-        let descriptor = visual_typst_core::slots::configured_kind(name)
+        let descriptor = typformula_core::slots::configured_kind(name)
             .unwrap_or_else(|| panic!("{name} 应当有形状"));
         assert_eq!(variant(&descriptor), shape, "{name} 的形状");
         let editor = {

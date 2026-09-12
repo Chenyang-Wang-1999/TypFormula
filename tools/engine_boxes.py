@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ADAPTER = ROOT / "target/adapter/release/visual-typst-layout.exe"
+ADAPTER = ROOT / "target/adapter/release/typformula-layout.exe"
 
 # Every entry is a math body, spliced into `$…$` so the adapter maps that range.
 # The list covers what the inventory compares: a base, the marks that decorate it,

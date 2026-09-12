@@ -729,6 +729,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
+name = "typformula"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "tar",
+ "typformula-core",
+ "typst-syntax",
+ "ureq",
+ "url",
+]
+
+[[package]]
+name = "typformula-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "typst-syntax",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "typst-syntax"
 version = "0.15.1"
 dependencies = [
@@ -858,30 +882,6 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
-
-[[package]]
-name = "visual-typst"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "serde",
- "serde_json",
- "tar",
- "typst-syntax",
- "ureq",
- "url",
- "visual-typst-core",
-]
-
-[[package]]
-name = "visual-typst-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "typst-syntax",
- "unicode-segmentation",
-]
 
 [[package]]
 name = "wasi"

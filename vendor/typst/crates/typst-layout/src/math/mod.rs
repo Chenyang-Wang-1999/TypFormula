@@ -662,7 +662,7 @@ fn warn_non_math_font(font: &Font, engine: &mut Engine, span: Span) {
     }
 }
 
-// visual-typst editor bridge
+// TypFormula editor bridge
 // Added to the pinned Typst layout crate by prepare.ps1.
 // Labels identify the final rendered fragment; they never replace math IR.
 fn editor_label_fragments(

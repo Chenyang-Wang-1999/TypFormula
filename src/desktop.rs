@@ -1,6 +1,6 @@
 //! Native desktop protocol. One document and one reusable formula session.
 use crate::document::Document;
-use visual_typst_core::typst;
+use typformula_core::typst;
 use serde_json::{Value, json};
 use typst_syntax::{SyntaxKind, SyntaxNode};
 use std::io::{self, BufRead, Write};

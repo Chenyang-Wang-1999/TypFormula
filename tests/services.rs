@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-use visual_typst_core::{Action, Editor};
-use visual_typst::services::{Services, CompletionRequest, RenderRequest, RawRange};
+use typformula_core::{Action, Editor};
+use typformula::services::{Services, CompletionRequest, RenderRequest, RawRange};
 
 fn render(service: &Services, expression: &str, definitions: &str) -> Result<serde_json::Value,String> {
     let prefix=format!("{definitions}\n$ ");
@@ -18,8 +18,8 @@ fn differential_symbol_keeps_its_name_and_renders() {
     let reply=service.complete(CompletionRequest {source:context.source,start:context.start,end:context.end,caret:context.caret}).unwrap();
     editor.apply(Action::LspCompletions {draft:context.draft,caret:context.draft_caret,items:reply.items}).unwrap();
     editor.apply(Action::Key {key:"Enter".into(),shift:false,ctrl:false}).unwrap();
-    let expression=visual_typst_core::typst::write_cell(&editor.root);
-    assert!(matches!(&editor.root[0].kind,visual_typst_core::math::Kind::Raw {source} if source=="dif"));
+    let expression=typformula_core::typst::write_cell(&editor.root);
+    assert!(matches!(&editor.root[0].kind,typformula_core::math::Kind::Raw {source} if source=="dif"));
     let output=render(&service, &expression, "").unwrap();
     let svg=output["svg"].as_str().unwrap();
     assert!(svg.contains("<svg") && svg.contains("<path"));assert_eq!(expression,"dif");

@@ -184,13 +184,13 @@ impl ExprExt for ast::Expr<'_> {
         if !vm.world().editor_math_origin(self.span()) {
             return Ok(content);
         }
-        // visual-typst source provenance: zero-size existing math tags, not a
+        // TypFormula source provenance: zero-size existing math tags, not a
         // box (which would change atom classes, spacing, or stretch behaviour).
         // These markers are not queryable and never become visible SVG nodes.
         use typst_library::introspection::{Location, MetadataElem, Tag, TagElem, TagFlags};
-        let key = typst_utils::hash128(&("visual-typst-origin-v1", self.span()));
+        let key = typst_utils::hash128(&("typformula-origin-v1", self.span()));
         let location = Location::new(key);
-        let mut marker = MetadataElem::new(Value::Str("visual-typst-origin-v1".into()))
+        let mut marker = MetadataElem::new(Value::Str("typformula-origin-v1".into()))
             .pack().spanned(self.span());
         marker.set_location(location);
         let flags = TagFlags { introspectable: false, tagged: false };

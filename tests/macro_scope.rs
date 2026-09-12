@@ -1,5 +1,5 @@
-use visual_typst_core::typst;
-use visual_typst::{document::Document, services::{RawRange, RenderRequest, Services}};
+use typformula_core::typst;
+use typformula::{document::Document, services::{RawRange, RenderRequest, Services}};
 use serde_json::json;
 
 #[test]

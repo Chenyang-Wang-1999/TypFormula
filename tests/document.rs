@@ -1,4 +1,4 @@
-use visual_typst::document::Document;
+use typformula::document::Document;
 use serde_json::json;
 fn load(source:&str)->Document {let mut doc=Document::default();doc.apply(json!({"action":"set_source","source":source})).unwrap();doc}
 #[test]
@@ -144,7 +144,7 @@ fn a_definition_confirmed_inside_a_formula_reclassifies_the_whole_cell() {
     let response=doc.response();
     // The cell is re-derived against the new definition instead of keeping a
     // two-argument call bound to a one-argument macro.
-    assert!(matches!(doc.editor.root[0].kind,visual_typst_core::math::Kind::Raw{..}),"{:?}",doc.editor.root[0].kind);
+    assert!(matches!(doc.editor.root[0].kind,typformula_core::math::Kind::Raw{..}),"{:?}",doc.editor.root[0].kind);
     assert_eq!(response["view"]["children"][1]["kind"],json!("raw"));
     assert_eq!(doc.source(),"#let twice(a, b) = $ #a + #b $\n$ twice(1, 2) $","the document itself is untouched");
 }

@@ -1,12 +1,12 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-cargo build --offline --locked --release --bin visual-typst --target-dir target/server
+cargo build --offline --locked --release --bin typformula --target-dir target/server
 if errorlevel 1 exit /b 1
 cargo build --offline --locked --release --manifest-path native-adapter/Cargo.toml --target-dir target/adapter
 if errorlevel 1 exit /b 1
-if defined VISUAL_TYPST_PYTHON (
-  "%VISUAL_TYPST_PYTHON%" -c "from PyQt5 import QtWidgets, QtSvg; import desktop.window"
+if defined TYPFORMULA_PYTHON (
+  "%TYPFORMULA_PYTHON%" -c "from PyQt5 import QtWidgets, QtSvg; import desktop.window"
 ) else (
   python -c "from PyQt5 import QtWidgets, QtSvg; import desktop.window"
 )

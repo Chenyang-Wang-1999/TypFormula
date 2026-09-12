@@ -1,4 +1,4 @@
-# Visual Typst
+# TypFormula
 
 原生 Qt 桌面编辑器：完整 `.typ` 源码是唯一文档模型，正文按普通文本编辑，进入 `$…$` 时用 LyX 式的结构公式编辑器，排版与 PDF 由随附的 Typst 引擎生成。
 
@@ -15,7 +15,7 @@ python -m pip install -r desktop/requirements.txt   # 已安装 PyQt5 时无需�
 .\start-desktop.cmd "D:\documents\article.typ"
 ```
 
-`build-desktop.cmd` 只构建，不启动窗口，尚未打包独立安装器。`VISUAL_TYPST_PYTHON` 可指定 Python 可执行文件，`VISUAL_TYPST_BIN` 可指定核心程序。
+`build-desktop.cmd` 只构建，不启动窗口，尚未打包独立安装器。`TYPFORMULA_PYTHON` 可指定 Python 可执行文件，`TYPFORMULA_BIN` 可指定核心程序。
 
 Tinymist 从 PATH、VS Code/Cursor 扩展目录或 `TINYMIST_BIN` 查找。没有 Tinymist 时仍能编辑、保存、结构编辑公式并出图，公式命令有内置补全；普通代码的补全、诊断、悬停、定义跳转和格式化需要它。
 

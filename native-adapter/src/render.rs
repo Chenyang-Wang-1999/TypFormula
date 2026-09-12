@@ -58,7 +58,7 @@ fn batch(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize]) -> Resu
     let mut labels = HashMap::new(); let mut edits = vec![]; let mut formula_labels = HashMap::new();
     for (i,r) in req.formulas.iter().enumerate() {
         if r.start >= r.end || req.source.get(r.start..r.end).is_none_or(|s| !s.starts_with('$') || !s.ends_with('$')) { return Err("公式源码区间无效".into()); }
-        let label = format!("visual-typst-formula-{i}"); formula_labels.insert(label.clone(), r.id.clone());
+        let label = format!("typformula-formula-{i}"); formula_labels.insert(label.clone(), r.id.clone());
         edits.push((r.end,r.end,format!("#label(\"{label}\")")));
     }
     // The trailing space is what keeps the spliced block from merging with the
@@ -69,7 +69,7 @@ fn batch(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize]) -> Resu
     // bracket, so the fragment's own equation, and its image, is untouched.
     for i in order.iter().rev() {
         let r = &req.raw[*i];
-        let label = format!("visual-typst-raw-{i}"); labels.insert(label.clone(),r);
+        let label = format!("typformula-raw-{i}"); labels.insert(label.clone(),r);
         edits.push((r.start,r.end,format!("#[${}$<{label}>] ",&req.source[r.start..r.end])));
     }
     edits.sort_by_key(|(start,end,_)|(*start,*end));

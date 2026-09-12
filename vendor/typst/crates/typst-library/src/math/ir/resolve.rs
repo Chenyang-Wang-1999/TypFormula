@@ -156,7 +156,7 @@ fn resolve_realized<'a, 'v, 'e>(
         let mut item = ctx.resolve_into_item(&equation.body, styles)?;
         if let MathItem::Component(comp) = &mut item {
             comp.props.editor_label = elem.label().map(|label| {
-                if !label.resolve().starts_with("visual-typst-raw-") { return label; }
+                if !label.resolve().starts_with("typformula-raw-") { return label; }
                 // Record the environment at the Raw boundary, before its body
                 // can introduce local styles. Resolve the base without the
                 // math Script/ScriptScript factor; keep that factor in the SVG.
@@ -523,7 +523,7 @@ fn resolve_inner_attach<'a, 'v, 'e>(
     // Extract from a nested EquationElem.
     let mut base_elem = &elem.base;
     while let Some(equation) = base_elem.to_packed::<EquationElem>() {
-        if base_elem.label().is_some_and(|l| l.resolve().starts_with("visual-typst-raw-")) { break; }
+        if base_elem.label().is_some_and(|l| l.resolve().starts_with("typformula-raw-")) { break; }
         base_elem = &equation.body;
     }
 

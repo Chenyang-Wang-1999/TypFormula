@@ -3,7 +3,7 @@
 Evidence for `docs/kind-inventory.md`: it drives the release backend over the
 desktop protocol and prints, per `Kind`, the node the frontend would receive.
 
-    cargo build --offline --locked --release --bin visual-typst --target-dir target/server
+    cargo build --offline --locked --release --bin typformula --target-dir target/server
     python tools/kind_inventory.py            # the tables, as text
     python tools/kind_inventory.py --json out.json
 
@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BACKEND = ROOT / "target/server/release/visual-typst.exe"
+BACKEND = ROOT / "target/server/release/typformula.exe"
 
 # A macro chain whose projection doubles per layer, far past `PROJECTION_LIMIT`
 # (4096): layer15 expands to 2**15 items, so the kernel keeps the call as the
@@ -223,7 +223,7 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if not BACKEND.is_file():
         raise SystemExit(f"缺少后端：{BACKEND}\n先运行 cargo build --offline --locked --release "
-                         f"--bin visual-typst --target-dir target/server")
+                         f"--bin typformula --target-dir target/server")
     dump = {}
     emitted = set()
     for label, source, actions in CASES:

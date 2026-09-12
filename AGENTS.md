@@ -1,4 +1,4 @@
-# Visual Typst --- Typst 可视化编辑器
+# TypFormula --- Typst 可视化编辑器
 
 ## 开发原则
 - 遇到意外情况马上上报，不要自行处理
@@ -6,8 +6,8 @@
 ## 项目结构
 
 ```
-visual-typst/
-├── src/                        外围（host crate `visual-typst`）：与外界打交道的一切
+typformula/
+├── src/                        外围（host crate `typformula`）：与外界打交道的一切
 │   ├── lib.rs                  模块清单；说明"内核可以没有外围，外围不能没有内核"
 │   ├── main.rs                 两个进程入口：`--desktop-core`（文档+公式会话）、`--stdio <目录>`（服务管道）
 │   ├── document.rs             文档所有权：源码是唯一权威 + 一个活动公式会话；`Document::annotate` 给每个 Raw 算源码区间（`Locator`）
@@ -16,7 +16,7 @@ visual-typst/
 │   ├── services.rs             Tinymist 会话（语言方法**与实时预览**共用）、公式/附件/字形适配器子进程、整页预览与 PDF；`ask_adapter` 是三条适配器请求的公共入口
 │   ├── packages.rs             @preview 包索引检索、下载、解压到 Typst 缓存
 │   └── workspace.rs            工作区内路径解析（拒绝越界）
-├── crates/core/                编辑内核（crate `visual-typst-core`）：只依赖 `typst-syntax` 与 serde
+├── crates/core/                编辑内核（crate `typformula-core`）：只依赖 `typst-syntax` 与 serde
 │   ├── Cargo.toml
 │   ├── build.rs                编译期把 config/*.json 生成成 `COMMANDS`/`SYMBOLS` 表（格式错误直接编译失败）
 │   └── src/
@@ -40,7 +40,7 @@ visual-typst/
 │   ├── svg.py                  Qt 5 SVG 兼容（Typst 的 glyph `<symbol>` 会报 link is undefined）
 │   ├── test_desktop.py         离屏集成测试（需要先 build-desktop.cmd）
 │   └── requirements.txt        PyQt5 等运行依赖
-├── native-adapter/             独立 crate（`visual-typst-layout`）：唯一链接 Typst 编译器的地方
+├── native-adapter/             独立 crate（`typformula-layout`）：唯一链接 Typst 编译器的地方
 │   ├── Cargo.toml              自己的 workspace（与根 workspace 隔离）
 │   ├── Cargo.lock
 │   ├── engine-patches.json     vendor/typst 上打了哪些补丁（供重新 vendoring 时对照）
@@ -100,7 +100,7 @@ visual-typst/
 
 ```powershell
 cargo test --offline --locked                                    # 内核 + host 测试
-cargo build --offline --locked --release --bin visual-typst --target-dir target/server
+cargo build --offline --locked --release --bin typformula --target-dir target/server
 cargo test --offline --locked --release --manifest-path native-adapter/Cargo.toml --target-dir target/adapter
 $env:QT_QPA_PLATFORM='offscreen'; python -m unittest desktop.test_desktop
 python tools/kind_inventory.py                                   # 前后端排布名双向对照

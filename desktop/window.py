@@ -73,7 +73,7 @@ class Window(QMainWindow):
         screen=screen or QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen:self.setGeometry(initial_window_geometry(screen.availableGeometry()))
         else:self.resize(1200,760)
-        self.setWindowTitle("Visual Typst")
+        self.setWindowTitle("TypFormula")
         self.splitter=QSplitter();self.setCentralWidget(self.splitter)
         self.editor=Editor(self);self.editors=[self.editor];self.splitter.addWidget(self.editor)
         self.source_view=SourceEditor();self.source_view.setLineWrapMode(QTextEdit.NoWrap)
@@ -203,7 +203,7 @@ class Window(QMainWindow):
         for style in self.analysis.get("styles",[]):
             if style["kind"]=="heading":
                 item=QTreeWidgetItem([style["text"].strip()]);item.setData(0,Qt.UserRole,style["start"]);self.outline.addTopLevelItem(item)
-        self.setWindowTitle(("* " if self.source!=self.saved else "")+(self.path.name if self.path else "未命名.typ")+" — Visual Typst")
+        self.setWindowTitle(("* " if self.source!=self.saved else "")+(self.path.name if self.path else "未命名.typ")+" — TypFormula")
         self.loading=False;self.reposition_math();self.apply_highlights()
         self.loading=True;self.sync_source_lines();self.loading=False
 
@@ -799,7 +799,7 @@ class Window(QMainWindow):
                 # An image in hand answers this request. A refusal (`False`) does
                 # too: it belongs to this revision and is dropped by the next edit,
                 # so not repeating it keeps a broken document from being compiled
-                # again on every scroll. Under VISUAL_TYPST_RAW_CACHE=plain a
+                # again on every scroll. Under TYPFORMULA_RAW_CACHE=plain a
                 # fragment holding a call is asked for on every pass instead; its
                 # previous image stays in the cache and keeps being drawn, so the
                 # extra render work is the only difference the switch makes.
@@ -982,7 +982,7 @@ class Window(QMainWindow):
             if not name:return
             destination=Path(name).resolve()
         else:
-            directory=Path(tempfile.gettempdir())/'VisualTypst';directory.mkdir(parents=True,exist_ok=True)
+            directory=Path(tempfile.gettempdir())/'TypFormula';directory.mkdir(parents=True,exist_ok=True)
             stem=re.sub(r'[^\w.-]+','_',self.path.stem if self.path else 'untitled')
             destination=directory/f'{stem}-{id(self):x}.pdf'
         self.report('正在用 Typst 编译 PDF…')

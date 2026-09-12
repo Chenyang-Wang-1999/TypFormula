@@ -751,7 +751,7 @@ class NativeTest(unittest.TestCase):
         self.assertIs(window.typesetter.raw(raws[0]),window.typesetter.raw(raws[1]))
 
     def test_the_experiment_switch_reuses_only_call_free_fragments(self):
-        """VISUAL_TYPST_RAW_CACHE=plain keeps an image only for a fragment without a call.
+        """TYPFORMULA_RAW_CACHE=plain keeps an image only for a fragment without a call.
 
         The switch asks what dropping the reuse of call-carrying fragments costs,
         so a fragment that already has an image is still drawn from it: the extra

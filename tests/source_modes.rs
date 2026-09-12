@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-use visual_typst_core::{Action,Editor,math::{Kind,Cursor},typst,view::View};
+use typformula_core::{Action,Editor,math::{Kind,Cursor},typst,view::View};
 fn input(e:&mut Editor,s:&str){e.apply(Action::Input{text:s.into()}).unwrap();}
 fn key(e:&mut Editor,s:&str){e.apply(Action::Key{key:s.into(),ctrl:false,shift:false}).unwrap();}
 fn source(e:&Editor)->String{typst::write_cell(&e.root)}
@@ -75,7 +75,7 @@ fn quote_inside_command_uses_enter_to_close_string_before_confirming() {
 
 #[test]
 fn differential_is_not_a_builtin_substitution() {
-    assert!(visual_typst_core::math::symbol("dif").is_none());
+    assert!(typformula_core::math::symbol("dif").is_none());
     let mut e=Editor::default();input(&mut e,"\\dif");key(&mut e,"Enter");
     assert!(matches!(&e.root[0].kind,Kind::Raw{source} if source=="dif"));
     assert_eq!(source(&e),"dif");

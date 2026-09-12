@@ -11,7 +11,7 @@ def main():
     # does the import and the attribute, and reports whether a preview can be shown at
     # all — the editor works without it (the wheel is not part of PyQt5 itself).
     preview.prepare()
-    application=QApplication(sys.argv);application.setApplicationName("Visual Typst")
+    application=QApplication(sys.argv);application.setApplicationName("TypFormula")
     # LyX's FontLoader does the same: the bundled math fonts have to be registered
     # before any family name is resolved, and a missing one is never guessed at.
     mathfont.install()
@@ -19,7 +19,7 @@ def main():
     def exception(kind,value,traceback):
         import traceback as trace
         trace.print_exception(kind,value,traceback)
-        QMessageBox.warning(None,"Visual Typst",str(value))
+        QMessageBox.warning(None,"TypFormula",str(value))
     sys.excepthook=exception
     try:window=Window(sys.argv[1] if len(sys.argv)>1 else None)
     except Exception as error:QMessageBox.critical(None,"启动失败",str(error));return 1

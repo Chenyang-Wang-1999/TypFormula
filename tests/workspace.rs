@@ -1,8 +1,8 @@
-use visual_typst::workspace::resolve;
+use typformula::workspace::resolve;
 
 #[test]
 fn project_paths_stay_inside_the_document_directory() {
-    let root=std::env::temp_dir().join(format!("visual-typst-paths-{}",std::process::id()));
+    let root=std::env::temp_dir().join(format!("typformula-paths-{}",std::process::id()));
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(root.join("inside.typ"),"inline $x$").unwrap();
     // The document directory itself, an existing file and a nested path are fine.
