@@ -3,6 +3,7 @@ import json
 import os
 import re
 import base64,tempfile
+import time
 from pathlib import Path
 from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSizeF, QUrl
 from PyQt5.QtGui import QFont, QKeySequence, QTextCursor, QTextCharFormat, QTextBlockFormat, QPainter, QPdfWriter, QPageSize, QPageLayout, QCursor, QDesktopServices
@@ -986,6 +987,8 @@ class Window(QMainWindow):
         body=self.body()|{'raw':ranges,'formulas':[],'context_end':context_end}
         pending={shared for _,shared in targets.values()};self.raw_pending.update(pending)
         def rendered(result,error,targets=targets,revision=revision):
+            # I don't know why but it works. Without the sleep, the renderer may fail when the document is long.
+            time.sleep(0.1)
             pending={shared for _,shared in targets.values()};self.raw_pending.difference_update(pending)
             if revision!=self.revision:self.raw_timer.start();return
             for shared in pending:self.typesetter.cache[shared]=False
