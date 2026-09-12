@@ -405,9 +405,10 @@ impl Editor {
     // Shared source-block entry for the edit button and horizontal navigation.
     fn open_source(&mut self, cursor: Cursor, source: String, caret: usize) {
         if self.pending().is_some() || !valid(&self.root, &cursor) || !source.is_char_boundary(caret) { return; }
-        if !cell(&self.root, &cursor.slices).get(cursor.pos).is_some_and(|a| matches!(&a.kind, Kind::Raw {source:s} if s == &source)) { return; }
+        let Some(original) = cell(&self.root, &cursor.slices).get(cursor.pos).cloned() else {return;};
+        if !matches!(original.kind, Kind::Raw {..} | Kind::MacroCall {..}) || typst::write_atom(&original) != source {return;}
         self.cursor = cursor; self.anchor = None; let pos = self.cursor.pos;
-        self.data_mut()[pos] = MathAtom {kind:Kind::Unknown {name:source.clone(),saved:vec![],caret,anchor:None,original:Some(source)},cells:vec![]};
+        self.data_mut()[pos] = MathAtom {kind:Kind::Unknown {name:source.clone(),saved:vec![original],caret,anchor:None,original:Some(source)},cells:vec![]};
         self.cursor.pos += 1; self.lsp_completions = None; self.completion_index = 0;
     }
     // Cursor::macroModeClose. The backslash is an input gesture, never serialized.
@@ -441,7 +442,10 @@ impl Editor {
         let Kind::Unknown { saved, original, .. } = atom.kind else { unreachable!() };
         self.lsp_completions = None;
         if cancel {
-            if let Some(source) = original { self.plain_insert(MathAtom::raw(source)); }
+            if let Some(source) = original {
+                if saved.is_empty() {self.plain_insert(MathAtom::raw(source));}
+                else {let n=saved.len();self.data_mut().splice(pos..pos,saved);self.cursor.pos+=n;}
+            }
             else { let n=saved.len(); self.data_mut().splice(pos..pos,saved); self.cursor.pos+=n; }
             return true;
         }
@@ -701,9 +705,9 @@ impl Editor {
         if forward && self.cursor.pos < len || !forward && self.cursor.pos > 0 {
             let p = if forward { self.cursor.pos } else { self.cursor.pos - 1 };
             if !shift {
-                if let Kind::Raw {source} = &self.data()[p].kind {
-                    if self.preview_failed(source) {
-                        let source = source.clone();
+                if matches!(self.data()[p].kind, Kind::Raw {..} | Kind::MacroCall {..}) {
+                    let source = typst::write_atom(&self.data()[p]);
+                    if self.preview_failed(&source) {
                         let caret = if forward { 0 } else { source.len() };
                         self.open_source(Cursor {pos:p,..self.cursor.clone()}, source, caret); return;
                     }

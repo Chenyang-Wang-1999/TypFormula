@@ -15,42 +15,19 @@ OBJECT = QTextFormat.UserObject + 1
 OBJECT_ID = QTextFormat.UserProperty + 1
 
 def mark_active_path(view, slices):
-    """Stamp `_active` on the view nodes the caret's slices name.
+    """Mark ancestors of active stops, including bound macro argument Views.
 
-    A slice is `{atom, cell}` from the root down, so the path is walked the same
-    way the backend names it: into child `cell` of atom `atom`, again for the next
-    slice. A view cell holds stops *and* atoms, so the view children are not the
-    data atoms — the `stop` node whose `cursor.pos` equals `atom` is what marks the
-    atom's place, and the next child is that atom. The box highlight then needs no
-    second walk, and a stale or impossible slice simply marks nothing.
-
-    The nodes are stamped in place for one layout pass: `geometry` is sent back to
-    the core from `refresh`, and an extra key in the view is ignored there.
+    Display children are not storage slots: a raw_macro contains name tokens,
+    and a template can duplicate or wrap an argument. The core's active stop
+    already identifies the displayed occurrence, so follow that through the View.
     """
-    marks = set()
-    node = view
-    for slice in slices or []:
-        children = node.get("children")
-        if not children: break
-        at = None
-        for index, child in enumerate(children):
-            if child.get("kind") == "stop" and child.get("cursor", {}).get("pos") == slice.get("atom"):
-                at = index
-                break
-        if at is None or at + 1 >= len(children): break
-        node = children[at + 1]
-        marks.add(id(node))
-        cell = node.get("children")
-        if not cell or slice.get("cell", 0) >= len(cell): break
-        node = cell[slice["cell"]]
-        marks.add(id(node))
-    for candidate in _walk(view):
-        if id(candidate) in marks: candidate["_active"] = True
-        else: candidate.pop("_active", None)
-
-def _walk(view):
-    yield view
-    for child in view.get("children", []): yield from _walk(child)
+    def visit(node):
+        found=node.get('kind')=='stop' and node.get('active',False)
+        for child in node.get('children',[]):found=visit(child) or found
+        if found and slices and node is not view and node.get('kind')!='stop':node['_active']=True
+        else:node.pop('_active',None)
+        return found
+    visit(view)
 
 class BitmapCache:
     """Bounded device-pixel cache; SVG paths are interpreted only once.
@@ -319,7 +296,7 @@ class Typesetter:
             return box
         if kind == "stop":
             return Box(2,em,ascent,stops=[(1,0,em,node["cursor"],node.get("active",False))])
-        if kind in ("raw","raw_macro") and node.get("error"):
+        if kind in ("raw","raw_macro","style") and node.get("error") and not node.get("_active"):
             # The language service rejected this one, so the editor draws what it can
             # vouch for: the node's own source, in the failure dress. That is the same
             # drawing a fragment whose image never came back gets, which is the point --
@@ -336,6 +313,7 @@ class Typesetter:
                 # it so it can be repaired in place.
                 return self.failed_box(node, em, ascent, factor, kind)
         if kind == "raw_macro" and not node.get("_active"):
+            if self.raw(node) is False:return self.failed_box(node,em,ascent,factor,kind)
             # A call the kernel declines to expand is drawn as *the document has it* --
             # one compiled image of the call's own source -- while the caret is outside
             # the node. Entering it swaps to the name and its argument slots, which is
@@ -434,7 +412,9 @@ class Typesetter:
             # so between the request and the answer — or after one that could not be
             # answered — the call is what the source says, where an empty run says nothing.
             glyph = node.get("_glyph")
-            if node.get("_active") or not glyph:
+            if glyph is False and not node.get("_active"):
+                return self.failed_box(node,em,ascent,factor,kind)
+            if node.get("_active") or glyph is None or glyph is False:
                 # The name is drawn in the source font, the way `raw_macro` draws its
                 # callee: a command name is Typst source, not a compiled glyph.
                 body = self.layout(self.slot(children, "inner", 0), factor)
@@ -702,6 +682,7 @@ class MathCanvas(QWidget):
 
     def refresh(self,state):
         self.owner.bind_active_raw(state)
+        self.owner.stamp_diagnostics(state['view'])
         for node in self.owner.view_nodes(state['view']):
             if node.get('kind')=='unknown':node['_string_mode']=state.get('string_mode',False)
         mark_active_path(state['view'],state.get('cursor',{}).get('slices',[]))

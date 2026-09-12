@@ -6,7 +6,11 @@ use typst::foundations::Smart;
 use typst::syntax::{SyntaxKind, SyntaxNode};
 
 #[derive(Deserialize)]
-pub struct RawRange { pub id: String, pub start: usize, pub end: usize }
+pub struct RawRange {
+    pub id: String, pub start: usize, pub end: usize,
+    #[serde(default)] pub call: Option<[usize;2]>,
+    #[serde(default)] pub occurrence: usize,
+}
 #[derive(Deserialize)]
 pub struct RenderRequest { #[serde(default)] pub preview: bool, #[serde(default)] pub pdf:bool, #[serde(default)] pub overlays: HashMap<String,String>, #[serde(default="default_path")] pub path: String, pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange>, #[serde(default)] pub preview_hashes:Vec<String> }
 
@@ -31,13 +35,18 @@ pub fn render(req: RenderRequest, world: &mut FormulaWorld) -> Result<Value, Str
     if req.raw.len() > 4096 { return Err("Raw 块过多".into()); }
     let original = Source::detached(req.source.clone());
     let mut order: Vec<usize> = (0..req.raw.len()).collect(); order.sort_by_key(|i| req.raw[*i].start);
-    let mut end = 0;
+    let mut end = 0; let mut previous = None;
     for i in &order {
         let r = &req.raw[*i];
-        if r.start < end || r.start >= r.end || r.end > req.source.len()
+        if (r.start < end && previous != Some((r.start,r.end))) || r.start >= r.end || r.end > req.source.len()
             || !req.source.is_char_boundary(r.start) || !req.source.is_char_boundary(r.end)
             || !valid_range(original.root(),0,r.start,r.end,false) { return Err("Raw 源码区间无效或重叠".into()); }
         end = r.end;
+        previous = Some((r.start,r.end));
+        if let Some([a,b]) = r.call {
+            if a>=b || b>req.source.len() || !valid_range(original.root(),0,a,b,false)
+                || (a<r.end && r.start<b) {return Err("宏调用区间无效".into());}
+        }
     }
     match batch(&req,world,&order) {
         Ok(value) => Ok(value),
@@ -55,7 +64,22 @@ fn batch(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize]) -> Resu
     let mut source = req.source.clone();
     // Labelled equations are transparent source markers in math IR. Their body
     // keeps native glyph/stretch/attachment semantics until final frame export.
-    let mut labels = HashMap::new(); let mut edits = vec![]; let mut formula_labels = HashMap::new();
+    let mut labels: HashMap<String,Vec<&RawRange>> = HashMap::new(); let mut edits = vec![]; let mut formula_labels = HashMap::new();
+    let mut calls = HashMap::new();
+    for i in order {
+        if let Some([a,b]) = req.raw[*i].call {
+            calls.entry(format!("typformula-raw-call-{a}-{b}")).or_insert([a,b]);
+        }
+    }
+    for (label,[a,b]) in &calls {
+        // Insert wrappers, rather than replace the call: raw argument fragments
+        // can be labelled inside the same invocation without overlapping edits.
+        // A zero-width tag keeps the outer group distinct when the invocation
+        // consists of exactly one labelled fragment. Otherwise IR flattens the
+        // two components and the invocation label replaces the fragment label.
+        edits.push((*a,*a,"#[$#metadata(none) ".into()));
+        edits.push((*b,*b,format!("$<{label}>] ")));
+    }
     for (i,r) in req.formulas.iter().enumerate() {
         if r.start >= r.end || req.source.get(r.start..r.end).is_none_or(|s| !s.starts_with('$') || !s.ends_with('$')) { return Err("公式源码区间无效".into()); }
         let label = format!("typformula-formula-{i}"); formula_labels.insert(label.clone(), r.id.clone());
@@ -69,8 +93,10 @@ fn batch(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize]) -> Resu
     // bracket, so the fragment's own equation, and its image, is untouched.
     for i in order.iter().rev() {
         let r = &req.raw[*i];
-        let label = format!("typformula-raw-{i}"); labels.insert(label.clone(),r);
-        edits.push((r.start,r.end,format!("#[${}$<{label}>] ",&req.source[r.start..r.end])));
+        let label = format!("typformula-raw-{}-{}",r.start,r.end);
+        let matches = labels.entry(label.clone()).or_default();
+        if matches.is_empty() {edits.push((r.start,r.end,format!("#[${}$<{label}>] ",&req.source[r.start..r.end])));}
+        matches.push(r);
     }
     edits.sort_by_key(|(start,end,_)|(*start,*end));
     for (start,end,replacement) in edits.into_iter().rev() { source.replace_range(start..end,&replacement); }
@@ -82,7 +108,7 @@ fn batch(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize]) -> Resu
     let result = typst::compile::<typst_layout::PagedDocument>(world);
     let document = result.output.map_err(diagnostics)?;
     let mut items = vec![]; let mut counts = HashMap::new();
-    fn collect(frame: &Frame, page: usize, at: Point, labels: &HashMap<String,&RawRange>, formula_labels: &HashMap<String,String>, active: &mut Vec<(typst::introspection::Location,String)>, counts: &mut HashMap<String,usize>, items: &mut Vec<Value>) {
+    fn collect(frame: &Frame, page: usize, at: Point, labels: &HashMap<String,Vec<&RawRange>>, calls: &HashMap<String,[usize;2]>, call: Option<[usize;2]>, formula_labels: &HashMap<String,String>, active: &mut Vec<(typst::introspection::Location,String)>, counts: &mut HashMap<String,usize>, items: &mut Vec<Value>) {
         for (pos,item) in frame.items() {
             match item {
                 FrameItem::Tag(typst::introspection::Tag::Start(content,..)) => {
@@ -96,9 +122,15 @@ fn batch(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize]) -> Resu
                     let label = label.resolve();
                     let (identity, size) = label.rsplit_once(":base-font-pt:")?;
                     let size = size.parse::<f64>().ok().filter(|s|s.is_finite() && *s > 0.0)?;
-                    Some((*labels.get(identity)?, size))
+                    Some((labels.get(identity)?, size))
                 });
-                if let Some((r, environment_font_size_pt)) = mapped {
+                if let Some((requests, environment_font_size_pt)) = mapped {
+                    let first = requests[0];
+                    let key = format!("{}:{}:{call:?}",first.start,first.end);
+                    let ordinal = *counts.entry(key.clone()).or_insert(0);
+                    *counts.get_mut(&key).unwrap() += 1;
+                    for r in requests {
+                    if r.call.is_some() && (r.call != call || r.occurrence != ordinal) {continue;}
                     if !formula_labels.is_empty() && active.is_empty() { continue; }
                     let id = active.last().map_or_else(||r.id.clone(),|(_,formula)|format!("{}:{formula}",r.id));
                     let occurrence = counts.entry(id.clone()).or_insert(0);
@@ -115,12 +147,19 @@ fn batch(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize]) -> Resu
                         "environment_font_size_pt":environment_font_size_pt,
                         "svg":typst_svg::svg(&svg_page,&Default::default())}));
                     *occurrence += 1;
-                } else { collect(&group.frame,page,at+*pos,labels,formula_labels,active,counts,items); }
+                    }
+                } else {
+                    let invocation = group.label.as_ref().and_then(|label| {
+                        let label=label.resolve(); let (id,_)=label.rsplit_once(":base-font-pt:")?;
+                        calls.get(id).copied()
+                    }).or(call);
+                    collect(&group.frame,page,at+*pos,labels,calls,invocation,formula_labels,active,counts,items);
+                }
             }
         }
     }
     let mut active = vec![];
-    for (page,output) in document.pages().iter().enumerate() { collect(&output.frame,page+1,Point::zero(),&labels,&formula_labels,&mut active,&mut counts,&mut items); }
+    for (page,output) in document.pages().iter().enumerate() { collect(&output.frame,page+1,Point::zero(),&labels,&calls,None,&formula_labels,&mut active,&mut counts,&mut items); }
     Ok(json!({"engine":"Typst in-memory source mapping","items":items,"pages":document.pages().len(),
         "warnings":result.warnings.iter().map(|w|w.message.as_str()).collect::<Vec<_>>()}))
 }
@@ -216,6 +255,23 @@ fn preview(req:&RenderRequest,world:&mut FormulaWorld)->Result<Value,String> {
 mod tests {
     use super::*;
     #[test]
+    fn template_fragments_are_selected_by_call_and_occurrence() {
+        let source="#let piece(x) = $bold(#x/2)$\n#let twice(x,y) = $piece(#x)+piece(#y)$\n$piece(a) + piece(b b b b) + twice(c, d d d d)$";
+        let start=source.find("bold(").unwrap();let end=start+"bold(#x/2)".len();
+        let raw:Vec<_>=[("piece(a)",0),("piece(b b b b)",0),("twice(c, d d d d)",0),("twice(c, d d d d)",1)].into_iter().enumerate().map(|(i,(text,occurrence))|{
+            let a=source.rfind(text).unwrap();
+            json!({"id":i.to_string(),"start":start,"end":end,"call":[a,a+text.len()],"occurrence":occurrence})
+        }).collect();
+        let req=serde_json::from_value(json!({"source":source,"raw":raw})).unwrap();
+        let result=render(req,&mut world().unwrap()).unwrap();
+        let items=result["items"].as_array().unwrap();
+        assert_eq!(items.len(),4,"{:?}",items.iter().map(|i|&i["id"]).collect::<Vec<_>>());
+        let item=|i:usize|items.iter().find(|v|v["id"]==format!("{i}:0")).unwrap();
+        assert!(item(1)["width"].as_f64().unwrap()>item(0)["width"].as_f64().unwrap());
+        assert!(item(3)["width"].as_f64().unwrap()>item(2)["width"].as_f64().unwrap());
+        assert_ne!(item(0)["svg"],item(2)["svg"]);
+    }
+    #[test]
     fn normalized_svg_width_does_not_depend_on_environment_size() {
         let mut world=world().unwrap();
         let small=compile(&mut world,"#set text(size: 12pt)\n$cancel(x)$",&["cancel(x)"]);
@@ -291,7 +347,7 @@ mod tests {
     fn relative_imports_use_the_active_file_directory() {
         let source="#import \"defs.typ\": twice\n$twice(x)$";
         let start=source.find("twice(x)").unwrap();
-        let reply=render(RenderRequest {preview:false,pdf:false,overlays:Default::default(),path:"tests/fixtures/sub/main.typ".into(),source:source.into(),raw:vec![RawRange{id:"imported".into(),start,end:start+8}],formulas:vec![],preview_hashes:vec![]},&mut world().unwrap()).unwrap();
+        let reply=render(RenderRequest {preview:false,pdf:false,overlays:Default::default(),path:"tests/fixtures/sub/main.typ".into(),source:source.into(),raw:vec![RawRange{id:"imported".into(),start,end:start+8,call:None,occurrence:0}],formulas:vec![],preview_hashes:vec![]},&mut world().unwrap()).unwrap();
         assert!(reply["items"][0]["svg"].as_str().unwrap().contains("<path"));
     }
     #[test]
@@ -325,7 +381,7 @@ mod tests {
         // A document that is broken everywhere has nothing to salvage, so it is
         // still reported as an error instead of an empty batch.
         assert!(render(RenderRequest{preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),
-            source:"$ undefined_op(x) $".into(),raw:vec![RawRange{id:"0".into(),start:2,end:17}],formulas:vec![],preview_hashes:vec![]},&mut world).is_err());
+            source:"$ undefined_op(x) $".into(),raw:vec![RawRange{id:"0".into(),start:2,end:17,call:None,occurrence:0}],formulas:vec![],preview_hashes:vec![]},&mut world).is_err());
     }
     #[test]
     fn the_trailing_space_of_a_splice_stays_outside_the_fragment() {
@@ -342,7 +398,7 @@ mod tests {
     }
     fn compile(world: &mut FormulaWorld, source: &str, targets: &[&str]) -> Value {
         let raw = targets.iter().enumerate().map(|(i,text)| {
-            let start = source.rfind(text).unwrap(); RawRange { id:i.to_string(),start,end:start+text.len() }
+            let start = source.rfind(text).unwrap(); RawRange { id:i.to_string(),start,end:start+text.len(),call:None,occurrence:0 }
         }).collect();
         render(RenderRequest {preview:false,pdf:false,overlays:Default::default(), path:"main.typ".into(), source:source.into(),raw,formulas:vec![],preview_hashes:vec![] },world).unwrap()
     }

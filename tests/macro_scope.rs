@@ -113,7 +113,7 @@ fn a_call_site_fragment_renders_from_the_document_its_own_call() {
     let definition=typst::macro_registry(source).get("fixed").cloned().unwrap();
     let (start,end)=typst::definition_raw_ranges(&definition,"lr(a, size: #100%)")[0];
     let request=RenderRequest{preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),
-        source:source.into(),raw:vec![RawRange{id:format!("{start}:{end}"),start,end}],formulas:vec![],preview_hashes:vec![],context_end:None};
+        source:source.into(),raw:vec![RawRange{id:format!("{start}:{end}"),start,end,call:None,occurrence:0}],formulas:vec![],preview_hashes:vec![],context_end:None};
     let result=service.render(request).unwrap();
     let items=result["items"].as_array().unwrap();
     assert_eq!(items.len(),1,"the call site is what compiles the fragment: {result}");

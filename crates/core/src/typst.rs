@@ -162,7 +162,23 @@ pub fn raw_ranges(source: &str, offset: usize, text: &str) -> Vec<(usize, usize)
             pos += child.len();
         }
     }
-    let mut out = vec![]; visit(Source::detached(source).root(), offset, text, &mut out); out
+    let tree=Source::detached(source);
+    let mut out = vec![]; visit(tree.root(), offset, text, &mut out);
+    if out.is_empty() && text.contains('(') {
+        // Structured calls are canonically spelled by the writer. Preserve the
+        // original range even when it used a/b or different argument whitespace.
+        fn canonical(text:&str)->Option<String> {
+            parse_document(&format!("$ {text} $")).ok().map(|p|write_cell(&p.root))
+        }
+        fn calls(node:&SyntaxNode,at:usize,want:&str,out:&mut Vec<(usize,usize)>) {
+            if node.kind()==SyntaxKind::MathCall && canonical(&node.full_text()).as_deref()==Some(want) {
+                out.push((at,at+node.len()));return;
+            }
+            let mut pos=at;for child in node.children(){calls(child,pos,want,out);pos+=child.len();}
+        }
+        if let Some(want)=canonical(text) {calls(tree.root(),offset,&want,&mut out);}
+    }
+    out
 }
 
 // A prefix ends at the formula being edited. Traverse only its open lexical

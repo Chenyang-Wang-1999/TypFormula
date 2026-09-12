@@ -212,7 +212,7 @@ editing.rs::every_shape_declares_its_editing_rules
 
 模板那边曾经另记着一个**不解决**的问题：`Style` 形状判定要看**已绑定**主体的字形串，而判定发生在绑定之前（`has_glyph_run` 对还没填的洞答 `false`）。**已经修好**，而且修法正是这一节说的"挪到实例侧"：
 
-注册期**不做这个决定**。模板里那个折叠节点保留着**带洞的拼写**（`bold(upright(#x))`），调用点把它绑完（`bold(upright(u))`）、重新解析、用**普通的 `view_atom` 再投影一次**——判据一个字符都没改，只是终于拿到了主体。所以 `$mathbf(u)$`（`#let mathbf(x) = $bold(upright(#x))$`）现在画成 `style{text:"bold(upright(u))", style_name:"bold"}`，而 `bold(frac(a, b))` 仍然退成整段调用的图：**分式不是字形串，这条判断本来就没变。**
+注册期**不做这个决定**。模板里那个折叠节点保留着**带洞的拼写**（`bold(upright(#x))`），调用点先把实参 View 填入主体，再依据绑定后的结构决定是否使用 style。整个过程保留实参携带的光标与 stop，不再把实参写成字符串后重新解析。调用拼写（`bold(upright(u))`）仅供取字形和失败显示使用。所以 `$mathbf(u)$`（`#let mathbf(x) = $bold(upright(#x))$`）现在画成 `style{text:"bold(upright(u))", style_name:"bold"}`，而 `bold(frac(a, b))` 仍然退成整段调用的图：**分式不是字形串，这条判断本来就没变。**
 
 两点值得记下来：
 

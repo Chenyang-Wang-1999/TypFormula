@@ -143,7 +143,7 @@ impl Document {
             // with fewer spaces than the writer emits never rendered its fragments.
             let canonical = typst::write_document_mode(&self.editor.root, "", self.editor.display);
             let locator = Locator::new(&self.source, range.start, equation, &canonical);
-            annotate(&mut response["view"], &self.editor.root, &locator, &mut raw, &mut HashMap::new(), false);
+            annotate(&mut response["view"], &self.editor.root, &locator, &mut raw, &mut HashMap::new(), false, None);
             formulas.push(json!({"id":"0","start":range.start,"end":range.end}));
             if let Some(command) = response["command"].as_object_mut() {
                 if let Some(s) = command.get_mut("source") { if let Some(text) = s.as_str() { *s = json!(format!("{text}{}", &self.source[range.end..])); } }
@@ -224,44 +224,63 @@ fn align(canonical: &str, source: &str) -> Vec<usize> {
 fn step(text: &str, at: usize) -> usize { at + text[at..].chars().next().map_or(0, char::len_utf8) }
 fn whitespace(text: &str, at: usize) -> bool { text[at..].chars().next().is_some_and(char::is_whitespace) }
 
-fn annotate(view: &mut Value, root: &MathData, locator: &Locator, raw: &mut Vec<Value>, counts: &mut HashMap<String,usize>, inside: bool) {
-    // Two kinds are drawn from a compiled image: `raw` (a fragment the editor does not
-    // model) and `raw_macro` (a call it declines to expand — which includes a font variant
-    // whose body has no glyph run). Both carry the source in `text` and a cursor in `edit`,
-    // so both are located the same way. A `style` node is *not* here: it is drawn from the
-    // glyphs the engine substituted, which need no source range and never overlap.
-    //
-    // One image per **outermost** such node, and none for one nested inside another: the
-    // outer node's range already covers the inner one's, and the adapter rejects
-    // overlapping ranges outright ("Raw 源码区间无效或重叠"), which costs *every* fragment
-    // of the batch its image.
-    let drawn = matches!(view["kind"].as_str(), Some("raw" | "raw_macro"));
-    if drawn && !inside {
-        let text = view["text"].as_str().unwrap_or_default().to_owned();
-        let range = if let Ok(cursor) = serde_json::from_value::<Cursor>(view["edit"].clone()) {
-            let mut copy = root.clone();
-            let mut marker = "visualtypstrangemarker".to_string(); while locator.document.contains(&marker) { marker.push('x'); }
-            cell_mut(&mut copy, &cursor.slices)[cursor.pos] = MathAtom::raw(&marker);
-            let marked = typst::write_document_mode(&copy,"",locator.equation.starts_with("$ "));
-            locator.locate(&marked, &marker, &text)
-        } else if let Ok([start,end]) = serde_json::from_value::<[usize;2]>(view["source_range"].clone()) {
-            locator.verified(start,end,&text)
-        } else {
-            // A fragment of a macro template: it lives in the definition text, which
-            // is the document prefix the view records alongside it.
-            let context = view["definitions"].as_str().unwrap_or_default(); let origin = view["origin"].as_str().unwrap_or_default();
-            let start = context.len(); let mut ranges = vec![];
-            if locator.document.get(start..start+origin.len()) == Some(origin) { ranges=typst::raw_ranges(origin,start,&text); }
-            ranges.first().and_then(|(a,b)| locator.verified(*a,*b,&text))
-        };
-        if let Some((start,end)) = range {
-            let id = format!("{start}:{end}"); let occurrence = counts.entry(id.clone()).or_insert(0);
-            view["render_id"] = json!(format!("{id}:0:{}",*occurrence)); *occurrence += 1;
-            if !raw.iter().any(|r| r["id"] == id) { raw.push(json!({"id":id,"start":start,"end":end})); }
+fn locate_edit(view: &Value, root: &MathData, locator: &Locator, text: &str) -> Option<(usize, usize)> {
+    let cursor = serde_json::from_value::<Cursor>(view["edit"].clone()).ok()?;
+    let mut copy = root.clone();
+    let mut marker = "visualtypstrangemarker".to_string();
+    while locator.document.contains(&marker) { marker.push('x'); }
+    cell_mut(&mut copy, &cursor.slices)[cursor.pos] = MathAtom::raw(&marker);
+    let marked = typst::write_document_mode(&copy, "", locator.equation.starts_with("$ "));
+    locator.locate(&marked, &marker, text).or_else(|| {
+        let pos=marked.find(&marker)?;
+        let estimate=locator.offset+locator.map.get(pos).copied().unwrap_or(0);
+        typst::raw_ranges(locator.equation,locator.offset,text).into_iter().min_by_key(|(a,_)|a.abs_diff(estimate))
+    })
+}
+
+fn has_active_stop(view: &Value) -> bool {
+    (view["kind"] == "stop" && view["active"] == true)
+        || view["children"].as_array().is_some_and(|children| children.iter().any(has_active_stop))
+}
+
+fn annotate(view: &mut Value, root: &MathData, locator: &Locator, raw: &mut Vec<Value>, counts: &mut HashMap<String,usize>, inside: bool, mut call: Option<[usize;2]>) {
+    // Locate every fragment, even while the outer call supplies its image. The
+    // request list selects non-overlapping outer images or the active call's slots.
+    if view["kind"] == "macro" {
+        if let Some(text) = view["source_text"].as_str() {
+            if let Some((a,b)) = locate_edit(view, root, locator, text) { call = Some([a,b]); }
         }
     }
-    let inside = inside || drawn;
-    if let Some(children) = view["children"].as_array_mut() { for child in children { annotate(child,root,locator,raw,counts,inside); } }
+    let drawn = matches!(view["kind"].as_str(), Some("raw" | "raw_macro"));
+    let expanded = view["kind"] == "raw_macro" && has_active_stop(view);
+    if drawn {
+        let text = view["source_text"].as_str().or(view["text"].as_str()).unwrap_or_default().to_owned();
+        let range = locate_edit(view, root, locator, &text).or_else(|| {
+            if let Ok([a,b]) = serde_json::from_value::<[usize;2]>(view["source_range"].clone()) {
+                return locator.verified(a,b,&text);
+            }
+            let context = view["definitions"].as_str().unwrap_or_default();
+            let origin = view["origin"].as_str().unwrap_or_default();
+            let start = context.len();
+            if locator.document.get(start..start+origin.len()) != Some(origin) { return None; }
+            typst::raw_ranges(origin,start,&text).first().and_then(|(a,b)|locator.verified(*a,*b,&text))
+        });
+        if let Some((start,end)) = range {
+            let instance = if view["kind"] == "raw_macro" && view["edit"].is_null() { call } else { None };
+            let base = instance.map_or_else(||format!("{start}:{end}"), |[a,b]|format!("{start}:{end}:{a}:{b}"));
+            let occurrence = counts.entry(base.clone()).or_insert(0);
+            let id = if instance.is_some() {format!("{base}:{}",*occurrence)} else {base};
+            let mut request = json!({"id":id,"start":start,"end":end});
+            if let Some(call) = instance {request["call"] = json!(call); request["occurrence"] = json!(*occurrence);}
+            view["render_id"] = json!(format!("{id}:0:{}",*occurrence)); *occurrence += 1;
+            view["render_request"] = request.clone();
+            if !inside && !expanded && !raw.iter().any(|r|r["id"]==id) {raw.push(request);}
+        }
+    }
+    let inside = inside || (drawn && !expanded);
+    if let Some(children) = view["children"].as_array_mut() {
+        for child in children {annotate(child,root,locator,raw,counts,inside,call);}
+    }
 }
 
 #[cfg(test)]

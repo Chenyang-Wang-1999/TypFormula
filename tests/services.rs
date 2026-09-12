@@ -5,7 +5,7 @@ use typformula::services::{Services, CompletionRequest, RenderRequest, RawRange}
 fn render(service: &Services, expression: &str, definitions: &str) -> Result<serde_json::Value,String> {
     let prefix=format!("{definitions}\n$ ");
     let start=prefix.len();
-    let result=service.render(RenderRequest {preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),source:format!("{prefix}{expression} $"),raw:vec![RawRange{id:"raw".into(),start,end:start+expression.len()}],formulas:vec![],preview_hashes:vec![],context_end:None})?;
+    let result=service.render(RenderRequest {preview:false,pdf:false,overlays:Default::default(),path:"main.typ".into(),source:format!("{prefix}{expression} $"),raw:vec![RawRange{id:"raw".into(),start,end:start+expression.len(),call:None,occurrence:0}],formulas:vec![],preview_hashes:vec![],context_end:None})?;
     Ok(result["items"][0].clone())
 }
 
@@ -110,7 +110,7 @@ fn a_fragment_context_renders_past_a_later_document_error() {
     let start = source.find("sum").unwrap();
     let end = start + "sum".len();
     let context_end = source.find("^n $").unwrap() + 4;
-    let raw = || vec![RawRange { id: format!("{start}:{end}"), start, end }];
+    let raw = || vec![RawRange { id: format!("{start}:{end}"), start, end, call:None, occurrence:0 }];
     let request = |context_end: Option<usize>| RenderRequest {
         preview: false, pdf: false, overlays: Default::default(), path: "main.typ".into(),
         source: source.into(), raw: raw(), formulas: vec![], preview_hashes: vec![], context_end,

@@ -113,8 +113,8 @@ fn collect_equations<'a>(
 /// Read the text of a **flat** math item: the substituted glyphs of one font variant.
 ///
 /// Only a flat run of characters has a glyph form. A body with structure — a fraction, a
-/// script, a table — has no single run, so this refuses it and the caller falls back to
-/// the image of the whole call, which the engine typesets correctly. Refusing is the
+/// script, a table — has no single run, so this refuses it. The kernel normally
+/// classifies such calls as raw_macro; a failed style request shows source. Refusing is the
 /// honest answer: a caller that concatenated a fraction's parts would draw nonsense.
 ///
 /// Nesting needs no recursion *here* because the IR has already collapsed it: the engine

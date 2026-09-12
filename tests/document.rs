@@ -1,6 +1,64 @@
 use typformula::document::Document;
 use serde_json::json;
 fn load(source:&str)->Document {let mut doc=Document::default();doc.apply(json!({"action":"set_source","source":source})).unwrap();doc}
+
+fn nodes<'a>(v:&'a serde_json::Value,kind:&str,out:&mut Vec<&'a serde_json::Value>) {
+    if v["kind"]==kind {out.push(v);}
+    if let Some(children)=v["children"].as_array(){for child in children {nodes(child,kind,out);}}
+}
+
+#[test]
+fn bound_calls_keep_source_locations_and_distinct_invocations() {
+    let source="#let wrap(x) = $bold(#x/2)$\n$wrap(a) + wrap(b)$";
+    let mut doc=load(source);let at=doc.equations().last().unwrap().start;
+    doc.apply(json!({"action":"activate_formula","start":at})).unwrap();
+    let state=doc.response();let mut calls=vec![];nodes(&state["view"],"raw_macro",&mut calls);
+    assert_eq!(calls.len(),2);
+    assert_eq!(calls[0]["text"],"bold(frac(a, 2))");
+    assert_eq!(calls[1]["text"],"bold(frac(b, 2))");
+    for (node,call) in calls.iter().zip(["wrap(a)","wrap(b)"]) {
+        let request=&node["render_request"];
+        let a=request["start"].as_u64().unwrap() as usize;let b=request["end"].as_u64().unwrap() as usize;
+        assert_eq!(&source[a..b],"bold(#x/2)");
+        let a=request["call"][0].as_u64().unwrap() as usize;let b=request["call"][1].as_u64().unwrap() as usize;
+        assert_eq!(&source[a..b],call);
+    }
+    assert_ne!(calls[0]["render_request"]["id"],calls[1]["render_request"]["id"]);
+    assert_eq!(doc.source(),source);
+}
+
+#[test]
+fn a_bound_style_preserves_argument_cursor_and_editing() {
+    let source="#let styled(x) = $bold(upright(#x))$\n$styled(a)$";
+    let mut doc=load(source);let at=doc.equations().last().unwrap().start;
+    doc.apply(json!({"action":"activate_formula","start":at})).unwrap();
+    doc.apply(json!({"action":"key","key":"ArrowRight"})).unwrap();
+    let state=doc.response();let mut stops=vec![];nodes(&state["view"],"stop",&mut stops);
+    assert!(stops.iter().any(|n|n["active"]==true && !n["cursor"]["slices"].as_array().unwrap().is_empty()));
+    doc.apply(json!({"action":"input","text":"z"})).unwrap();
+    assert!(doc.source().ends_with("$styled(z a)$"));
+}
+
+#[test]
+fn bound_style_empty_arguments_keep_their_typst_spelling() {
+    let mut doc=load("#let styled(long_name) = $bold(#long_name)$\n$styled(\"\")$");
+    let at=doc.equations().last().unwrap().start;
+    doc.apply(json!({"action":"activate_formula","start":at})).unwrap();
+    let state=doc.response();let mut styles=vec![];nodes(&state["view"],"style",&mut styles);
+    assert_eq!(styles[0]["text"],"bold(\"\")");
+}
+
+#[test]
+fn entering_a_collapsed_call_requests_its_located_inner_fragments() {
+    let mut doc=load("$bold(arrow.r)$");doc.apply(json!({"action":"activate_formula","start":0})).unwrap();
+    let outside=doc.response();let mut inner=vec![];nodes(&outside["view"],"raw",&mut inner);
+    assert!(inner[0]["render_request"].is_object());
+    assert_eq!(outside["render"]["raw"].as_array().unwrap().len(),1);
+    doc.apply(json!({"action":"key","key":"ArrowRight"})).unwrap();
+    let inside=doc.response();let request=&inside["render"]["raw"][0];
+    let a=request["start"].as_u64().unwrap() as usize;let b=request["end"].as_u64().unwrap() as usize;
+    assert_eq!(&doc.source[a..b],"arrow.r");
+}
 #[test]
 fn padded_matrix_cells_are_written_and_survive_reentry() {
     for (source, cell, expected) in [("$mat(a, b; c)$",3,"$mat(a, b; c, z)$"), ("$mat(a; b, c)$",1,"$mat(a, z; b, c)$")] {

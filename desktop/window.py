@@ -52,7 +52,7 @@ class Window(QMainWindow):
     def __init__(self,path=None,screen=None):
         super().__init__();self.loading=True;self.source="";self.saved="";self.path=None
         self.history=[];self.future=[];self.revision=0;self.analysis={};self.math_state=None
-        self.semantic_spans=[];self.engine_spans=[]
+        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
         self.definition_draft=None
         self.settings=load_settings();self.typesetter=Typesetter(self.settings);self.typesetter.warn=self.report
@@ -180,7 +180,7 @@ class Window(QMainWindow):
             self.newline="\r\n" if "\r\n" in text else "\n";text=text.replace("\r\n","\n")
         else:text="";self.newline="\n"
         self.stop_preview()
-        self.path=path;self.source=text;self.saved=text;self.history=[];self.future=[];self.semantic_spans=[];self.engine_spans=[]
+        self.path=path;self.source=text;self.saved=text;self.history=[];self.future=[];self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
         self.typesetter.cache.clear();self.typesetter.svg.clear();self.typesetter.placements.clear();self.typesetter.glyphs.clear();self.glyph_pending.clear();self.ensure_services()
         self.core.call("set_source",source=text)
         self.analysis=self.core.call("analyze");self.bind_formula_ids({},self.analysis);self.raw_cache.edits.clear();self.load_glyphs();self.raw_cache.rebind({},self.analysis);self.raw_pending.clear();self.revision+=1
@@ -377,7 +377,7 @@ class Window(QMainWindow):
             self.project();return
         self.checkpoint()
         old_source=self.source;self.source=self.source[:a]+text+self.source[b:];self.revision+=1
-        self.semantic_spans=[];self.engine_spans=[]
+        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
         old=self.analysis
         self.analysis=self.update_analysis(old_source,a,b,text);self.raw_cache.rebind(old,self.analysis)
         caret=a+len(text)
@@ -403,7 +403,7 @@ class Window(QMainWindow):
         if not self.finish_formula(focus=False):return
         other.append((self.source,self.focused_editor().source_selection()))
         old_source=self.source;self.source,selection=stack.pop();self.revision+=1
-        self.semantic_spans=[];self.engine_spans=[]
+        self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
         old=self.analysis
         a,b,text=difference(old_source,self.source)
         self.analysis=self.update_analysis(old_source,a,b,text);self.raw_cache.rebind(old,self.analysis)
@@ -439,7 +439,7 @@ class Window(QMainWindow):
         self.math_state=state
         if state["source"]!=before:
             self.checkpoint();self.source=state["source"];self.revision+=1
-            self.semantic_spans=[];self.engine_spans=[]
+            self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[]
             for key,value in list(self.typesetter.cache.items()):
                 if value is None:del self.typesetter.cache[key]
             self.typesetter.touch()
@@ -449,6 +449,7 @@ class Window(QMainWindow):
         self.stamp_contexts(state['view'])
         self.math_canvas.refresh(state);self.reposition_math()
         self.report_raw_fragments(state)
+        self.raw_timer.start()
         invalidated=self.raw_cache.track(state,self.typesetter.cache)
         if invalidated:self.invalidate_raw(invalidated);self.raw_timer.start()
         active=next((stop for stop in self.math_canvas.box.stops if stop[4]),None)
@@ -629,15 +630,14 @@ class Window(QMainWindow):
                 # reply must not replace the new request's cache or trigger a repaint.
                 if self.glyph_pending.get(key) is not token:return
                 del self.glyph_pending[key]
-                # A failure clears the entry so the next analysis asks again; recording an
-                # empty answer would draw a blank where a variant should be.
-                self.typesetter.glyphs.pop(key,None) if error else self.typesetter.glyphs.__setitem__(key,(value or {}).get("glyphs",""))
-                self.typesetter.touch()
+                # False is a stable failure; None is pending, and an empty string
+                # is a successful empty run. Retry failures on explicit refresh.
+                self.typesetter.glyphs[key]=False if error else (value or {}).get("glyphs","")
                 # The views read the cache when they are laid out (see `stamp_formula`),
                 # so dropping the memoized boxes and repainting is the whole of it: the
                 # next layout picks the answer up. Stamping here would have to reach both
                 # projections of every formula, which is what let the box stay blank.
-                self.repaint_formulas()
+                self.repaint_glyphs(key)
             self.services.request("/api/glyphs",{"path":"main.typ","expression":text,"definitions":definitions,"display":display},
                                   arrived,key="glyphs:"+str(key))
 
@@ -727,8 +727,9 @@ class Window(QMainWindow):
         def walk(node, inside):
             kind = node.get('kind')
             if kind == 'raw_macro':
-                if not inside: out.append(node)
-                inside = True
+                if not node.get('_active'):
+                    if not inside: out.append(node)
+                    inside = True
             elif kind == 'raw' and not inside:
                 out.append(node)
             for child in node.get('children') or []: walk(child, inside)
@@ -760,6 +761,10 @@ class Window(QMainWindow):
         for node in self.view_nodes(view):
             if node.get('kind') not in ('raw','raw_macro'):continue
             node['_context']=index.get(':'.join((node.get('render_id') or '').split(':')[:2]))
+            call=node.get('render_request',{}).get('call')
+            if call:
+                owner=next((f for f in self.analysis.get('formulas',[]) if f['start']<=call[0] and call[1]<=f['end']),None)
+                if owner:node['_call_identity']=(owner.get('_object_id'),call[0]-owner['start'],call[1]-owner['start'])
         return view
 
     def remember_attachments(self,formula,attachments):
@@ -824,13 +829,16 @@ class Window(QMainWindow):
         for item in diagnostics:
             bounds=item.get("range")
             if not isinstance(bounds,dict):continue
-            start=from_byte(self.source,self.lsp_position(bounds["start"]))
-            end=from_byte(self.source,self.lsp_position(bounds["end"]))
+            if item.get('severity',1)!=1:continue
+            start=to_byte(self.source,self.lsp_position(bounds["start"]))
+            end=to_byte(self.source,self.lsp_position(bounds["end"]))
             if end<=start:continue
             spans.append((start,end,item.get("message","")))
         changed=False
-        for formula in self.analysis.get("formulas",[]):
-            view=formula.get("view")
+        self.diagnostic_spans=spans
+        views=[f.get('view') for f in self.analysis.get('formulas',[])]
+        if self.math_state:views.append(self.math_state['view'])
+        for view in views:
             if not view:continue
             for node in self.view_nodes(view):
                 identity=node.get("render_id")
@@ -840,6 +848,13 @@ class Window(QMainWindow):
                 if node.get("error")!=hit:changed=True
                 node["error"]=hit
         if changed:self.typesetter.touch();self.repaint_formulas()
+
+    def stamp_diagnostics(self,view):
+        for node in self.view_nodes(view):
+            identity=node.get('render_id')
+            if not identity:continue
+            start,end=map(int,identity.split(':')[:2])
+            node['error']=next((message for a,b,message in self.diagnostic_spans if a<end and start<b),None)
 
     def report_raw_fragments(self,state=None,force=False):
         """Tell the core which Raw fragments of the active formula have no image.
@@ -854,8 +869,9 @@ class Window(QMainWindow):
         if not state:return
         failed=[];rest=[]
         for node in self.view_nodes(state.get('view',{})):
-            if node.get('kind')!='raw' or not node.get('edit'):continue
-            (failed if self.typesetter.raw(node) is False else rest).append(node.get('text',''))
+            if node.get('kind') not in ('raw','raw_macro','style') or not node.get('edit'):continue
+            unavailable=node.get('_glyph') is False if node['kind']=='style' else self.typesetter.raw(node) is False
+            (failed if unavailable or node.get('error') else rest).append(node.get('text',''))
         signature=(state.get('definitions',''),bool(state.get('display')),tuple(sorted(set(failed))),tuple(sorted(set(rest))))
         if not force and signature==self.raw_signature:return
         self.raw_signature=signature
@@ -909,11 +925,12 @@ class Window(QMainWindow):
         visible=self.visible_formula_starts()
         for formula in self.analysis.get('formulas',[]):
             if formula['start'] not in visible:continue
-            request=formula.get('render')
+            active=self.math_state if self.math_state and self.math_state['active_range']['start']==formula['start'] else None
+            request=(active or formula).get('render')
             if not request:continue
             by_id={item['id']:item for item in request.get('raw',[])}
             wanted=0
-            for node in self.raw_fragments(formula.get('view',{})):
+            for node in self.raw_fragments((active or formula).get('view',{})):
                 stable=node.get('_raw_key');text=node.get('text','');shared=raw_key(node)
                 if not node.get('render_id'):
                     # No range means the service can never be asked for this fragment.
@@ -932,8 +949,9 @@ class Window(QMainWindow):
                 # extra render work is the only difference the switch makes.
                 if known and (any(value is False for value in known) or reusable(text)):continue
                 if shared in self.raw_pending or shared in seen:continue
-                source_id=':'.join(node['render_id'].split(':')[:2]);source_range=by_id.get(source_id)
+                source_range=node.get('render_request') or by_id.get(':'.join(node['render_id'].split(':')[:2]))
                 if not source_range:continue
+                source_id=source_range['id']
                 seen.add(shared);targets[source_id]=(stable,shared);ranges.append(source_range);wanted+=1
                 in_definition=in_definition or any(a<=source_range['start']<b for a,b in definitions)
             # Ask for a source that reaches only as far as the last fragment does:
@@ -962,11 +980,11 @@ class Window(QMainWindow):
                 # compile instead of failing the batch. That verdict is about the
                 # document text, so the next edit clears it and asks again, the
                 # same way a failed request does.
-                refused={targets[source_id][1] for source_id in (result or {}).get('failed',[]) if source_id in targets}
-                self.raw_error=(revision,refused) if refused else None
                 for item in result.get('items',[]):
-                    source_id=':'.join(item['id'].split(':')[:2])
+                    source_id=next((key for key in targets if item['id']==key or item['id'].startswith(key+':')),None)
                     if source_id in targets:self.typesetter.cache[targets[source_id][1]]=item
+                refused={shared for shared in pending if self.typesetter.cache.get(shared) is False}
+                self.raw_error=(revision,refused) if refused else None
             self.typesetter.touch();self.repaint_formulas()
         self.services.request('/api/render',body,rendered,key='raw-batch')
 
@@ -975,6 +993,20 @@ class Window(QMainWindow):
         for editor in self.editors:editor.document().markContentsDirty(0,editor.document().characterCount());editor.viewport().update()
         if self.math_state:self.math_canvas.refresh(self.math_state);self.reposition_math()
         self.report_raw_fragments()
+
+    def repaint_glyphs(self,key):
+        """A glyph reply invalidates only Views which read this cache entry."""
+        _,text,display=key
+        affected=[]
+        for formula in self.analysis.get('formulas',[]):
+            if bool(formula.get('display'))==display and text in self.glyph_expressions([formula]):
+                self.stamp_formula(formula);affected.append(formula)
+        for editor in self.editors:
+            for position,formula in editor.object_data.items():
+                if any(formula is f for f in affected):editor.document().markContentsDirty(position,1)
+            editor.viewport().update()
+        if self.math_state and bool(self.math_state.get('display'))==display and text in self.glyph_expressions([self.math_state]):
+            self.math_canvas.refresh(self.math_state);self.reposition_math();self.report_raw_fragments()
 
     def invalidate_raw(self,records):
         """Drop every image of the fragments a script edit invalidated.
@@ -1136,6 +1168,8 @@ class Window(QMainWindow):
         if not self.finish_formula():return
         self.typesetter.cache.clear();self.typesetter.svg.clear()
         self.typesetter.placements.clear()
+        self.typesetter.glyphs.clear();self.glyph_pending.clear();self.load_glyphs()
+        self.typesetter.touch();self.raw_timer.start();self.repaint_formulas()
         qt_svg.cache_clear()
         self.background()
 

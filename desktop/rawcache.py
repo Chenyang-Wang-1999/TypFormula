@@ -34,6 +34,9 @@ def raw_key(node):
     of the key. Everything else shares one image per source text, wherever it stands.
     """
     text=node.get('text','')
+    request=node.get('render_request',{})
+    if request.get('call'):
+        return ('raw-instance',text,node.get('origin'),node.get('_call_identity',tuple(request['call'])),request.get('occurrence',0),node.get('_context'))
     return ('raw',text,node['_context']) if node.get('_context') else ('raw',text)
 
 def signature_digest(value):

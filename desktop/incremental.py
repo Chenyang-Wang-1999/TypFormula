@@ -27,10 +27,27 @@ def _shift_view(node,start,end,delta):
     if 'render_id' in node:
         moved=_shift_id(node['render_id'],start,end,delta)
         if moved!=node['render_id']:result={**result,'render_id':moved}
+    if 'render_request' in node:
+        request=_shift_request(node['render_request'],start,end,delta)
+        if request!=node['render_request']:
+            result={**result,'render_request':request}
+            suffix=node['render_id'][len(node['render_request']['id']):]
+            result['render_id']=request['id']+suffix
     children=node.get('children')
     if children:
         shifted=[_shift_view(child,start,end,delta) for child in children]
         if any(new is not old for new,old in zip(shifted,children)):result={**result,'children':shifted}
+    return result
+
+def _shift_request(item,start,end,delta):
+    bounds=_range(item['start'],item['end'],start,end,delta)
+    if bounds is None:return item
+    result={**item,'start':bounds[0],'end':bounds[1],'id':_shift_id(item.get('id'),start,end,delta)}
+    if item.get('call'):
+        call=_range(*item['call'],start,end,delta)
+        if call:
+            result['call']=list(call)
+            result['id']=f'{bounds[0]}:{bounds[1]}:{call[0]}:{call[1]}:{item.get("occurrence",0)}'
     return result
 
 def _shift_formula(formula,start,end,delta,new_source):
@@ -47,11 +64,8 @@ def _shift_formula(formula,start,end,delta,new_source):
             if not items:continue
             shifted=[]
             for item in items:
-                item_bounds=_range(item['start'],item['end'],start,end,delta)
-                item_id=_shift_id(item.get('id'),start,end,delta)
-                if item_bounds and (item_bounds!=(item['start'],item['end']) or item_id!=item.get('id')):
-                    shifted.append({**item,'start':item_bounds[0],'end':item_bounds[1],'id':item_id})
-                else:shifted.append(item)
+                moved_item=_shift_request(item,start,end,delta)
+                shifted.append(moved_item if moved_item!=item else item)
             moved[group]=shifted
         result={**result,'render':moved}
     if 'view' in formula:

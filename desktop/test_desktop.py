@@ -84,6 +84,100 @@ class NativeTest(unittest.TestCase):
         window=self.window;window.replace(0,len(window.source),source)
         window.compile_timer.stop()
 
+    def test_bound_style_has_a_visible_editable_argument_caret(self):
+        window=self.window;calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request):
+            self.load('#let styled(x) = $bold(upright(#x))$\n$styled(a)$')
+            window.activate(window.analysis['formulas'][-1]['start'])
+            window.math_action('key',key='ArrowRight')
+            self.assertTrue(any(stop[4] for stop in window.math_canvas.box.stops))
+            self.assertTrue(any(n.get('_active') for n in window.view_nodes(window.math_state['view']) if n['kind']=='style'))
+            window.math_action('input',text='z')
+            self.assertTrue(window.source.endswith('$styled(z a)$'))
+
+    def test_failed_raw_macro_enters_source_and_can_be_repaired(self):
+        self.load('$unknownfn(a)$');window=self.window
+        formula=window.analysis['formulas'][0]
+        node=next(n for n in window.view_nodes(formula['view']) if n['kind']=='raw_macro')
+        window.typesetter.cache[raw_key(node)]=False;window.typesetter.touch()
+        self.assertTrue(any(op[0]=='failed' for op in window.editor.handler.box(formula).operations))
+        window.activate(0);window.math_action('key',key='ArrowRight')
+        self.assertTrue(window.math_state['pending']);self.assertEqual(window.math_state['command']['draft'],'unknownfn(a)')
+        window.math_action('key',key='Escape')
+        self.assertTrue(any(n['kind']=='raw_macro' for n in window.view_nodes(window.math_state['view'])))
+        window.math_action('key',key='ArrowLeft')
+        window.math_action('key',key='a',ctrl=True);window.math_action('input',text='sqrt(3)')
+        window.math_action('key',key='Enter');window.finish_formula()
+        self.assertEqual(window.source,'$sqrt(3)$')
+
+    def test_style_failure_is_cached_and_reply_only_relayouts_its_readers(self):
+        window=self.window;asked=[]
+        def request(route,body,callback,key=None):
+            if route=='/api/glyphs':asked.append((body,callback))
+        with patch.object(window.services,'request',side_effect=request):
+            self.load('$bold(x)$ between $frac(a,b)$')
+            unrelated=window.analysis['formulas'][1];box=window.editor.handler.box(unrelated)
+            asked[0][1](None,'cannot resolve glyphs')
+            self.assertIs(window.typesetter.glyphs[('', 'bold(x)',False)],False)
+            self.assertIs(window.editor.handler.box(unrelated),box)
+            window.load_glyphs();window.replace(len(window.source),len(window.source),'!')
+            self.assertEqual(len(asked),1)
+            style=window.analysis['formulas'][0]
+            self.assertTrue(any(op[0]=='failed' for op in window.editor.handler.box(style).operations))
+            window.refresh_svg();self.assertEqual(len(asked),2)
+            asked[-1][1]({'glyphs':''},None)
+            window.load_glyphs();self.assertEqual(len(asked),2)
+            self.assertFalse(any(op[0]=='failed' for op in window.editor.handler.box(style).operations))
+
+    def test_unicode_diagnostics_reach_static_and_active_calls_and_clear(self):
+        source='中文😀\n第二行 $unknownfn(a)$';self.load(source);window=self.window
+        formula=window.analysis['formulas'][0];window.activate(formula['start'])
+        line=source.splitlines()[1];a=line.index('unknownfn');b=a+len('unknownfn')
+        diagnostic={'range':{'start':{'line':1,'character':u16(line[:a])},'end':{'line':1,'character':u16(line[:b])}},'message':'unknown variable','severity':1}
+        window.mark_diagnostics([diagnostic])
+        for view in (formula['view'],window.math_state['view']):
+            node=next(n for n in window.view_nodes(view) if n['kind']=='raw_macro')
+            self.assertEqual(node['error'],'unknown variable')
+        window.math_action('key',key='ArrowRight');self.assertTrue(window.math_state['pending']);self.assertEqual(window.math_state['command']['draft'],'unknownfn(a)')
+        window.math_action('key',key='Escape');window.mark_diagnostics([])
+        self.assertTrue(all(not n.get('error') for n in window.view_nodes(window.math_state['view'])))
+        window.mark_diagnostics([dict(diagnostic,severity=2)])
+        self.assertTrue(all(not n.get('error') for n in window.view_nodes(window.math_state['view'])))
+
+    def test_active_raw_macro_fetches_inner_fragment_without_overlap(self):
+        self.load('$bold(arrow.r)$');window=self.window;calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request):
+            window.load_raw();window.activate(0);window.math_action('key',key='ArrowRight')
+            calls.clear();window.load_raw()
+        ranges=[r for body in calls if 'raw' in body for r in body['raw']]
+        self.assertEqual([window.source.encode()[r['start']:r['end']].decode() for r in ranges],['arrow.r'])
+        self.assertTrue(any(op[0]=='svg' for op in window.math_canvas.box.operations))
+
+    def test_template_call_images_are_distinct_through_real_frontend_service(self):
+        self.load('#let wrap(x) = $bold(#x/2)$\n$wrap(a) + wrap(b b b b)$');window=self.window
+        requests=[];original=window.services.request
+        def observed(route,body,callback,key=None):
+            if route=='/api/render':requests.append(body)
+            return original(route,body,callback,key)
+        with patch.object(window.services,'request',side_effect=observed):window.load_raw()
+        loop=QEventLoop();timer=QTimer();timer.timeout.connect(lambda:loop.quit() if not window.raw_pending else None)
+        limit=QTimer();limit.setSingleShot(True);limit.timeout.connect(loop.quit)
+        timer.start(10);limit.start(15000);loop.exec_();timer.stop();limit.stop()
+        self.assertFalse(window.raw_pending)
+        formula=window.analysis['formulas'][-1]
+        calls=[n for n in window.view_nodes(formula['view']) if n['kind']=='raw_macro']
+        items=[window.typesetter.raw(n) for n in calls]
+        self.assertTrue(all(isinstance(item,dict) for item in items),items)
+        self.assertGreater(items[1]['width'],items[0]['width'])
+        self.assertEqual(len(requests[0]['raw']),2)
+        self.assertNotEqual(raw_key(calls[0]),raw_key(calls[1]))
+        identities=[raw_key(n) for n in calls]
+        with patch.object(window.services,'request',side_effect=observed):
+            window.replace(0,0,'中文😀\n\n');window.load_raw()
+        moved=[n for n in window.view_nodes(window.analysis['formulas'][-1]['view']) if n['kind']=='raw_macro']
+        self.assertEqual([raw_key(n) for n in moved],identities)
+        self.assertEqual(len(requests),1,'移动公式只更新请求坐标，不丢弃已渲染的实例')
+
     def test_native_objects_copy_and_edit_undo(self):
         self.load("中文😀 $ a/b $ 末尾")
         window=self.window;editor=window.editor

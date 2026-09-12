@@ -200,7 +200,11 @@ pub struct RenderRequest { #[serde(default)] pub preview: bool, #[serde(default)
     /// after the outermost node that holds them.
     #[serde(default)] pub context_end: Option<usize> }
 #[derive(Deserialize, Serialize)]
-pub struct RawRange { pub id: String, pub start: usize, pub end: usize }
+pub struct RawRange {
+    pub id: String, pub start: usize, pub end: usize,
+    #[serde(default,skip_serializing_if="Option::is_none")] pub call: Option<[usize;2]>,
+    #[serde(default)] pub occurrence: usize,
+}
 
 /// Cut the source after the top-level node the fragments were asked for.
 ///

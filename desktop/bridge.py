@@ -20,6 +20,7 @@ def process(parent, arguments, workspace=None):
     environment = QProcessEnvironment.systemEnvironment()
     adapter=ROOT/"target/adapter/release/typformula-layout.exe"
     if not adapter.is_file():adapter=ROOT/"target/adapter/debug/typformula-layout.exe"
+    adapter=Path(os.environ.get("TYPFORMULA_ADAPTER",adapter))
     environment.insert("TYPFORMULA_ADAPTER", str(adapter))
     child = QProcess(parent)
     child.setProcessEnvironment(environment)

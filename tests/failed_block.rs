@@ -12,6 +12,21 @@ fn load()->Editor{let mut e=Editor::default();e.apply(Action::Import{source:"und
 fn status(e:&mut Editor,failed:bool){e.apply(Action::PreviewResult{source:"undefinedname".into(),definitions:e.definitions.clone(),display:e.display,failed}).unwrap();}
 
 #[test]
+fn failed_calls_open_source_and_cancel_restores_their_structure() {
+    for source in ["undefinedfn(a)","bold(a)"] {
+        let mut e=Editor::default();e.apply(Action::Import{source:source.into()}).unwrap();
+        let root=e.root.clone();
+        e.apply(Action::PreviewResult{source:source.into(),definitions:e.definitions.clone(),display:e.display,failed:true}).unwrap();
+        key(&mut e,"ArrowRight");assert_eq!(e.pending(),Some(source));
+        key(&mut e,"Escape");assert_eq!(e.root,root);
+        key(&mut e,"ArrowLeft");assert_eq!(e.pending(),Some(source));
+        e.apply(Action::Key{key:"a".into(),ctrl:true,shift:false}).unwrap();
+        e.apply(Action::Input{text:"sqrt(3)".into()}).unwrap();key(&mut e,"Enter");
+        assert_eq!(typst::write_cell(&e.root),"sqrt(3)");
+    }
+}
+
+#[test]
 fn failed_block_enters_from_either_side_at_the_corresponding_caret() {
     let mut e=load();status(&mut e,true);key(&mut e,"ArrowRight");
     assert_eq!(e.pending(),Some("undefinedname"));
