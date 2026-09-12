@@ -122,8 +122,10 @@ class Editor(QTextEdit):
         self.decorate_incremental(source,selection,scroll,schedule_raw,reparsed)
 
     def install_objects(self,force=False,dirty=None):
-        # The projections below replace the views, so no memoized box survives.
-        self.owner.typesetter.touch()
+        # Unchanged formulas retain their Views and boxes even if the surrounding
+        # paragraph was reparsed. Only discard entries whose Views are no longer live.
+        live={id(f['view']) for f in self.mapping.objects.values() if 'view' in f}
+        self.handler.boxes={key:value for key,value in self.handler.boxes.items() if key in live}
         self.object_data={};self.object_by_id={}
         for index,formula in self.mapping.objects.items():
             position=u16(self.mapping.text[:index]);identifier=formula['_object_id']

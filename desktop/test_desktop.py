@@ -529,7 +529,8 @@ class NativeTest(unittest.TestCase):
         one for a body that has a glyph run (`has_glyph_run`) — a body that has none is
         drawn as the call instead, which `test_a_variant_without_a_glyph_run_*` pins.
         """
-        self.load('$bold(A)$');window=self.window
+        window=self.window;calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request):self.load('$bold(A)$')
         style=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n['kind']=='style')
         self.assertEqual(style['style_name'],'bold')
         self.assertEqual(style['text'],'bold(A)','分析里带的是要问引擎的拼写')
@@ -567,9 +568,9 @@ class NativeTest(unittest.TestCase):
         `/api/glyphs` as a plain `A` — u pright is the answer — and the mapping put the
         italic one back. `bold(A)` hid the bug because `𝐀` is not ASCII.
         """
-        self.load('$upright(A) + bold(A)$');window=self.window
-        calls,request=self.fake_render()
+        window=self.window;calls,request=self.fake_render()
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
+            self.load('$upright(A) + bold(A)$')
             window.load_glyphs();window.load_raw()
         box=window.editor.handler.box(window.analysis['formulas'][0])
         drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
@@ -1119,6 +1120,96 @@ class NativeTest(unittest.TestCase):
         self.assertLessEqual(projected,4,f'{projected} of 80 formulas were rebuilt')
         from .rawcache import signature
         self.assertEqual(signature(window.analysis['formulas'][-1]['view']),signature(before[-1]))
+
+    def test_prose_edits_reuse_nearby_formula_views_and_boxes(self):
+        window=self.window;calls,request=self.fake_render()
+        with patch.object(window.services,'request',side_effect=request):
+            self.load('Before $bold(x)$ between $frac(a, b)$ after')
+            views=[f['view'] for f in window.analysis['formulas']]
+            boxes=[window.editor.handler.box(f) for f in window.analysis['formulas']]
+            calls.clear()
+            with patch.object(window.core,'call',wraps=window.core.call) as core:
+                window.replace(0,6,'中文😀 ')
+                window.replace(len(window.source),len(window.source),'!')
+            self.assertFalse([c for c in core.call_args_list if c.args[0] in ('analyze','analyze_formula')])
+            self.assertFalse([b for b in calls if 'expression' in b])
+            for formula,view,box in zip(window.analysis['formulas'],views,boxes):
+                self.assertIs(formula['view'],view)
+                self.assertIs(window.editor.handler.box(formula),box)
+            window.activate(window.analysis['formulas'][0]['start'])
+            window.finish_formula()
+            self.assertIs(window.editor.handler.box(window.analysis['formulas'][0]),boxes[0])
+
+    def test_only_changed_formula_is_analyzed_in_shared_paragraph(self):
+        self.load('Before $a$ between $b$ after');window=self.window
+        second=window.analysis['formulas'][1]['view']
+        at=window.source.index('$a$')+1
+        with patch.object(window.core,'call',wraps=window.core.call) as calls:
+            window.replace(at,at+1,'z')
+        targets=[c.kwargs['start'] for c in calls.call_args_list if c.args[0]=='analyze_formula']
+        self.assertEqual(targets,[window.analysis['formulas'][0]['start']])
+        self.assertIs(window.analysis['formulas'][1]['view'],second)
+        self.assertIn('z',[n.get('text') for n in window.view_nodes(window.analysis['formulas'][0]['view'])])
+
+    def test_reused_raw_view_source_ranges_follow_unicode_prose_edits(self):
+        self.load('Before $unknownfn(a)$ after');window=self.window
+        with patch.object(window.core,'call',wraps=window.core.call) as calls:
+            window.replace(0,0,'中文😀 ')
+        self.assertFalse([c for c in calls.call_args_list if c.args[0]=='analyze_formula'])
+        formula=window.analysis['formulas'][0]
+        node=next(n for n in window.view_nodes(formula['view']) if n['kind']=='raw_macro')
+        a,b=map(int,node['render_id'].split(':')[:2])
+        self.assertEqual(window.source.encode()[a:b].decode(),'unknownfn(a)')
+        self.assertIn({'id':f'{a}:{b}','start':a,'end':b},formula['render']['raw'])
+
+    def test_scope_delimiter_edits_refresh_cached_macro_bindings(self):
+        self.load('#[#let foo(x) = $#x+1$]\n$foo(a)$');window=self.window
+        at=window.source.index(']')
+        for replacement,kind in (('', 'macro'),(']', 'raw_macro')):
+            window.replace(at,at+(not replacement),replacement)
+            formula=window.analysis['formulas'][-1]
+            kinds=[n['kind'] for n in window.view_nodes(formula['view'])]
+            self.assertIn(kind,kinds)
+            fresh=window.core.call('analyze_formula',start=formula['start'])
+            self.assertEqual(signature(formula['view']),signature(fresh['view']))
+
+    def test_styles_share_empty_context_cache_and_pending_requests(self):
+        window=self.window;asked=[]
+        def request(route,body,callback,key=None):
+            if route=='/api/glyphs':asked.append((body,callback))
+        with patch.object(window.services,'request',side_effect=request):
+            self.load('#let value = 1\nBefore $bold(x)$ between $bold(x)$')
+            window.load_glyphs();window.load_glyphs()
+            self.assertEqual(len(asked),1)
+            self.assertEqual(asked[0][0]['definitions'],'')
+            window.replace(window.source.index('Before'),window.source.index('Before')+6,'正文 ')
+            self.assertEqual(len(asked),1,'正文变化不能重复发送在途字形请求')
+            asked[0][1]({'glyphs':'\U0001D499'},None)
+            at=window.source.index('1');window.replace(at,at+1,'2')
+            self.assertEqual(len(asked),1,'宏定义变化不清空无定义上下文的字形缓存')
+            for formula in window.analysis['formulas']:
+                if 'view' not in formula:continue
+                window.stamp_formula(formula)
+                for node in window.view_nodes(formula['view']):
+                    if node['kind']=='style':self.assertEqual(node['_glyph'],'\U0001D499')
+            window.activate(window.analysis['formulas'][-1]['start'])
+            style=next(n for n in window.view_nodes(window.math_state['view']) if n['kind']=='style')
+            self.assertEqual(style['_glyph'],'\U0001D499')
+
+    def test_style_request_ignores_broken_and_unclosed_document_prefixes(self):
+        window=self.window
+        for source in ('$unknownfn(a)$\n$bold(x)$','#block[$bold(x)$]'):
+            asked=[];window.typesetter.glyphs.clear();window.glyph_pending.clear()
+            def request(route,body,callback,key=None):
+                if route=='/api/glyphs':asked.append((body,callback))
+            with patch.object(window.services,'request',side_effect=request):self.load(source)
+            self.assertEqual(len(asked),1)
+            body,callback=asked[0];self.assertEqual(body['definitions'],'')
+            result=self.service('/api/glyphs',body)
+            self.assertEqual(result['glyphs'],'\U0001D499')
+            callback(result,None)
+            formula=window.analysis['formulas'][-1]
+            self.assertIn('\U0001D499',[op[3][0] for op in window.editor.handler.box(formula).operations if op[0]=='text'])
 
     def test_incremental_edit_preserves_distant_qt_text_blocks_and_formula_ids(self):
         from PyQt5.QtGui import QTextBlockUserData

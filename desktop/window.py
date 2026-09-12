@@ -56,7 +56,7 @@ class Window(QMainWindow):
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
         self.definition_draft=None
         self.settings=load_settings();self.typesetter=Typesetter(self.settings);self.typesetter.warn=self.report
-        self.raw_cache=RawCache();self.raw_pending=set()
+        self.raw_cache=RawCache();self.raw_pending=set();self.glyph_pending={}
         # (analysis, {render_id prefix -> digest of the script shape}) for the fragments
         # whose box follows the script they sit in, rebuilt when the analysis is replaced.
         # See `context_index` for why only those fragments are in it.
@@ -181,7 +181,7 @@ class Window(QMainWindow):
         else:text="";self.newline="\n"
         self.stop_preview()
         self.path=path;self.source=text;self.saved=text;self.history=[];self.future=[];self.semantic_spans=[];self.engine_spans=[]
-        self.typesetter.cache.clear();self.typesetter.svg.clear();self.typesetter.placements.clear();self.typesetter.glyphs.clear();self.ensure_services()
+        self.typesetter.cache.clear();self.typesetter.svg.clear();self.typesetter.placements.clear();self.typesetter.glyphs.clear();self.glyph_pending.clear();self.ensure_services()
         self.core.call("set_source",source=text)
         self.analysis=self.core.call("analyze");self.bind_formula_ids({},self.analysis);self.raw_cache.edits.clear();self.load_glyphs();self.raw_cache.rebind({},self.analysis);self.raw_pending.clear();self.revision+=1
         for editor in self.editors:editor.expanded.clear()
@@ -338,8 +338,8 @@ class Window(QMainWindow):
             # A confirmed definition edit changes even an identically spelled
             # macro call's image. Plain prose edits keep these caches intact.
             self.typesetter.cache.clear();self.typesetter.svg.clear()
-            self.typesetter.placements.clear();self.typesetter.glyphs.clear();self.typesetter.touch()
-        candidate,rebuild=incremental_merge(self.analysis,syntax,self.source,byte_start,byte_end,replacement,reparsed)
+            self.typesetter.placements.clear();self.typesetter.touch()
+        candidate,rebuild=incremental_merge(self.analysis,syntax,self.source,byte_start,byte_end,replacement,reparsed,old_source=old_source)
         for target in rebuild:
             formula=self.core.call("analyze_formula",start=target)
             if formula is None:
@@ -606,25 +606,29 @@ class Window(QMainWindow):
 
         The kernel cannot produce them (Typst substitutes codepoints through a table
         outside its reach), so the analysis carries the **spellings to ask about** and this
-        turns them into answers. Cached across edits by the key `stamp_draw` looks up --
-        the spelling together with the definitions in force and the display mode, because a
-        variant's glyphs depend on all three and on nothing else.
+        turns them into answers. Font variants are evaluated with empty definitions;
+        both page and active formula reuse the spelling/display cache across prose
+        and macro-definition edits.
         """
         want={}
         for formula in self.analysis.get("formulas",[]):
             if formula.get("editable") is False or "view" not in formula: continue
-            definitions=self.source[:from_byte(self.source,formula['start'])]
             display=bool(formula.get("display"))
             for text in Window.glyph_expressions([formula]):
-                want[(definitions,text,display)]=text
+                want[("",text,display)]=text
         for key,text in want.items():
             # Only a **real answer** counts as cached. A `None` means "asked, nothing came
             # back" — a service that was not up yet, a core that restarted — and treating it
             # as cached would leave that variant blank for the rest of the session.
-            if self.typesetter.glyphs.get(key) is not None: continue
+            if self.typesetter.glyphs.get(key) is not None or key in self.glyph_pending: continue
             definitions,_,display=key
+            token=object();self.glyph_pending[key]=token
             self.typesetter.glyphs[key]=None
-            def arrived(value,error,key=key):
+            def arrived(value,error,key=key,token=token):
+                # A document switch may start the same expression again. Its old
+                # reply must not replace the new request's cache or trigger a repaint.
+                if self.glyph_pending.get(key) is not token:return
+                del self.glyph_pending[key]
                 # A failure clears the entry so the next analysis asks again; recording an
                 # empty answer would draw a blank where a variant should be.
                 self.typesetter.glyphs.pop(key,None) if error else self.typesetter.glyphs.__setitem__(key,(value or {}).get("glyphs",""))
@@ -658,15 +662,18 @@ class Window(QMainWindow):
         is a rule with more than one place to get wrong. Reading the caches at layout time is
         what leaves the answer callback with nothing to do but repaint.
         """
-        attachments=[]
+        attachments=[];changed=False
         for node in self.view_nodes(view):
             if node.get("kind")=="style":
-                # A missing answer is written rather than skipped: changing the definitions
-                # changes the key, and the previous variant's glyphs must not survive that.
-                node["_glyph"]=self.typesetter.glyphs.get((definitions,node.get("text",""),display))
+                glyph=self.typesetter.glyphs.get(("",node.get("text",""),display))
+                changed=changed or node.get("_glyph")!=glyph
+                node["_glyph"]=glyph
             if node.get("attachment"):
-                node["_placement"]=self.typesetter.placements.get((definitions,node["attachment"],display),{})
+                placement=self.typesetter.placements.get((definitions,node["attachment"],display),{})
+                changed=changed or node.get("_placement",{})!=placement
+                node["_placement"]=placement
                 attachments.append((definitions,node["attachment"],display))
+        if changed:view['_draw_revision']=view.get('_draw_revision',0)+1
         return attachments
 
     def prepare_view(self,view,definitions,display):

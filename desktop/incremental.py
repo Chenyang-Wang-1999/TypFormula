@@ -59,13 +59,24 @@ def _shift_formula(formula,start,end,delta,new_source):
         if view is not formula['view']:result={**result,'view':view}
     return result
 
-def merge(previous,syntax,new_source,start,end,replacement,reparsed):
+def merge(previous,syntax,new_source,start,end,replacement,reparsed,old_source=None):
     """Return a merged analysis and the formula starts that need projection."""
     delta=len(replacement.encode('utf-8'))-(end-start)
-    shifted=[]
+    shifted=[];unchanged=set()
+    before=old_source.encode('utf-8') if old_source is not None else None
+    after=new_source.encode('utf-8')
+    # Delimiters outside a formula may move a binding into or out of its lexical
+    # scope without changing the binding's text. Keep Typst's reparse invalidation
+    # for these structural edits; ordinary prose still reuses the cached View.
+    inside_formula=any(f['start']<start and end<f['end'] for f in previous.get('formulas',[]))
+    context_changed=before is not None and not inside_formula and any(
+        c in before[start:end]+replacement.encode('utf-8') for c in b'#[]{}')
     for old in previous.get('formulas',[]):
         formula=_shift_formula(old,start,end,delta,new_source)
-        if formula is not None:shifted.append(formula)
+        if formula is not None:
+            shifted.append(formula)
+            if before is not None and before[old['start']:old['end']]==after[formula['start']:formula['end']]:
+                unchanged.add((formula['start'],formula['end']))
     by_range={(item['start'],item['end']):item for item in shifted}
     # A reparse can include a neighbouring unchanged let. Only changed binding
     # text/ranges invalidate its dependents; moving the same block is not an edit.
@@ -81,7 +92,10 @@ def merge(previous,syntax,new_source,start,end,replacement,reparsed):
     for base in syntax.get('formulas',[]):
         cached=by_range.get((base['start'],base['end']))
         overlaps=base['start']<reparsed['end'] and reparsed['start']<base['end']
-        invalid=overlaps or (invalidate_after is not None and base['start']>=invalidate_after)
+        # Typst may reparse a whole surrounding paragraph. A formula in that
+        # paragraph still owns the same View when its actual source is unchanged.
+        content_changed=(base['start'],base['end']) not in unchanged if before is not None else overlaps
+        invalid=content_changed or (context_changed and overlaps) or (invalidate_after is not None and base['start']>=invalidate_after)
         if cached and not invalid and cached.get('display')==base.get('display'):
             formulas.append(cached)
         else:

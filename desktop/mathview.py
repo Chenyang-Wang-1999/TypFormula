@@ -128,7 +128,7 @@ class Typesetter:
         self.cache = cache if cache is not None else {}
         self.svg = BitmapCache()
         self.placements = {}
-        # Substituted glyphs per `(definitions, call spelling, display)`, filled from
+        # Substituted glyphs per `('', call spelling, display)`, filled from
         # `/api/glyphs`. A `None` value marks "asked, answer not here yet": the window
         # stamps that as a missing `_glyph`, and the drawing falls back to the call.
         self.glyphs = {}
@@ -666,10 +666,10 @@ class FormulaObject(QObject,QTextObjectInterface):
         if signature!=self.signature:self.boxes.clear();self.signature=signature
         view=formula["view"]
         entry=self.boxes.get(id(view))
-        if entry is not None and entry[0] is view:return entry[1]
+        if entry is not None and entry[0] is view and entry[2]==view.get('_draw_revision',0):return entry[1]
         self.editor.owner.stamp_formula(formula)
         box=typesetter.layout(view)
-        self.boxes[id(view)]=(view,box)
+        self.boxes[id(view)]=(view,box,view.get('_draw_revision',0))
         return box
 
     def intrinsicSize(self, document, position, format):

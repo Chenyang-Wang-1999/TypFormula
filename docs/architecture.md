@@ -4,7 +4,7 @@
 
 `desktop/` 是 Qt Widgets / PyQt5 原生前端，通过 `--desktop-core` 管道使用 Rust Document，通过独立 `--stdio` 管道使用编译/包服务与 Tinymist。没有 WebView、HTTP 端口或 WASM；两个后端进程都是窗口自己启动的私有管道。完整源码及文档撤销由窗口持有，QTextDocument 只是带自定义公式对象的投影；位置映射显式转换 Python Unicode、Rust UTF-8 和 Qt/LSP UTF-16。一个窗口只保留一个活动公式会话和绘图控件，分栏共享源码。
 
-Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`，使用 Typst 增量解析器返回的实际重解析范围；桌面公式索引只扫描更新后的轻量语法节点，平移范围外已有投影，只为重解析范围相交的新建/改变公式构造 View。`let` 变化会使其后的宏投影失效。合并时只重建真正移动的节点：编辑点之前的公式与未移动的子树与上一份投影共享，因此每次按键不再深拷贝全部公式。载入文件和 `analyze_formula` 不可用时的回退仍走一次全量 `analyze`，即完整投影；上面描述的增量只覆盖编辑路径。此策略沿用 Typst 保持远处 span 稳定的增量解析边界，而不是按输入字符猜测影响范围。参见 [Typst 编译器架构](https://github.com/typst/typst/blob/main/docs/dev/architecture.md) 与 [comemo](https://github.com/typst/comemo)。
+Rust Document 常驻 `typst_syntax::Source`。源码编辑调用 `Source::edit`，使用 Typst 增量解析器返回的实际重解析范围；桌面公式索引只扫描更新后的轻量语法节点，平移范围外已有投影，逐公式比较编辑前后的源码，只为新建、内容改变或宏定义变化影响到的公式构造 View；普通正文重解析覆盖到未改动的公式不再触发 analyze_formula。公式外的 #、方括号和花括号变更可能改变绑定作用域，保守保留重解析范围内的投影失效。`let` 变化会使其后的宏投影失效。合并时只重建真正移动的节点：编辑点之前的公式与未移动的子树与上一份投影共享，因此每次按键不再深拷贝全部公式。载入文件和 `analyze_formula` 不可用时的回退仍走一次全量 `analyze`，即完整投影；上面描述的增量只覆盖编辑路径。此策略沿用 Typst 保持远处 span 稳定的增量解析边界，而不是按输入字符猜测影响范围。参见 [Typst 编译器架构](https://github.com/typst/typst/blob/main/docs/dev/architecture.md) 与 [comemo](https://github.com/typst/comemo)。
 
 窗口与后端的连接由 `desktop/bridge.py` 管理：`Core` 持有一个文档与一个活动公式会话，按动作给等待预算（`set_source`/`analyze` 这类要整篇解析的请求另计），核心退出或超时后重启、按镜像到的源码重放 `set_source` 并恢复当时打开的公式会话，再重试该请求一次；`Services` 持有 `--stdio` 通道，子进程退出后由下一次请求重启。两条通道的失败信息都带动作名、退出码与后端 stderr 尾部。细节见 [desktop.md](desktop.md)。
 
@@ -34,7 +34,7 @@ F5 通过原生 `typst-pdf` 编译当前内存源码并交给系统默认阅读�
 
 ## 状态所有权
 
-文档内相邻的 `#let` 由 `desktop/definitions.py` 合成紧凑折叠块，投影仅替换显示，复制仍返回完整源码。展开后由块内文本框持有未提交草稿，Enter 确认时作为一次文档替换写回，Shift+Enter 换行，Esc 取消；草稿输入不调用后端。增量扫描携带每个 let 的原文，普通正文编辑只移动区间，不因重解析范围覆盖到未改动的 let 就使其后全部宏视图失效。定义内容发生变化时清空派生渲染缓存，撤销同样处理。
+文档内相邻的 `#let` 由 `desktop/definitions.py` 合成紧凑折叠块，投影仅替换显示，复制仍返回完整源码。展开后由块内文本框持有未提交草稿，Enter 确认时作为一次文档替换写回，Shift+Enter 换行，Esc 取消；草稿输入不调用后端。增量扫描携带每个 let 的原文，普通正文编辑只移动区间，不因重解析范围覆盖到未改动的 let 就使其后全部宏视图失效。定义内容发生变化时清空图片与附件缓存，撤销同样处理；style 字形使用空定义上下文，其缓存仍可复用。
 
 矩阵的短行补空块至齐行，补出的格子参与显示、导航和回写。进入公式本身仍不改写原始拼写；首次结构编辑后写出完整矩形。普通 `&` 对齐公式仍保留各行原来的列数。
 
@@ -252,7 +252,7 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 所以这不是"把 `codex/src/styling.rs` 那张表转写进 Python"还是"先不做"的选择，而是**不要在前端复述那张表**：`to_style` 的输出早已在数学 IR 里（`resolve.rs:309-317` 把 `styled_text` 交给 `TextItem::create`），适配器只是把它**读回来**——`/api/glyphs` 带 `glyphs:true` 编译这段拼写，递归取 `Glyph`/`Text`/`Number` 的 `text`。前端因此不依赖 codex，"表抄错了就画错"这个风险不存在：编辑器画的字形与引擎排的字形是同一份数据。
 
-键是 `(definitions, 调用拼写, display)`，**按层**各问一次：`bold(upright(a))` 的引擎结果是 `𝐚`，但 `upright(a)` 这一层自己的字形是 `a`，光标进去要看到的正是后者。
+style 请求的 `definitions` 固定为空，键是 `("", 调用拼写, display)`，不携带文档正文或宏定义前缀。同一表达式在不同公式、正文修改前后共享字形缓存；在途请求也按同一键去重，切换文档后的旧回包会丢弃。**按层**各问一次：`bold(upright(a))` 的引擎结果是 `𝐚`，但 `upright(a)` 这一层自己的字形是 `a`，光标进去要看到的正是后者。
 
 内核只在主体**真的有字形串**时才建 `Style` 节点（`has_glyph_run`：`Char`/`Symbol`/`Number`/`Text`，以及形状是 `style` 的嵌套调用；`Raw`、分数、重音都不算）。`bold(frac(a, b))`、`bold(hat(a))`、`upright(a/b)` 因此走 `raw_macro` 那条老路（一张图，光标进入画名字与参数槽），不需要字形，也就不存在"取不到字"的状态。
 
