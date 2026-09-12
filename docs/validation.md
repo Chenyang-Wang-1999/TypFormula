@@ -1923,6 +1923,92 @@ $ root(3, x + 1) $
 | `python tools/kind_inventory.py` | 退出码 0，两个方向都对齐 |
 | root 的线上视图与绘制 | role 顺序 `index`→`radicand`，页面画出 `x + 1` 与 `3`（真二进制 + 真前端实测） |
 
+## 清理不必要的 Kind：五个描述符变体出栈 · 2026-09-12
+
+### 删掉了什么
+
+| 删掉 | 类型 | 为什么它已经不需要存在 |
+| --- | --- | --- |
+| `Sqrt` / `Root` / `Accent` / `Line` / `Style` | `Kind` 变体 | **从来没有任何源码能把它们存进树**（`tests/stored_kinds.rs` 一直在守这条）。它们唯一的作用是给 `configured_kind` 一个可以借的载体 |
+| `configured_kind` | 函数 | 它的"取图数据"搬进了 `config/commands.json` |
+| `Write::Positioned` | 枚举变体 | 只有 `Line` 声明它，而 `Line` 没了 |
+| `Horiz::Pair` | 枚举变体 | 上一轮让 root 按书写顺序存之后，它与 `Linear` 完全等价 |
+| `placeholder_indices` | 函数 | 两个调用者都没了：`fill_command_cells` 改问 `Shape::slots`，解析期的 `args.swap` 上一轮删掉 |
+| `fill_template` 的 `{name}` 分支 | 代码 | `Write::Template` 只剩 `frac({0}, {1})`，没有名字可替换 |
+
+`Kind` 现在只剩**会被存进树的变体**（14 个 = 12 个进树 + `Parameter`/`TemplateCall` 这两个模板专用），"这个变体会不会被存"不再是一个需要回答的问题。
+
+### 五个描述符携带的东西去了哪
+
+这是本轮的关键：删得掉是因为**每一样都已经有别的地方放了**。
+
+| 原来由描述符携带 | 现在在哪 |
+| --- | --- |
+| 槽位、导航、排布名 | `Shape`（本来就是按形状名取的） |
+| 回写模板 | `Grammar`——而一个调用永远是 `Write::Named`，不需要模板 |
+| 取图数据：`abs` 是哪对定界符、`overline` 在上还是在下 | **`config/commands.json` 的 `text` / `above`** |
+| 记号名（`hat`）、变体名（`bold`） | **就是命令行本身**，所以配置里不用写 |
+
+最后一条值得单说：`hat` 的记号叫 `hat`、`bold` 的变体叫 `bold`，所以那两个字段根本不需要存在——`Draw::Mark` 与 `Draw::Variant` 都不带数据，画的时候直接读调用的名字。
+
+配置因此长这样（不填的字段取默认值）：
+
+```json
+"abs":      { "shape": "delim", "text": "|\n|" },
+"overline": { "shape": "line",  "above": true  },
+"underline":{ "shape": "line",  "above": false },
+"hat": "decoration",
+"bold": "style",
+```
+
+`build.rs` 为这几个字段加了交叉校验，写错形状直接**编译失败**：`text` 只能配 `delim`、`above` 只能配 `line`、`text` 必须是"左\n右"两段且都非空。
+
+### 借形状的入口只剩两个
+
+`view_atom` 原来要先把一个 `Kind` 求出来（`shape.as_ref().unwrap_or(&atom.kind)`）再走那张大表。现在是两条清楚的路：
+
+- `MathAtom::command_shape()` → `Option<Shape>`（拿槽位与导航，并替字体变体把关字形串）
+- `slots::configured_draw(name)` → `Option<Draw>`（拿画法）
+
+新增的 `View::view_configured` 只做一件旧事：把 `Draw` 翻成线上节点。**它的注释里专门写了"线名要写死，不能拿 `Shape::view`"**，因为 `sqrt`/`delim`/`decoration`/`line` 四个形状名与线名不同（都走 `decorated`）。
+
+### 一个我自己写出来又被测出来的缺陷
+
+第一版 `view_configured` 里，我把分派条件写成了 `configured_draw(name)` 有值就画配置形状，**漏掉了 `command_shape()` 那道关**。后果是可观察的：`$bold(frac(a, b))$` 的主体不是字形行，本该退回 `raw_macro` 画成一张图，却建出了一个永远填不上字形的 `style` 节点。
+
+`test_a_variant_without_a_glyph_run_is_drawn_as_the_call` 当场报错：
+
+```
+AssertionError: True is not false : $bold(frac(a, b))$ 的结构化主体不该建样式节点
+```
+
+修法是把关重新放回 `command_shape()`——它才是那个会因"主体不是字形串"而返回 `None` 的查询。这条用例是上一轮为了别的事写的，这次恰好逮住了反向的错误，说明它钉的位置是对的。
+
+### 两条测试的覆盖变化（不是回归）
+
+| 用例 | 变化 |
+| --- | --- |
+| `four_kinds_are_shape_descriptors_that_are_never_stored` | **删掉**——它守的五个变体不存在了，问题本身消失 |
+| `a_named_command_stores_a_call_and_borrows_its_shape` | **新增**，覆盖十个借形状的命令：断言存成 `MacroCall`、借到的形状名、线上排布、`marker`、`style_name` |
+| `the_typst_vocabulary_is_covered_exactly_once` | **改为按形状对账**。`Radical`/`Accent`/`Cancel`/`Line` 现在只由**借来的形状**认领，五个描述符删掉后形状表是唯一认领它们的地方 |
+| `named_roles_exist_…` / `the_schema_covers_exactly_…` | 改为遍历 `every_shape()`：**存进树的 Kind 的形状 + 借来的形状**。只查 Kind 会漏掉 `frac`/`sqrt`/`hat` 的槽位——而它们恰好是借来的那一半 |
+
+词汇表那条测试第一次改完仍然失败，报 `["Fenced", "Fraction", "Glyph", "Radical"]`。原因不是语义而是**列表重复**：`every_shape()` 里 `fraction`/`delim`/`grid` 会各出现两次（一次经由 Kind、一次经由可借形状），重复项被读成了"两个形状共同认领"。加了 `distinct_shapes()` 去重后是 `["Glyph", "Radical"]`，与删除前一致。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --offline --locked` | **137 通过 / 0 失败** |
+| `cargo test … --manifest-path native-adapter/Cargo.toml` | **21 通过** |
+| `python -m unittest desktop.test_desktop` | **87 通过** |
+| `python tools/kind_inventory.py` | 退出码 0，两个方向都对齐 |
+| 死代码扫描 | `cargo clippy --all-targets` 无 `dead_code`/`never used` 警告；`slots.rs` 的常量逐个查过引用 |
+
+改动文件：`config/commands.json`、`crates/core/{build.rs,src/{slots,math,typst,view,cursor}.rs}`、`tests/{stored_kinds,round_trip}.rs`、`docs/{architecture,kind-inventory,rust-for-cpp,validation}.md`。
+
+`docs/rust-for-cpp.md` 里的代码片段早已落后于代码（它举的 `match (name, args.len())` 分发几轮前就删了，`Kind::Decoration` 更是早就拆开），本轮把变体名换成存在的、并在开头加了一段"片段可能跑在前面，以点名的文件为准"的说明——教学文档逐行维护没有收益，但让人照着抄到不存在的类型上是另一回事。
+
 改动文件：`crates/core/src/{slots,math,typst,cursor,view}.rs`、`crates/core/build.rs`、`tests/{caret_navigation,lyx_traces,command_mode,failed_block,round_trip,stored_kinds,structured_input}.rs`、`docs/{architecture,kind-inventory,validation}.md`。
 
 

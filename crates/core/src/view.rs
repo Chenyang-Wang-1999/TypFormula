@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Build the display tree from editable atoms and their cursor positions.
 use crate::{cursor::Editor, math::*, typst};
-use crate::slots::{view::MACRO_COLLAPSED, Role};
+use crate::slots::{self, view::MACRO_COLLAPSED, Role};
 use serde::Serialize;
 
 #[derive(Clone, Serialize)]
@@ -147,16 +147,28 @@ impl Editor {
     }
     fn view_atom(&self, atom: &MathAtom, path: Option<&[CursorSlice]>, pos: usize, occurrence: &str) -> View {
         let child_path = |idx| path.map(|p| { let mut p = p.to_vec(); p.push(CursorSlice { atom: pos, cell: idx }); p });
-        // A configured command call has no shape of its own: the command file says
-        // which shape it draws as, and the call's cells *are* that shape's slots. So
-        // the projection runs on the shape and reads the call's cells — the one place
-        // a `MacroCall` is not drawn as a call.
-        let shape = atom.command_shape();
-        let kind = shape.as_ref().unwrap_or(&atom.kind);
-        // The layout strategy is declared per kind (`slots::Shape::view`); only
+        let shape = atom.shape();
+        // The layout strategy is declared per shape (`slots::Shape::view`); only
         // the fields that a strategy reads are filled in below.
-        let view_kind = kind.shape().view;
-        if shape.is_none() && let Kind::MacroCall { name, function } = &atom.kind {
+        let view_kind = shape.view;
+        if let Kind::MacroCall { name, function } = &atom.kind {
+            // A configured call is drawn from the data its *name* supplies plus the
+            // shape it names — no `Kind` of its own. This is the one place a
+            // `MacroCall` is not drawn as a call.
+            //
+            // The gate is `command_shape`, **not** `configured_draw`: the shape lookup
+            // is what answers `None` for a font variant whose body is not a glyph run,
+            // and that answer is what sends `bold(frac(a, b))` down the `raw_macro` path
+            // below instead of building a `style` node it could never fill.
+            let draw = atom.command_shape().and_then(|_| crate::slots::configured_draw(name));
+            if let Some(draw) = draw {
+                let children = atom.cells.iter().enumerate().map(|(idx, data)| {
+                    let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"));
+                    child.role = shape.role_at(idx).map(Role::name);
+                    child
+                }).collect();
+                return Self::view_configured(atom, name, draw, children, path, pos, occurrence);
+            }
             let registry = typst::macro_registry(&self.definitions);
             let definition = registry.get(name).filter(|d| d.expandable);
             // A call is only bound while its argument count still matches the
@@ -196,13 +208,13 @@ impl Editor {
             return view;
         }
         // Every cell is a slot of this node, and its role comes from the node's
-        // own declaration, so the frontend can place it without counting cells.
+        // own shape, so the frontend can place it without counting cells.
         let children: Vec<_> = atom.cells.iter().enumerate().map(|(idx, data)| {
             let mut child = self.view_cell(data, child_path(idx).as_deref(), &format!("{occurrence}.c{idx}"));
-            child.role = kind.shape().role_at(idx).map(Role::name);
+            child.role = shape.role_at(idx).map(Role::name);
             child
         }).collect();
-        match kind {
+        match &atom.kind {
             Kind::MacroCall { .. } => unreachable!(),
             Kind::TemplateCall { definition } => { let mut view = View::new(view_kind, "", children); view.columns = *definition; view }
             Kind::Parameter { index } => { let mut view = View::new(view_kind, "", vec![]); view.columns = *index; view }
@@ -239,8 +251,6 @@ impl Editor {
                 View::new(view_kind, "", parts)
             }
             Kind::Fraction => { let mut v = View::new("fraction", "", children); v.marker = Some("-".into()); v }
-            Kind::Sqrt => View::decorated("radical", "", children),
-            Kind::Root => { let mut v = View::new("root", "", children); v.marker = Some("radical".into()); v }
             Kind::Scripts => {
                 let mut slots = vec![children[0].clone_view()];
                 for up in [true, false] {
@@ -267,25 +277,6 @@ impl Editor {
             // frontend has always read them); `marker` says only *which* decoration
             // this is, so the frontend dispatches on one name instead of on the shape.
             Kind::Fenced { left, right } => View::decorated("delim", format!("{left}\n{right}"), children),
-            Kind::Accent { name } => View::decorated(name.clone(), "", children),
-            // `LineItem` stores the position and nothing else, so the marker is the
-            // position spelled the way the frontend draws it.
-            Kind::Line { above } => View::decorated(if *above { "overline" } else { "underline" }, "", children),
-            // A font variant. `style_name` is the command that made it, and `text` is the
-            // **call's spelling** (`bold(upright(a))`) — the expression whose substituted
-            // glyphs are wanted, so nothing has to be reassembled from the children. The
-            // glyphs themselves are not here: the kernel cannot reach the table that
-            // produces them, so the frontend reads them out of its own cache when it lays
-            // the view out, and draws the call itself until it has them.
-            Kind::Style { name } => {
-                let mut v = View::new("style", typst::write_atom(atom), children);
-                v.style_name = Some(name.clone());
-                // The cursor locates this call for the *frontend*, not for `annotate`:
-                // a variant is never drawn from an image, so it holds no source range.
-                // Its children are what an edit of the body goes through.
-                v.edit = path.map(|path| Cursor { slices: path.to_vec(), pos, occurrence: format!("{occurrence}.edit") });
-                v
-            }
             Kind::Table { columns, row_lengths, name } => {
                 let mut v = View::new("table", "", children);
                 v.columns = *columns;
@@ -304,6 +295,50 @@ impl Editor {
                 v.columns = *columns;
                 v.row_lengths = row_lengths.clone();
                 v
+            }
+        }
+    }
+    /// A call drawn by the shape its name declares.
+    ///
+    /// This replaces what used to be five `Kind` variants (`Sqrt`, `Root`, `Accent`,
+    /// `Line`, `Style`) that no source code could ever store: they existed so that a
+    /// configured call had a `Kind` to borrow. The arrangement comes from the shape,
+    /// the mark or the delimiter pair from the config entry, and where the command's
+    /// own name *is* the data (`hat`'s mark, `bold`'s variant) it is read straight off
+    /// the call.
+    ///
+    /// The wire kinds are spelled out rather than taken from `Shape::view`, because
+    /// the two disagree for most of these shapes — `sqrt`, `delim`, `decoration` and
+    /// `line` all travel as `decorated`, told apart by `marker`.
+    fn view_configured(atom: &MathAtom, name: &str, draw: slots::Draw, children: Vec<View>, path: Option<&[CursorSlice]>, pos: usize, occurrence: &str) -> View {
+        match draw {
+            slots::Draw::Fraction => { let mut view = View::new("fraction", "", children); view.marker = Some("-".into()); view }
+            // A bare hook is a `decorated`; a hook with a degree is its own arrangement,
+            // because the frontend lays the two out differently.
+            slots::Draw::Radical { degree: false } => View::decorated("radical", "", children),
+            slots::Draw::Radical { degree: true } => { let mut view = View::new("root", "", children); view.marker = Some("radical".into()); view }
+            // A delimited pair: the characters stay in `text` (left, newline, right, as
+            // the frontend has always read them); `marker` says only *which* decoration
+            // this is, so the frontend dispatches on one name instead of on the shape.
+            slots::Draw::Delim(text) => View::decorated("delim", text, children),
+            // The mark is the command's own name, which is why the config needs no
+            // field for it: `hat` is drawn with the mark `hat`.
+            slots::Draw::Mark => View::decorated(name, "", children),
+            slots::Draw::Rule { above } => View::decorated(if above { "overline" } else { "underline" }, "", children),
+            slots::Draw::Variant => {
+                // A font variant. `style_name` is the command that made it, and `text` is
+                // the **call's spelling** (`bold(upright(a))`) — the expression whose
+                // substituted glyphs are wanted, so nothing has to be reassembled from the
+                // children. The glyphs themselves are not here: the kernel cannot reach the
+                // table that produces them, so the frontend reads them out of its own cache
+                // when it lays the view out, and draws the call itself until it has them.
+                let mut view = View::new("style", typst::write_atom(atom), children);
+                view.style_name = Some(name.to_string());
+                // The cursor locates this call for the *frontend*, not for `annotate`:
+                // a variant is never drawn from an image, so it holds no source range.
+                // Its children are what an edit of the body goes through.
+                view.edit = path.map(|path| Cursor { slices: path.to_vec(), pos, occurrence: format!("{occurrence}.edit") });
+                view
             }
         }
     }

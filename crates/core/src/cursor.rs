@@ -721,8 +721,9 @@ impl Editor {
                 // met from its right) and a grid (a row is met from its last column).
                 // The radical is asked of the **shape**, because a `root(...)` call is
                 // stored as a `MacroCall` and only the command file says it is a radical
-                // at all — testing `Kind::Root` here silently changed where the caret landed.
-                let radical = owner.command_shape().is_some_and(|descriptor| descriptor.shape().is_radical());
+                // at all — asking the atom's own kind here silently changed where the
+                // caret landed, and there is no `Kind::Root` to test for any more.
+                let radical = owner.command_shape().is_some_and(|shape| shape.is_radical());
                 let root_back = !forward && (radical || matches!(owner.kind, Kind::Table { .. } | Kind::Multiline { .. }));
                 self.cursor.slices.last_mut().unwrap().cell = next; self.cursor.pos = if root_back { self.data().len() } else { 0 };
             } else { self.pop(forward); }

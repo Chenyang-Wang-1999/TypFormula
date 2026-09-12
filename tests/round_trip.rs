@@ -220,7 +220,7 @@ fn accent_atoms_round_trip() {
     //
     // `cancel(x)` *is* here. The engine lays it out as `CancelItem` rather than
     // `AccentItem`, but the editor's model is the same for both — one body with a
-    // mark drawn over it — so it is `Kind::Accent` reached by a name in
+    // mark drawn over it — so it borrows the `decoration` shape by a name in
     // `config/commands.json`. Only where the mark sits differs, which is the
     // frontend's business.
     for source in ["hat(x)", "hat(a + b)", "hat(frac(a, b))", "cancel(x)", "cancel(a + b)"] {

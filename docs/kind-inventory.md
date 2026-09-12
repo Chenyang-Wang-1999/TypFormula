@@ -8,11 +8,11 @@
 - **线上实测** 是从真实 release 后端取回来的，不是读代码推的：`tools/kind_inventory.py` 驱动 `typformula.exe --desktop-core`，按行发 `{"action":…}` JSON，`set_source` → `activate_formula` → 需要时再发 `input`，然后取 `state` 回来的 `view`。每个 Kind 至少一个能真正产生它的源文（宏那几项见下面的"不能从源码到达的两项"）。
 - **引擎** 一栏来自 `vendor/typst/crates/typst-library/src/math/ir/item.rs`，是编译器自己的 item 形状；表里引用的盒子由 `tools/engine_boxes.py` 用真实适配器量出。
 
-`class` 单独说：只有 `Fraction` 与 `Table` 在表里写死为 `7`，`Multiline`/`Sqrt`/其余都是 `0`，而 `Char` 的类是**由字符本身决定**的（`slots::char_class`），表里那一格永远不会被读。
+`class` 单独说：只有 `Fraction` 与 `Table` 在表里写死为 `7`，`Multiline` 与其余都是 `0`，而 `Char` 的类是**由字符本身决定**的（`slots::char_class`），表里那一格永远不会被读。
 
 ## 一、主表
 
-「视图名」这一列是 **`Shape::view`，也就是*形状*名**——它是 `config/commands.json` 写的那个名字，每个 `Kind` 唯一且稳定。**它不一定是线上的名字**：`view_atom` 可以把几个形状合并成一个线 kind，八处形状名与线名不同——`Sqrt`/`Fenced`/`Accent`/`Line` 都走 `decorated`（靠 `marker` 区分画法）：
+「视图名」这一列是 **`Shape::view`，也就是*形状*名**——它是 `config/commands.json` 写的那个名字。**它不一定是线上的名字**：`view_atom` 可以把几个形状合并成一个线 kind，八处形状名与线名不同——`sqrt`/`delim`/`decoration`/`line` 都走 `decorated`（靠 `marker` 区分画法）：
 
 | 形状名（`Shape::view`） | 线名（`view_atom`） |
 | --- | --- |
@@ -22,7 +22,22 @@
 | `aligned` | `multiline` |
 | `macro`（折叠时） | `raw_macro` |
 
-还有一处要连着读：`Sqrt`/`Root`/`Accent`/`Line`/`Style` 这五个**只作为形状描述符存在，不再是树里的节点**。`sqrt(x)`、`hat(x)`、`bold(x)` 这些**调用形式**存成 `MacroCall`（形状由名字查出来），`√x`/`∛x` 也折进同一个 `MacroCall`。`Fraction` **不在这五个之列**——`frac(a, b)` 与语法写法 `a/b` 都真的存 `Kind::Fraction`（判据见 `docs/architecture.md`：一个构造要是自己的 `Kind`，得带着名字与配置都给不出的**实例数据**（`Table.columns`、`Fenced.left/right`、`Multiline.row_lengths`、`Raw.source`……），或者要保住书写形式）。
+**下表的每一行都是一个真的会被存进树的 `Kind`。** 形状比 `Kind` 多：`sqrt`/`root`/`delim`/`line`/`decoration`/`style` 这六个只有 `Shape` 而没有对应的 `Kind`——`sqrt(x)`、`hat(x)`、`bold(x)`、`abs(x)` 这些**调用形式**一律存成 `MacroCall`（形状由名字查出来），`√x`/`∛x` 也折进同一个 `MacroCall`。它们的槽位、导航、排布名与画法分别在 `Shape` 表和 `config/commands.json` 里（取图数据如 `abs` 的定界符对、`overline` 在上还是在下，就写在配置里）。
+
+`Sqrt`/`Root`/`Accent`/`Line`/`Style` 五个变体**曾经留在 `Kind` 里**当"形状描述符"，现已被删除；判据见 `docs/architecture.md`：一个构造要是自己的 `Kind`，得带着名字与配置都给不出的**实例数据**（`Table.columns`、`Fenced.left/right`、`Multiline.row_lengths`、`Raw.source`……），或者要保住书写形式。`Fraction` 与 `Fenced` 都满足这条，所以它们真的被存下来（`frac(a, b)` 与语法写法 `a/b` 都存 `Kind::Fraction`）。
+
+借形状的命令的线上实测，按形状列在这里：
+
+| 命令 | 借的形状 | 线上排布 | marker |
+| --- | --- | --- | --- |
+| `frac` | `fraction` | `fraction` | `-` |
+| `sqrt` | `sqrt` | `decorated` | `radical` |
+| `root` | `root` | `root` | `radical` |
+| `abs` / `norm` | `delim` | `decorated` | `delim` |
+| `hat` / `cancel` | `decoration` | `decorated` | 命令名本身 |
+| `overline` / `underline` | `line` | `decorated` | `overline` / `underline` |
+| `bold` / `upright` | `style` | `style` | 无（用 `style_name`） |
+| `mat` / `vec` / `cases` | `grid` | `table` | 无（见 `Table` 行） |
 
 | `Kind` | 存储字段 | 槽位（role·scale·可空） | 入口（前进 → / 后退 ←） | 左右 | 上下 | 形状名 | 回写 | 线上实测 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -36,15 +51,10 @@
 | `MacroCall` | `name`, `function` | `arg`(100%)，可重复 | 边界（首/末格） | 线性 | 无 | `macro` / `raw_macro` | 具名调用或裸名字 | `text`=宏名 + children 1×模板视图；子节点 `macro-argument` 的 `text`=形参名。折叠时 `text`=**调用本身的拼写**（用来取这一段的图），children=`symbol("名(")`、参数 `cell`、`symbol(")")` |
 | `TemplateCall` | `definition` | `arg`，可重复 | 边界 | 线性 | 无 | `template-call` | 模板专用（写入时 `unreachable!`） | **不上线**（见第五节） |
 | `Fraction` | 无 | `numerator`(90%)、`denominator`(90%) | 分子 / 分母 | **锁定** | 互换，落格首 | `fraction` | `frac({0}, {1})` | children 2×`cell@numerator`/`cell@denominator` |
-| `Sqrt` | 无 | `radicand`(100%) | 边界 | 线性 | 无 | `sqrt` | `sqrt({0})` | 线上是 `decorated`/`marker="radical"` + children 1×`cell@radicand`；`√x` 也走这里（折成 `MacroCall`） |
-| `Root` | 无 | `index`(55%)、`radicand`(100%) | `index` / `radicand` | 线性 | 互换，落格尾 | `root` | `root({0}, {1})` | `root`/`marker="radical"` + children 2×`cell@index`/`cell@radicand`。存储顺序即 `root(index, radicand)` 的书写顺序 |
 | `Scripts` | 无 | `base`(100%)、`upper`(70%,可空)、`lower`(70%,可空) | `base` / `base` | **锁定** | 附件专用 | `script` | 自己拼 `^(…)`/`_(…)` | 线名是 **`scripts`**；**`attachment`**（仅顶层根分支）+ children 3：`cell@base`、`cell@upper`、`cell@lower`；缺席的脚标是 `absent`，**也带同一个 role** |
 | `Fenced` | `left`, `right` | `inner`(100%) | 边界 | 线性 | 无 | `delim` | `abs()`/`norm()`/字面定界符 | 线上是 `decorated`/`marker="delim"`，字符仍在 `text`（`"左\n右"`）+ children 1×`cell@inner` |
 | `Table` | `columns`, `row_lengths`, `name` | `cell`(100%)，可重复 | 中行首/末格 | 列内 | 列运算 | `grid` | `name(…)`：`mat` 行用 `;`，`vec`/`cases` 一个参数一行 | 线名是 **`table`**；`columns` + `row_lengths` + `N×cell@cell`，另带 `border`/`is_mat`（由 `name` 查配置得到） |
 | `Multiline` | `columns`, `row_lengths` | `cell`，可重复 | 边界 | 列内 | 列运算 | `aligned` | 行用 `&`、`\` | 线名是 **`multiline`**；`columns` + `row_lengths` + N×`cell@cell`（`row_lengths` 两个 kind 都会上线，前端据此跳过补齐格） |
-| `Accent` | `name` | `inner`(100%) | 边界 | 线性 | 无 | `decoration` | `{name}({0})` | 线上是 `decorated`，`marker`=命令名，`text` 为空 + children 1×`cell@inner` |
-| `Line` | `above: bool` | `inner`(100%) | 边界 | 线性 | 无 | `line` | `overline({0})` / `underline({0})`（`Write::Positioned`） | 线上是 `decorated`，`marker`=`overline`/`underline`，`text` 为空 + children 1×`cell@inner` |
-| `Style` | `name` | `inner`(100%) | 边界 | 线性 | 无 | `style` | `{name}({0})` | 线名就是 `style`；`style_name`=命令名（`bold`/`upright`），`text`=**整段调用拼写**（`bold(upright(a))`，`/api/glyphs` 按这个拼写取字），`_glyph`=引擎替换后的字形串（前端在**布局那一刻**从缓存盖上去，见 `docs/architecture.md`）。主体不是字形串时**不建这个节点**，改走 `raw_macro`（`bold(frac(a, b))`） |
 
 ## 二、线上 `View` 的字段，谁填了什么
 
@@ -52,9 +62,9 @@
 
 | 字段 | 谁填 | 实测值示例 |
 | --- | --- | --- |
-| `kind` | 全部 | 视图名（**线名**，可以与 `Kind` 的*形状名*不同：`Sqrt`/`Fenced`/`Accent`/`Line` 都是 `decorated`，`macro` 折叠时是 `raw_macro`） |
+| `kind` | 全部 | 视图名（**线名**，可以与*形状名*不同：`sqrt`/`delim`/`decoration`/`line` 都是 `decorated`，`script`/`grid`/`aligned` 分别是 `scripts`/`table`/`multiline`，`macro` 折叠时是 `raw_macro`） |
 | `text` | 每个节点都有这个字段，但**带内容的只有** `Char`/`Symbol`/`Number`/`Raw`/`raw_macro`/`Fenced`/`decorated`/`style`；`Unknown` 与所有结构性 `Kind` 都是空串 | `hat`、`(\n)`、`x`、`12.5`、`layer15(a)`、`bold(upright(a))` |
-| `role` | 父节点填给子节点（`Decl::role_at`）；根节点不填 | `numerator`、`radicand`、`inner` |
+| `role` | 父节点填给子节点（`Shape::role_at`）；根节点不填 | `numerator`、`radicand`、`inner` |
 | `display_glyph` | **只有 `Char`**，且只有这个字符在 `config/symbols.json` 里时 | 打的 `-` → `−` |
 | `children` | 除叶子外全部；`Scripts` 恒 3 个（缺席补 `absent`） | — |
 | `cursor` | 每个 `stop` 节点（插入位），不在 Kind 节点上 | — |

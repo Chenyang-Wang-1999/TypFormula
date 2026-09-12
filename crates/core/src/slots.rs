@@ -127,12 +127,16 @@ pub enum Vertical {
 
 /// How a node's cells become its Typst spelling.
 ///
-/// Most kinds are a call over their cells, and for those the template states the
-/// order those cells are written in — `"frac({0}, {1})"`, `"sqrt({0})"`. A cell
-/// order that differs from the spelling would be stated here rather than hidden in
-/// a hand-written `c(1), c(0)`; after `Root` was changed to store its cells in the
-/// order `root(index, radicand)` writes them, no kind needs that any more.
-/// Placeholders are `{0}`, `{1}`… for cells and `{name}` for the node's stored name.
+/// Exactly one kind spells itself through a template: `frac`, as `"frac({0}, {1})"`.
+/// The rest are either one of the dedicated forms below or `Write::Named`, which is
+/// what every call uses — including the configured commands, whose spelling is
+/// `name(args)` whatever shape they borrow for drawing. That is why `{name}` is no
+/// longer a placeholder: nothing left in the enum has a name to substitute.
+///
+/// A template states the order its cells are written in, so a cell order that
+/// differed from the spelling would be visible here rather than hidden in a
+/// hand-written `c(1), c(0)`. After `Root` was changed to store its cells in the
+/// order `root(index, radicand)` writes them, no kind needs that.
 #[derive(Clone, Copy)]
 pub enum Write {
     Template(&'static str),
@@ -152,9 +156,6 @@ pub enum Write {
     /// A call whose callee is the node's stored name, or the bare name when it
     /// is not a function (`MacroCall`).
     Named,
-    /// The spelling is chosen by a stored position rather than by a name: the same
-    /// cell is `above` in one node and `below` in another (`Line`).
-    Positioned { above: &'static str, below: &'static str },
     /// `mat(…)` over cells grouped by the stored column count (`Table`).
     Matrix,
     /// Rows joined by ` \` + newline, cells by ` & ` (`Multiline`).
@@ -270,27 +271,48 @@ pub fn configured_shape(name: &str) -> Option<Shape> {
     shape_named(command_spec(name)?.shape)
 }
 
-/// The **drawing data** a command name carries, as a descriptor `Kind`.
+/// The **drawing data** a command name carries, beyond the shape it names.
 ///
-/// Not stored, and no longer consulted for spelling: a configured call writes back
-/// through `Grammar`/`Write::Named`, which needs nothing but its own name. What is
-/// left here is the data only the name can supply and only the *drawing* reads —
-/// `abs` is the `|` pair, `hat` the accent called `hat`, `overline` the line above.
-/// `view_atom` reads it; `configured_shape` answers the slots and navigation.
+/// Only the name can say these, and only the drawing reads them: `abs` is the `|`
+/// pair and `norm` the `‖` pair, `overline` puts its rule above rather than below.
+/// They live in `config/commands.json` beside the name, with a default for every
+/// field a name does not need.
 ///
-/// It goes away when `config/commands.json` carries those view fields itself.
-pub fn configured_kind(name: &str) -> Option<Kind> {
-    Some(match shape_named(command_spec(name)?.shape)?.view {
-        "delim" => match name {
-            "abs" => Kind::Fenced { left: "|".into(), right: "|".into() },
-            _ => Kind::Fenced { left: "‖".into(), right: "‖".into() },
-        },
-        "decoration" => Kind::Accent { name: name.to_string() },
-        "line" => Kind::Line { above: name == "overline" },
-        "style" => Kind::Style { name: name.to_string() },
-        "fraction" => Kind::Fraction,
-        "sqrt" => Kind::Sqrt,
-        "root" => Kind::Root,
+/// This is the whole reason the five shape descriptors (`Sqrt`/`Root`/`Accent`/
+/// `Line`/`Style`) could leave the `Kind` enum: they were never stored, and the only
+/// thing they carried that a `Shape` does not is these few fields.
+#[derive(Clone, Copy)]
+pub enum Draw {
+    /// A fraction over two cells.
+    Fraction,
+    /// A radical. `sqrt` is a bare hook, `root` a hook with a degree beside it — and
+    /// the two travel as *different* wire kinds (`decorated` and `root`), which is one
+    /// of the places a shape name and a wire name disagree.
+    Radical { degree: bool },
+    /// A delimited pair around one body, spelled left-then-right by a newline.
+    Delim(&'static str),
+    /// A mark over one body. The mark's name is the command's own name (`hat`).
+    Mark,
+    /// A rule over or under one body.
+    Rule { above: bool },
+    /// A font variant over one body. The variant's name is the command's own name
+    /// (`bold`), so the call keeps it.
+    Variant,
+}
+
+/// How a configured call is drawn, from the shape its entry names.
+pub fn configured_draw(name: &str) -> Option<Draw> {
+    let spec = command_spec(name)?;
+    Some(match spec.shape {
+        "fraction" => Draw::Fraction,
+        "sqrt" => Draw::Radical { degree: false },
+        "root" => Draw::Radical { degree: true },
+        "delim" => Draw::Delim(spec.text?),
+        // The mark *is* the command name (`hat`, `cancel`), and so is the variant
+        // (`bold`, `upright`) — which is why neither needs a field in the file.
+        "decoration" => Draw::Mark,
+        "style" => Draw::Variant,
+        "line" => Draw::Rule { above: spec.above.unwrap_or(name == "overline") },
         _ => return None,
     })
 }
@@ -576,19 +598,6 @@ impl Kind {
             // Template edges exist only inside an expanded macro template.
             Kind::TemplateCall { .. } => TEMPLATE_CALL_SHAPE,
             Kind::Fraction => FRACTION_SHAPE,
-            // Typst has one `Radical` with an optional index; the editor keeps
-            // the index as a cell of its own, so a square root is a radical
-            // whose index cell is empty. Which of the two kinds a node is comes
-            // from how many cells it stores, and the two tags below are how the
-            // wire tells the frontend to draw a hook or a degree.
-            Kind::Sqrt => SQRT_SHAPE,
-            Kind::Root => ROOT_SHAPE,
-            // Storage is always `[base, upper, lower]`; an empty cell is an
-            // attachment the source does not have (`math::script_cell`). Typst's
-            // `ScriptsItem` has six attachment fields because it separates
-            // limits from scripts and keeps the left ones; which of the two a
-            // cell is, is decided by the compiler and asked for separately
-            // (`native-adapter`), not stored here.
             Kind::Scripts => SCRIPTS_SHAPE,
             // The delimiters are the two characters the source spelled, not
             // items as in Typst's `FencedItem`, and the one cell is the body
@@ -596,20 +605,6 @@ impl Kind {
             Kind::Fenced { .. } => DELIM_SHAPE,
             Kind::Table { .. } => GRID_SHAPE,
             Kind::Multiline { .. } => ALIGNED_SHAPE,
-            // A mark above or below the base; its name is the callee and the cell
-            // is its body. Typst's `AccentItem` derives above/below from the mark
-            // itself, so nothing here stores it.
-            Kind::Accent { .. } => DECORATION_SHAPE,
-            // A rule above or below the base. Only the position is stored, because
-            // that is all `LineItem` has.
-            Kind::Line { .. } => LINE_SHAPE,
-            // A base drawn in a font variant. Its slots are a decoration's — one inner
-            // cell, entered at the edge, linear, no vertical move — because the variant
-            // changes how the body is *drawn*, not how it is edited. What it does not
-            // have is a glyph: Typst substitutes codepoints, and that table is out of the
-            // kernel's reach, so the frontend asks the engine (`Shape::typst` records the
-            // `Glyph`s it stands for, once the substitution has happened).
-            Kind::Style { .. } => STYLE_SHAPE,
         }
     }
 
@@ -628,16 +623,10 @@ impl Kind {
             Kind::MacroCall { .. } => Write::Named,
             Kind::TemplateCall { .. } => Write::TemplateOnly,
             Kind::Fraction => Write::Template("frac({0}, {1})"),
-            Kind::Sqrt => Write::Template("sqrt({0})"),
-            // Stored order is Typst's own `root(index, radicand)`, so the
-            // template reads in the same order and no reversal is stated here.
-            Kind::Root => Write::Template("root({0}, {1})"),
             Kind::Scripts => Write::Attach,
             Kind::Fenced { .. } => Write::Delimited,
             Kind::Table { .. } => Write::Matrix,
             Kind::Multiline { .. } => Write::Rows,
-            Kind::Accent { .. } | Kind::Style { .. } => Write::Template("{name}({0})"),
-            Kind::Line { .. } => Write::Positioned { above: "overline({0})", below: "underline({0})" },
         } }
     }
 }
@@ -670,15 +659,27 @@ mod tests {
             ("MacroCall", Kind::MacroCall { name: "f".into(), function: true }, 2),
             ("TemplateCall", Kind::TemplateCall { definition: 0 }, 2),
             ("Fraction", Kind::Fraction, 2),
-            ("Sqrt", Kind::Sqrt, 1),
-            ("Root", Kind::Root, 2),
             ("Scripts", Kind::Scripts, 3),
             ("Fenced", Kind::Fenced { left: "(".into(), right: ")".into() }, 1),
             ("Table", Kind::Table { columns: 2, row_lengths: vec![2, 2], name: "mat".into() }, 4),
             ("Multiline", Kind::Multiline { columns: 2, row_lengths: vec![2, 2] }, 4),
-            ("Accent", Kind::Accent { name: "hat".into() }, 1),
-            ("Line", Kind::Line { above: true }, 1),
-            ("Style", Kind::Style { name: "bold".into() }, 1),
+        ]
+    }
+
+    /// The shapes a command can name, which have no `Kind` of their own.
+    ///
+    /// `sqrt`, `root`, `decoration`, `line`, `style` and `delim` are all borrowable
+    /// by a `MacroCall`; between them they are the reason the shape table exists
+    /// apart from the kind table.
+    fn borrowable_shapes() -> Vec<(&'static str, Shape, usize)> {
+        vec![
+            ("fraction", FRACTION_SHAPE, 2),
+            ("sqrt", SQRT_SHAPE, 1),
+            ("root", ROOT_SHAPE, 2),
+            ("delim", DELIM_SHAPE, 1),
+            ("line", LINE_SHAPE, 1),
+            ("decoration", DECORATION_SHAPE, 1),
+            ("style", STYLE_SHAPE, 1),
         ]
     }
 
@@ -686,13 +687,25 @@ mod tests {
     fn every_kind_has_a_representative_here() {
         // `Kind::shape` makes a new kind fail to compile; this count is what
         // makes a new kind fail to be *covered* by this file.
-        assert_eq!(representatives().len(), 19, "新增 Kind 后请在这里补一条代表实例");
+        assert_eq!(representatives().len(), 14, "新增 Kind 后请在这里补一条代表实例");
+    }
+
+    /// Every shape the two invariants below hold for, with the number of cells a node
+    /// of that shape really stores.
+    ///
+    /// Two sources, because the schema is now reached two ways: a stored `Kind` carries
+    /// its own shape, and a configured command *borrows* one by name. Checking only the
+    /// kinds would leave the borrowed half — which is where the slots of `frac`, `sqrt`,
+    /// `hat` and the rest actually live — unguarded.
+    fn every_shape() -> Vec<(String, Shape, usize)> {
+        let kinds = representatives().into_iter().map(|(label, kind, cells)| (label.to_string(), kind.shape(), cells));
+        let borrowed = borrowable_shapes().into_iter().map(|(label, shape, cells)| (label.to_string(), shape, cells));
+        kinds.chain(borrowed).collect()
     }
 
     #[test]
     fn named_roles_exist_in_the_schema_that_names_them() {
-        for (label, kind, _) in representatives() {
-            let shape = kind.shape();
+        for (label, shape, _) in every_shape() {
             if let Entry::Role { forward, backward } = shape.entry {
                 assert!(shape.index_of(forward).is_some(), "{label}：入口角色 {forward:?} 不在槽位表里");
                 assert!(shape.index_of(backward).is_some(), "{label}：入口角色 {backward:?} 不在槽位表里");
@@ -706,8 +719,7 @@ mod tests {
 
     #[test]
     fn the_schema_covers_exactly_the_cells_a_kind_stores() {
-        for (label, kind, cells) in representatives() {
-            let shape = kind.shape();
+        for (label, shape, cells) in every_shape() {
             match shape.arity {
                 Arity::Exact => {
                     for index in 0..shape.slots.len() {
@@ -765,7 +777,6 @@ mod tests {
         assert_eq!(MathAtom::nest(Kind::Fraction, 2).math_class(), 7);
         assert_eq!(MathAtom::nest(Kind::Table { columns: 2, row_lengths: vec![2, 2], name: "mat".into() }, 4).math_class(), 7);
         assert_eq!(MathAtom::nest(Kind::Multiline { columns: 2, row_lengths: vec![2, 2] }, 4).math_class(), 0);
-        assert_eq!(MathAtom::nest(Kind::Sqrt, 1).math_class(), 0);
     }
 
     /// `config/commands.json` is a file, so nothing in the type system holds it to
@@ -804,10 +815,16 @@ mod tests {
     }
 
     #[test]
-    fn every_declaration_agrees_with_the_kind_it_describes() {
+    fn every_grammar_agrees_with_the_kind_it_describes() {
         // `write_atom` dispatches on the declared `Write`, then reads the data
         // that shape needs and stops with `unreachable!` if the kind has none.
         // This test is what makes those arms unreachable rather than a guess.
+        //
+        // `Write::Template` has exactly one user left. It used to be shared with
+        // `sqrt`/`root`/`hat`/`overline`, which were written through borrowed shapes;
+        // those are `MacroCall`s now and spell themselves with `Write::Named`, so the
+        // template form survives only for the one construct whose call syntax and cell
+        // order could ever differ — and after `Root` was aligned, they do not.
         for (label, kind, _) in representatives() {
             let agrees = match kind.grammar().write {
                 Write::OwnText => matches!(kind, Kind::Char { .. } | Kind::Symbol { .. } | Kind::Raw { .. } | Kind::Unknown { .. }),
@@ -820,8 +837,7 @@ mod tests {
                 Write::Matrix => matches!(kind, Kind::Table { .. }),
                 Write::Rows => matches!(kind, Kind::Multiline { .. }),
                 Write::Named => matches!(kind, Kind::MacroCall { .. }),
-                Write::Template(_) => matches!(kind, Kind::Fraction | Kind::Sqrt | Kind::Root | Kind::Accent { .. } | Kind::Style { .. }),
-                Write::Positioned { .. } => matches!(kind, Kind::Line { .. }),
+                Write::Template(_) => matches!(kind, Kind::Fraction),
             };
             assert!(agrees, "{label}：write 声明与 Kind 不符，写回会走到 unreachable");
         }
@@ -837,13 +853,13 @@ mod tests {
             while let Some(open) = rest.find('{') {
                 let close = rest[open..].find('}').unwrap_or_else(|| panic!("{label}：模板占位符没有闭合：{template}"));
                 let key = &rest[open + 1..open + close];
-                if key == "name" {
-                    assert!(matches!(kind, Kind::MacroCall { .. } | Kind::Accent { .. } | Kind::Style { .. }), "{label}：模板用了 {{name}}，但这个 Kind 没有名字");
-                } else {
-                    let index = key.parse::<usize>().unwrap_or_else(|_| panic!("{label}：无法解析的占位符 {{{key}}}"));
-                    assert!(index < cells, "{label}：占位符 {{{key}}} 超出 {cells} 个格子");
-                    used += 1;
-                }
+                // `{name}` used to be here for the borrowed shapes. No stored kind has
+                // one now, and a template that reached for it would be answered by
+                // `fill_template`'s `unreachable!` — so the placeholder is refused here.
+                assert_ne!(key, "name", "{label}：模板用了 {{name}}，但已经没有任何 Kind 有名字");
+                let index = key.parse::<usize>().unwrap_or_else(|_| panic!("{label}：无法解析的占位符 {{{key}}}"));
+                assert!(index < cells, "{label}：占位符 {{{key}}} 超出 {cells} 个格子");
+                used += 1;
                 rest = &rest[open + close + 1..];
             }
             assert!(used > 0, "{label}：写成模板却一个格子都没用到");
@@ -889,12 +905,29 @@ mod tests {
         }
     }
 
+    /// The distinct shapes, once each.
+    ///
+    /// `every_shape` deliberately lists a shape twice when a stored kind and a
+    /// configured command share it (`fraction`, `delim`, `grid`), which is exactly what
+    /// the vocabulary check must not count twice: two entries for one shape would read
+    /// as "two shapes claim this `MathKind`".
+    fn distinct_shapes() -> Vec<(&'static str, Shape)> {
+        let mut out: std::collections::BTreeMap<&'static str, Shape> = std::collections::BTreeMap::new();
+        for (_, shape, _) in every_shape() { out.entry(shape.view).or_insert(shape); }
+        out.into_iter().collect()
+    }
+
     #[test]
     fn the_typst_vocabulary_is_covered_exactly_once() {
         let all = typst_math_kinds();
         let mut claimed: Vec<&str> = vec![];
-        for (label, kind, _) in representatives() {
-            for name in kind.shape().typst {
+        // Every shape, however it is reached. A `MathKind` may be claimed by a stored
+        // kind's own shape or by one a command borrows, and `Radical`, `Accent`, `Cancel`
+        // and `Line` are **only** reachable through the second: the five shape descriptors
+        // that used to carry them as `Kind`s are gone, so this is now the only thing that
+        // claims them.
+        for (label, shape) in distinct_shapes() {
+            for name in shape.typst {
                 assert!(all.contains(name), "{label}：声明对应 MathKind::{name}，但 vendored 枚举里没有这个变体");
                 claimed.push(name);
             }
@@ -904,14 +937,15 @@ mod tests {
         // This is the alignment checklist: every entry here is a construct the
         // editor keeps as `Raw` source text, or one it does not have to model.
         assert_eq!(unclaimed, UNMODELLED, "未建模的 MathKind 清单变了：请更新 UNMODELLED 并写下每一项的决定");
-        // Sharing a variant is a decision, not an accident. `Glyph` is shared
-        // because a character and a named symbol really are both glyphs;
-        // `Radical` is shared because the editor keeps a square root and an nth
-        // root apart while Typst models them as one item.
+        // Sharing a variant is a decision, not an accident. `Glyph` is shared because a
+        // character, a named symbol and a font variant are all drawn from glyphs;
+        // `Radical` because a bare hook and a hook with a degree are two shapes over
+        // Typst's one `Radical`. (`Accent`/`Cancel` are the other kind of sharing but the
+        // same shape, so they do not show up here.)
         let mut sorted = claimed.clone();
         sorted.sort_unstable();
         let mut shared: Vec<&str> = sorted.windows(2).filter(|pair| pair[0] == pair[1]).map(|pair| pair[1]).collect();
         shared.dedup();
-        assert_eq!(shared, ["Glyph", "Radical"], "被两个 Kind 共同认领的 MathKind 变了");
+        assert_eq!(shared, ["Glyph", "Radical"], "被两个形状共同认领的 MathKind 变了");
     }
 }

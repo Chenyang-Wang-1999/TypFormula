@@ -92,8 +92,6 @@ pub enum Kind {
     Parameter { index: usize },
     Text,
     Fraction,
-    Sqrt,
-    Root,
     Scripts,
     Fenced { left: String, right: String },
     /// A grid of cells: Typst's `Table`.
@@ -101,9 +99,10 @@ pub enum Kind {
     /// `columns` is the one piece of instance data no name and no config file can
     /// supply — it comes from how the argument list was punctuated (`mat(a, b; c, d)`
     /// is two columns, `mat(a; b; c)` is one), and a flat cell list no longer says.
-    /// That is why this kind is *stored* while `Sqrt`/`Root`/`Accent`/`Line`/`Style`
-    /// are only shape descriptors — the names alone say what those are, and every call
-    /// that borrows one (`sqrt(x)`, `hat(x)`, `bold(x)`) is stored as a `MacroCall`.
+    /// That is why this kind is *stored*: a name alone cannot say how many columns a
+    /// table has. `sqrt(x)`, `hat(x)` and `bold(x)` are the other side of that line —
+    /// every call whose shape its name fully describes is stored as a `MacroCall` and
+    /// looks its shape up in `config/commands.json`.
     ///
     /// `row_lengths` records how many cells each row really had before the flat list
     /// was padded to `columns`, exactly as `Multiline` does. Rows need not be equal:
@@ -121,28 +120,6 @@ pub enum Kind {
     // `columns` and `row_lengths` are the flat encoding of Typst's
     // `MultilineItem::rows`: the cells are one flat list, padded to `columns`.
     Multiline { columns: usize, row_lengths: Vec<usize> },
-    /// A base with a mark above or below: Typst's `Accent`.
-    ///
-    /// The name is the command that built it (`hat`, `vec`), which is what the
-    /// writer needs; the engine's `AccentItem` carries the resolved mark item
-    /// instead, and derives above/below from the mark's own Unicode class, so the
-    /// position is not stored here.
-    Accent { name: String },
-    /// A base with a rule above or below: Typst's `Line`.
-    ///
-    /// `LineItem` holds nothing but the position, so neither does this: the
-    /// spelling (`overline` or `underline`) follows from it.
-    Line { above: bool },
-    /// A base drawn in a font variant — `bold`, `upright`, `bb`, `frak`: one body cell
-    /// plus the name of the variant.
-    ///
-    /// **The glyphs are not here.** Typst applies a variant by *substituting codepoints*
-    /// (`resolve.rs` passes `codex`'s `to_style(c, …)` output into the item's text), and
-    /// that table lives in a crate the kernel cannot reach. So this kind stores the same
-    /// thing `Accent` stores — the name — and the frontend asks the engine for the
-    /// substituted glyphs. Measured: `bold(A)` and a literal `𝐀` are the same width
-    /// (0.869), `bold(alpha)` and `𝛂` share height and baseline (0.460/0.452).
-    Style { name: String },
     Unknown { name: String, saved: MathData, caret: usize, anchor: Option<usize>, original: Option<String> },
 }
 
@@ -176,16 +153,16 @@ impl MathAtom {
     /// `sqrt`, `hat`, `overline` and the rest are calls whose shape only
     /// `config/commands.json` knows. The node stores the *name*; the shape is looked
     /// up, never stored, so changing the file cannot leave a node holding a stale one.
-    /// The descriptor a configured command call borrows, if it names one.
+    /// The shape a configured command call borrows, if its name has one.
     ///
-    /// A **drawing** token, not the node's own kind: the node stays `MacroCall`.
-    /// `view_atom` reads the delimiters or the mark off it, and `shape` derives the
-    /// slots and navigation from it. The spelling does not come from here — that is
-    /// `grammar`, and for a call it is always `Write::Named`.
-    pub fn command_shape(&self) -> Option<Kind> {
+    /// `config/commands.json` is the only thing consulted: a call is stored as
+    /// `MacroCall { name }`, and everything about how it looks and how the caret moves
+    /// inside it comes from the shape its name names. Nothing is stored on the node, so
+    /// editing the file cannot leave a node holding a stale shape.
+    pub fn command_shape(&self) -> Option<Shape> {
         match &self.kind {
             Kind::MacroCall { name, .. } => {
-                let shape = slots::configured_kind(name)?;
+                let shape = slots::configured_shape(name)?;
                 // A font variant is the one shape whose applicability depends on the
                 // **body**: it is applied by substituting codepoints, so it only exists
                 // while its body is a run of characters. `bold(a)` qualifies; a fraction,
@@ -198,7 +175,7 @@ impl MathAtom {
                 // as it is edited: emptying a body, or typing a fraction into one, has to be
                 // able to move the node between the two drawings. `Kind` is what is stored,
                 // and it stays `MacroCall` either way.
-                if matches!(shape, Kind::Style { .. }) && !crate::typst::has_glyph_run(&self.cells) {
+                if shape.is_font_variant() && !crate::typst::has_glyph_run(&self.cells) {
                     return None;
                 }
                 Some(shape)
@@ -227,7 +204,7 @@ impl MathAtom {
     ///
     /// The *spelling* is not here: it comes from `grammar`, which is the node's own.
     pub fn shape(&self) -> Shape {
-        self.command_shape().map_or_else(|| self.kind.shape(), |descriptor| descriptor.shape())
+        self.command_shape().unwrap_or_else(|| self.kind.shape())
     }
     /// How this atom spells itself back into the document. See `crate::slots`.
     ///

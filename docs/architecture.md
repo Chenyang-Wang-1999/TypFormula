@@ -191,14 +191,16 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 ### 配置好的名字存成 `MacroCall`，形状是查出来的
 
-`config/commands.json` 里的名字**不再各自有一个 `Kind`**：节点存的是**调用**（`MacroCall { name, cells }`），而**槽位、视图、拼写**都在画或写的那一刻由名字查表得到（`math::MathAtom::command_shape` → `slots::configured_kind`）。所以 `Kind::Fraction`/`Sqrt`/`Root`/`Accent`/`Line`/`Style` 这些变体**仍然存在，但不再是树里的节点**——它们是**形状描述符**，被 `configured_kind` 按名字返回。`Kind::Fenced` 与 `Kind::Table` 例外，它们仍然真的被存下来（前者是 `(a+b)` 的语法节点，后者见上表）。
+`config/commands.json` 里的名字**不各自有一个 `Kind`**：节点存的是**调用**（`MacroCall { name, cells }`），而**槽位、导航、排布与拼写**都在画或写的那一刻由名字查表得到（`math::MathAtom::command_shape` → `slots::configured_shape`，画法由 `slots::configured_draw`）。`Kind::Fenced` 与 `Kind::Table` 例外，它们仍然真的被存下来（前者是 `(a+b)` 的语法节点，后者见上表），因为它们带着名字与配置都给不出的实例数据。
+
+需要强调的是**这里没有"形状描述符 Kind"这回事了**。曾经有：`Sqrt`/`Root`/`Accent`/`Line`/`Style` 五个变体留在枚举里，只为给 `configured_kind` 一个可以借的载体。它们现在整个删掉了——形状是 `Shape`（按形状名取），取图数据在配置文件里，见上文"五个变体已经删除"。
 
 这样做换来一件事：**配置文件决定什么被结构化，而且改了文件不会留下持有旧形状的节点**。代价是两类**按 `Kind` 写死的规则会静默失效**，实测在两处发生过，都记在这里：
 
 | 规则 | 原写法 | 为什么失效 | 修法 |
 | --- | --- | --- | --- |
 | 退格在格首"只拉出当前实参" | `matches!(owner.kind, Kind::MacroCall { .. })` | 借了形状的 `frac(a, b)` 也是 `MacroCall`，于是它继承了**宏实参**的语义，退格再也拉不出实参（`lyx_traces.rs` 抓到） | `MathAtom::is_macro()`：`MacroCall` **且**没有配置形状，即"实参是 `#let` 的形参" |
-| 向左跨格进入根式时落在格尾 | `matches!(owner.kind, Kind::Root)` | `root(...)` 存成 `MacroCall`，这个判断恒为假，光标落到了格首 | 改问 `owner.command_shape()`（`caret_navigation.rs` 新增用例抓到） |
+| 向左跨格进入根式时落在格尾 | `matches!(owner.kind, Kind::Root)` | `root(...)` 存成 `MacroCall`，这个判断恒为假，光标落到了格首 | 改问 `owner.command_shape()` 的形状是不是 radical（`caret_navigation.rs` 新增用例抓到） |
 
 第二条尤其值得记：**当时没有任何测试覆盖它**，是翻完之后逐条审 `Kind::` 判断才发现的，而补的第一版用例又走的是 `entry_cell` 而不是 `move_horizontal` 那条路，加了变异检查才发现它照样通过。同一个理由让 `is_macro()` 必须存在：`Kind::MacroCall` 现在是一个**过载**的标记，既表示"宏调用"也表示"借了形状的命令"，凡是按它分派的规则都要重新问一遍。
 
@@ -213,13 +215,22 @@ if MATH_FUNC_PREC >= min_prec && p.directly_at(SyntaxKind::LeftParen) {
 
 **`Table` 则必须留下，这是原计划里唯一算错的一项。** `mat` 的列数既不在名字里也不在配置里，只在参数列表的分号里：`mat(a, b; c, d)` 存成一个扁平格子表之后就再也分不出行界，写不回 `mat(a, b; c, d)`。所以 `mat` 不能变成普通 `MacroCall`——除非 `MacroCall` 自己长出一个列数字段，而那只是把同一个问题换了个地方放。
 
-这条判据**有测试守着**：`tests/stored_kinds.rs` 解析一份覆盖"命令写法 + 语法写法"的语料，收集**真正进过树**的 `Kind`，断言集合恰好是 `Char`/`Symbol`/`Number`/`Raw`/`MacroCall`/`Text`/`Fraction`/`Scripts`/`Fenced`/`Table`/`Multiline`/`Unknown` 十二个。多一个就说明有人把某个**形状描述符**重新变成了会存的节点——那种回归能编译、能往返，此前没人会说。实测把 radical 那一支改回 `Kind::Sqrt`，它会报「多出来的：["Sqrt"]」。
+这条判据**有测试守着**：`tests/stored_kinds.rs` 解析一份覆盖"命令写法 + 语法写法"的语料，收集**真正进过树**的 `Kind`，断言集合恰好是 `Char`/`Symbol`/`Number`/`Raw`/`MacroCall`/`Text`/`Fraction`/`Scripts`/`Fenced`/`Table`/`Multiline`/`Unknown` 十二个。多一个就说明有人把某个**形状描述符**重新变成了会存的节点——那种回归能编译、能往返，此前没人会说。
 
-`Sqrt`/`Root`/`Accent`/`Line`/`Style` 五个变体因此**只在形状表里活着**：`configured_kind` 拿它们当**取图数据**返回、`Shape` 描述它们的槽位、`view_atom` 按它们画，但没有源码能存它们。这不是"该删没删"，而是**一个变体身兼两职**——`command_shape()` 与 `is_macro()` 之所以必须存在，就是因为 `Kind::MacroCall` 同时也是"借了形状的命令"。
+`Sqrt`/`Root`/`Accent`/`Line`/`Style` 五个变体曾经留在 `Kind` 里当"形状描述符"——`configured_kind` 拿它们当取图数据返回、`Shape` 描述它们的槽位、`view_atom` 按它们画，但没有任何源码能存它们。**现在它们整个从 `Kind` 枚举里删掉了**，因为唯一阻止删除的那样东西已经不在了：
+
+| 原来由描述符携带的 | 现在在哪 |
+| --- | --- |
+| 槽位、导航、排布名 | `Shape`（本来就是按形状名取的） |
+| 回写模板 | `Grammar`——而一个调用永远是 `Write::Named`，不需要模板 |
+| 取图数据（`abs` 是哪对定界符、`overline` 在上还是在下） | `config/commands.json` 的 `text` / `above` 字段 |
+| 记号名与变体名 | 就是命令行本身（`hat` 的记号是 `hat`、`bold` 的变体是 `bold`），所以配置里不用写 |
+
+于是 `Kind` 里只剩**会被存进树的变体**，"这个变体会不会被存"不再是一个需要回答的问题。借形状这件事只剩两个入口：`command_shape()`（拿 `Shape`，并替字体变体把关字形串）与 `slots::configured_draw()`（拿画法）。
 
 ### `Style` 的替换表在适配器那一侧，不在前端也不在内核
 
-`Kind::Style` 的载荷是 `{name}`（命令名），**线上**才叫 `style_name`；`text` 是线上 View 的字段，装的是整段调用拼写。`Style{name}`（`bold`/`upright`…）的**机制**很便宜：形状不带数据（`name` 就是命令名，和 `Accent` 一样），所以只要一个形状描述符 + 配置里几行。**贵的是那一步"替换"**，也就是"让前端负责渲染"实际要求什么。查证结果：
+`Style` 的载荷是 `{name}`（命令名），**线上**才叫 `style_name`；`text` 是线上 View 的字段，装的是整段调用拼写。这个**机制**很便宜：形状不带数据（`name` 就是命令名，和 `Accent` 一样），所以只要一个形状 + 配置里几行——`Style` 那个 `Kind` 变体本身也不需要了。**贵的是那一步"替换"**，也就是"让前端负责渲染"实际要求什么。查证结果：
 
 | 事实 | 证据 |
 | --- | --- |
@@ -333,7 +344,7 @@ View:      macro
 
 加一个 `Kind` 时编译器会要求把这几件事一次说清：`Kind::shape()` 与 `Kind::grammar()` 都是穷尽 `match`。
 
-`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个 `decl` 可以认领 0 个（编辑器专有：`MacroCall`/`TemplateCall`/`Parameter`/`Unknown`）、1 个或多个（`Raw` 认领 `Box`/`Mathml`/`External`；`Sqrt` 与 `Root` 都认领 `Radical`；`Char` 与 `Symbol` 都认领 `Glyph`）。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何 `Kind` 认领的变体"恰好等于 `slots::UNMODELLED`——现在只剩 `Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一项就必然要改那张表，并在那里写下为什么其余几项还没做。这三项与上一节的"名字表"是**两件事**：`VecElem` 连名字都没进表，而 `Group` 是"编辑器的一个格子就是一个 group"、根本不需要谁去代表它。`cancel` 则是第三类——它靠 `commands.json` 里的一行把 `Accent` 的形状借过来用，`MathKind::Cancel` 因此由 `Kind::Accent` 一并认领（见下节）。`view` 名与变体名**故意不同**（`Kind::Fenced` 的排布名仍是 `delim`）：排布名是给前端的绘图契约，只在画法变化时才需要改。
+`typst` 那一项是**与 Typst 词汇表的对应关系**：`Kind` 的变体名照着 Typst 的 `MathKind`（`vendor/typst/crates/typst-library/src/math/ir/item.rs`）取，一个形状可以认领 0 个（编辑器专有：`macro`/`template-call`/`parameter`/`unknown`）、1 个或多个（`raw` 认领 `Box`/`Mathml`/`External`；`sqrt` 与 `root` 都认领 `Radical`；`char`/`symbol`/`style` 都认领 `Glyph`；`decoration` 认领 `Accent` 与 `Cancel`）。对账是**按形状**做的，不是按 `Kind`——`Radical`/`Accent`/`Cancel`/`Line` 只由借来的形状认领，五个描述符 `Kind` 删掉之后，形状表是唯一认领它们的地方。核心 crate 不依赖编译器，所以两边不能靠类型系统绑定；代替它的是两个测试：一个从 vendor 源码里扫出 `MathKind` 的变体名（`MathKind` 增删改名会让它失败），另一个断言"没被任何形状认领的变体"恰好等于 `slots::UNMODELLED`——现在只剩 `Group`、`Primes`、`SkewedFraction`。因此对齐与否是可查的：认领掉一项就必然要改那张表，并在那里写下为什么其余几项还没做。这三项与上一节的"名字表"是**两件事**：`VecElem` 连名字都没进表，而 `Group` 是"编辑器的一个格子就是一个 group"、根本不需要谁去代表它。`cancel` 则是第三类——它靠 `commands.json` 里的一行把 `decoration` 形状借过来用，`MathKind::Cancel` 因此由那个形状一并认领（见下节）。形状名与线名**故意可以不同**（`Kind::Fenced` 的形状名仍是 `delim`，线名是 `decorated`）：形状名是配置与 `Shape` 表用的键，线名是给前端的绘图契约，只在画法变化时才需要改。
 
 `Char` 的载荷是**一个字形簇**（`String`，不是一个 `char`），因为"字符"与"Unicode 标量"不是一回事：`é` 可能是一个标量也可能是两个，emoji 常是好几个。词法本来就把一个字形簇收进一个节点，`GlyphItem` 也装一个簇——按标量拆会让回写在簇中间插入分隔符，把 `é` 写成 `e ́`。`Kind::Number` 同理是"一个格"，串内字符由 `Write::Run` 连成一个记号。
 
@@ -421,7 +432,7 @@ render.raw: [{start:684, end:694}]
 
 ### `cancel` 只加了一行配置，代价全在夹具上
 
-`cancel(x)` 的形状就是 `hat(x)` 的形状——一个正文格 + 一个画在它上面的记号——所以它**不需要新的 `Kind`**，只需要在 `config/commands.json` 里加一行 `"cancel": "decoration"`（`Kind::Accent` 已经会把命令名存进 `name`，拼写也已经是 `{name}({0})`）。实测：`cancel(x)` 变成 `decorated`/`marker="cancel"`、一格、写回 `cancel(x)`，往返成立。
+`cancel(x)` 的形状就是 `hat(x)` 的形状——一个正文格 + 一个画在它上面的记号——所以它**不需要新的 `Kind`**，只需要在 `config/commands.json` 里加一行 `"cancel": "decoration"`（记号名就是命令名，拼写是 `Write::Named`）。实测：`cancel(x)` 变成 `decorated`/`marker="cancel"`、一格、写回 `cancel(x)`，往返成立。
 
 引擎侧量到的两件事决定了前端怎么画：默认记号是**内容框的上升对角线**（`CancelItem` 的 `length` = 对角线 + 0.3em），而且 **`cancel(x)` 与 `x` 的盒子完全相同**（24pt 下都是 13.728×10.872），而 `hat(x)` 是 16.92、`overline(x)` 是 16.056——所以记号是**盖在**正文上、盒子不长高，这与 `hat`/`overline` 那两条"抬起身子腾地方"的分支相反。
 

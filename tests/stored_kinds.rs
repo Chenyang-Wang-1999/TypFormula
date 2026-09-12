@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! 解析器**真正会存进树里**的 `Kind` 有哪些。
 //!
-//! 这次重构把一批变体留成了**形状描述符**：`slots::configured_kind` 会返回它们、
-//! `Decl` 描述它们、`view_atom` 按它们画，但**已经没有任何源码能把它们放进树里**。
-//! 这个区别正是重构的要点，而此前**没有任何测试守着它**——把 `Kind::Sqrt` 重新变成
-//! 会存的节点，照样能编译、照样能往返，把收拢悄悄退回去。
-//!
 //! 判据（见 `docs/architecture.md`）：一个构造要是自己的 `Kind`，只有两个理由——
 //! **带着名字与配置都给不出的实例数据**（`Table.columns`、`Fenced.left/right`、
 //! `Multiline.row_lengths`、`Raw.source`、`Char.text`……），或者**要保住书写形式**
 //! （`a/b` 的 `SkewedFraction` 属于这条）。
+//!
+//! 这条判据曾经是在**收拾一批多余的变体**：`Sqrt`/`Root`/`Accent`/`Line`/`Style`
+//! 五个变体留在枚举里当"形状描述符"，没有任何源码能把它们放进树里。那时这条用例是
+//! 唯一的守卫，因为把它们重新变成会存的节点照样能编译、照样能往返。
+//!
+//! **现在它们已经被删掉了**（见 `docs/validation.md` 的"清理不必要的 Kind"），
+//! 于是这条用例守的东西变小、但更硬：枚举里只剩会被存的变体，所以它断言的是
+//! "哪些变体真的会出现"——多一个或少一个都说明解析路径变了。`variant` 仍然是穷尽
+//! `match`，新增一个变体时编译器会要求在这里回答一次。
 //!
 //! 两个变体永远不在这个集合里，但**不是**因为它们多余：`Parameter` 与
 //! `TemplateCall` 只存在于宏模板的内部树，上线前就被 `bind_template_inner` 换掉
@@ -22,6 +26,12 @@ use typformula_core::{Action, Editor};
 fn variant(kind: &Kind) -> &'static str {
     // 穷尽 match：新增一个 `Kind` 时编译器会要求在这里给它一个名字，
     // 于是"它算不算会被存下来的 kind"这个问题必须被回答一次。
+    //
+    // 五个形状描述符（`Sqrt`/`Root`/`Accent`/`Line`/`Style`）**已经不在这里**：
+    // 它们从没被存进树，而唯一由它们携带、`Shape` 说不出的东西（`abs` 是哪对定界符、
+    // `overline` 在上还是在下）已经搬进 `config/commands.json`，所以它们整个从
+    // `Kind` 枚举里删掉了。从此"这个变体会不会被存"这个问题不再需要回答——枚举里
+    // 只剩会被存的变体。
     match kind {
         Kind::Char { .. } => "Char",
         Kind::Symbol { .. } => "Symbol",
@@ -32,19 +42,10 @@ fn variant(kind: &Kind) -> &'static str {
         Kind::Parameter { .. } => "Parameter",
         Kind::Text => "Text",
         Kind::Fraction => "Fraction",
-        Kind::Sqrt => "Sqrt",
-        Kind::Root => "Root",
         Kind::Scripts => "Scripts",
         Kind::Fenced { .. } => "Fenced",
         Kind::Table { .. } => "Table",
         Kind::Multiline { .. } => "Multiline",
-        Kind::Accent { .. } => "Accent",
-        Kind::Line { .. } => "Line",
-        // 穷尽 match 在这里就问了那个必须回答的问题：`Style` 会不会被存进树？答案是不会
-        // ——它和 `Accent`/`Line` 同类，是**形状描述符**：`bold(A)` 存成
-        // `MacroCall{ name: "bold" }`，形状由名字查出来。所以它不在下面的 `expected` 里，
-        // 而这个 match 让"新增一个 Kind 却不回答这个问题"变成编译错误。
-        Kind::Style { .. } => "Style",
         Kind::Unknown { .. } => "Unknown",
     }
 }
@@ -107,31 +108,48 @@ fn the_parser_stores_only_the_kinds_that_carry_their_own_data() {
     );
 }
 
-/// 反过来说：四个变体**只在形状表里活着**，`configured_kind` 会返回它们，但没有任何
-/// 源码能把它们存进树——`Sqrt`/`Root` 的两种写法都折进了 `MacroCall`，`Accent`/`Line`
-/// 的命令名由配置供给。
+/// 反过来的一面：借形状的命令**存成 `MacroCall`**，它长什么样全部由名字查出来。
 ///
-/// 它们仍然必须存在：`configured_kind` 拿它们当**取图数据**返回（`abs` 是哪对定界符、
-/// `hat` 是哪个记号），`Shape` 描述它们的槽位，`view_atom` 按它们画。所以这不是"该删没
-/// 删"，而是**这个 `Kind` 变体身兼两职**的证据——这也是为什么 `command_shape()` 与
-/// `is_macro()` 必须存在。拼写已经不靠它们了：`Grammar` 按 `Kind` 取，一个调用永远是
-/// `Write::Named`。
+/// 这条用例取代了原来的 `four_kinds_are_shape_descriptors_that_are_never_stored`。
+/// 那时 `Sqrt`/`Root`/`Accent`/`Line`/`Style` 五个变体留在 `Kind` 里当"形状描述符"，
+/// 用例守的是"它们不该被存进树"。现在它们**整个从枚举里删掉了**——枚举里只剩会被存的
+/// 变体，于是"会不会被存"不再是一个需要回答的问题。
+///
+/// 留下的是这条更直接的断言：这些命令只产生 `MacroCall`，而它的形状、线上排布与
+/// `marker` 全部能从配置查出来。配置是文件，所以这条检查必须存在。
 #[test]
-fn four_kinds_are_shape_descriptors_that_are_never_stored() {
-    for (name, shape) in [
-        ("sqrt", "Sqrt"), ("root", "Root"), ("hat", "Accent"), ("overline", "Line"),
+fn a_named_command_stores_a_call_and_borrows_its_shape() {
+    // (命令, 借的形状, 线上排布, marker)
+    for (name, shape, wire, marker) in [
+        ("frac", "fraction", "fraction", Some("-")),
+        ("sqrt", "sqrt", "decorated", Some("radical")),
+        ("root", "root", "root", Some("radical")),
+        ("hat", "decoration", "decorated", Some("hat")),
+        ("cancel", "decoration", "decorated", Some("cancel")),
+        ("overline", "line", "decorated", Some("overline")),
+        ("underline", "line", "decorated", Some("underline")),
+        ("abs", "delim", "decorated", Some("delim")),
+        ("norm", "delim", "decorated", Some("delim")),
+        ("bold", "style", "style", None),
     ] {
-        let descriptor = typformula_core::slots::configured_kind(name)
+        let borrowed = typformula_core::slots::configured_shape(name)
             .unwrap_or_else(|| panic!("{name} 应当有形状"));
-        assert_eq!(variant(&descriptor), shape, "{name} 的形状");
-        let editor = {
-            let mut editor = Editor::default();
-            editor.apply(Action::Import { source: format!("${name}(x)$") }).unwrap();
-            editor
-        };
+        assert_eq!(borrowed.view, shape, "{name} 借的形状");
+        assert!(typformula_core::slots::configured_draw(name).is_some(), "{name} 应当有画法");
+
+        let mut editor = Editor::default();
+        editor.apply(Action::Import { source: format!("${name}(x)$") }).unwrap();
         assert_eq!(
             variant(&editor.root[0].kind), "MacroCall",
-            "{name}(x) 应当存成 MacroCall（形状由名字查出来），而不是 {shape}",
+            "{name}(x) 应当存成 MacroCall（形状由名字查出来），而不是一个专门的 Kind",
         );
+        // The wire kind and marker come off that path too, not off any stored field.
+        let response = editor.response();
+        let top = &response.view.children[1];
+        assert_eq!(top.kind, wire, "{name} 的线上排布");
+        assert_eq!(top.marker.as_deref(), marker, "{name} 的 marker");
+        // A font variant carries its name instead: that is what the frontend asks the
+        // engine for the substituted glyphs by.
+        assert_eq!(top.style_name.as_deref(), (wire == "style").then_some(name), "{name} 的 style_name");
     }
 }

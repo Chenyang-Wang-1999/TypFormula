@@ -10,6 +10,8 @@
 - 想动手写 → 看 §2 速查表，遇到报错回来查 §3。
 - 想先做个小改动 → 直接跳 §6 的自测题。
 
+> **代码片段可能已经跑在前面了。** 这份文档讲的是 **Rust 的语法与概念**，例子取自本项目的某个时刻。内核经过多轮重构（`Kind` 收拢、`Decl` 拆成 `Grammar`/`Shape`、宏与命令表的改动……），片段里的行号与具体写法未必还对得上。想找对应代码时**以片段点名的文件为准，不要照抄片段**；凡是我知道已经过时的，就地写了说明。
+
 数组语法层面 Rust 和 C++ 很像，麻烦都在**所有权**和**trait**。这两块 §1 讲透，其余都是查表。
 
 ## 1. 五个心智转换
@@ -336,15 +338,18 @@ if children.iter().any(|n| matches!(n.kind(), SyntaxKind::Linebreak | SyntaxKind
 ### 4.8 match guard 与字段简写
 
 ```rust
+// 示意图：这条按名字给出形状的 match 已经不存在了——现在形状查的是
+// `config/commands.json`（`slots::configured_shape`），节点也统一存成
+// `MacroCall`，不再按名字造出各自的 `Kind`。留下它是因为下面两个语法点没变。
 let kind = match (name.as_str(), args.len()) {
-    ("frac", 2) => Kind::Fraction, ("sqrt", 1) => Kind::Sqrt, ("root", 2) => Kind::Root,
+    ("frac", 2) => Kind::Fraction,
     ("abs", 1) => Kind::Fenced { left: "|".into(), right: "|".into() },
-    ("overline" | "underline" | "hat" | "vec", 1) => Kind::Decoration { name },
-    ("mat", n) if n > 0 && widths.iter().all(|w| *w == widths[0]) => Kind::Table { columns: widths[0] },
+    ("mat", n) if n > 0 && widths.iter().all(|w| *w == widths[0]) => Kind::Table {
+        columns: widths[0], row_lengths: vec![widths[0]; n], name: name.clone(),
+    },
     _ => return vec![MathAtom::from_source(node.full_text())],
 };
 ```
-（`typst.rs:552-559`）
 
 `("mat", n) if n > 0 && ...` 里的 `if` 是 **match guard**：先按元组匹配名字与参数个数，再检查附加条件（各行列数一致才当矩阵，否则落到 `_` 退化成 Raw）。C++ 的 `switch` 没有这个，得写嵌套 `if`。
 
@@ -355,9 +360,9 @@ let kind = match (name.as_str(), args.len()) {
 ### 4.9 `usize::from(bool)`
 
 ```rust
-Kind::Root => usize::from(forward),
+self.cursor.pos = slice.atom + usize::from(forward);
 ```
-（`math.rs:58`）
+（`cursor.rs:301`）
 
 `bool` 转 `usize` 用 `usize::from(b)` 而不是 `b as usize`——前者是安全转换（`From` trait），后者是强制转换。Rust 鼓励前者。
 

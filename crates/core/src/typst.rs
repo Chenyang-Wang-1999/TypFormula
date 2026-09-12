@@ -742,7 +742,7 @@ pub fn has_glyph_run(data: &[MathData]) -> bool {
     !data.is_empty() && data.iter().all(|cell| cell.iter().all(|atom| match &atom.kind {
         Kind::Char { .. } | Kind::Symbol { .. } | Kind::Number | Kind::Text => true,
         Kind::MacroCall { .. } => {
-            matches!(atom.command_shape(), Some(Kind::Style { .. })) && has_glyph_run(&atom.cells)
+            atom.command_shape().is_some_and(|shape| shape.is_font_variant()) && has_glyph_run(&atom.cells)
         }
         _ => false,
     }))
@@ -755,17 +755,6 @@ pub fn has_glyph_run(data: &[MathData]) -> bool {
 /// which is what lets the parser look every command up in the one table.
 fn candidate_names() -> Vec<&'static str> {
     slots::command_names()
-}
-/// The cell indices a `Write::Template` names, in the order they appear.
-pub fn placeholder_indices(template: &str) -> Vec<usize> {
-    let mut out = vec![];
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        let close = match rest[open..].find('}') { Some(close) => open + close, None => break };
-        if let Ok(index) = rest[open + 1..close].parse::<usize>() { out.push(index); }
-        rest = &rest[close + 1..];
-    }
-    out
 }
 
 fn parse_marker(node: &SyntaxNode) -> MathData {    // A single marker can also be the complete expression in an argument.
@@ -793,8 +782,13 @@ pub fn write_cell(data: &MathData) -> String {
     }
     out
 }
-/// Fills a `slots::Write::Template`: `{0}`, `{1}`… are cell indices and
-/// `{name}` is the node's stored name.
+/// Fills a `slots::Write::Template`: `{0}`, `{1}`… are cell indices.
+///
+/// There used to be a `{name}` placeholder for the shapes that spelled themselves
+/// `{name}({0})` — `hat`, `bold` and the rest. Those are `MacroCall`s now and spell
+/// themselves through `Write::Named`, and the one template left (`frac`) has no name
+/// to substitute, so the placeholder and its `unreachable!` arm are gone. A template
+/// that reached for it is caught by `slots.rs`'s `a_template_only_names_placeholders_that_exist`.
 ///
 /// One pass rather than successive replacement: a cell's own source can contain
 /// braces (a text run is written as a quoted string), so substituting cell 0
@@ -806,18 +800,12 @@ fn fill_template(template: &str, atom: &MathAtom) -> String {
         out.push_str(&rest[..open]);
         let Some(close) = rest[open..].find('}') else { out.push_str(&rest[open..]); return out };
         let key = &rest[open + 1..open + close];
-        match key {
-            "name" => match &atom.kind {
-                Kind::MacroCall { name, .. } | Kind::Accent { name } => out.push_str(name),
-                other => unreachable!("模板用了 {{name}}，但 {other:?} 没有名字"),
-            },
-            other => match other.parse::<usize>().ok().and_then(|index| atom.cells.get(index)) {
-                Some(cell) => out.push_str(&write_cell(cell)),
-                // Keep an invented placeholder visible rather than dropping it,
-                // so the round-trip test fails loudly instead of silently
-                // writing a truncated node into the document.
-                None => { debug_assert!(false, "模板占位符 {{{other}}} 没有对应的格子"); out.push_str(&rest[open..open + close + 1]); }
-            },
+        match key.parse::<usize>().ok().and_then(|index| atom.cells.get(index)) {
+            Some(cell) => out.push_str(&write_cell(cell)),
+            // Keep an invented placeholder visible rather than dropping it,
+            // so the round-trip test fails loudly instead of silently
+            // writing a truncated node into the document.
+            None => { debug_assert!(false, "模板占位符 {{{key}}} 没有对应的格子"); out.push_str(&rest[open..open + close + 1]); }
         }
         rest = &rest[open + close + 1..];
     }
@@ -855,11 +843,6 @@ pub fn write_atom(atom: &MathAtom) -> String {
             run
         }
         Write::Template(template) => fill_template(template, atom),
-        Write::Positioned { above, below } => fill_template(match &atom.kind {
-            Kind::Line { above: true } => above,
-            Kind::Line { above: false } => below,
-            other => unreachable!("{other:?} 声明为按位置拼写，但它没有位置"),
-        }, atom),
         Write::Named => match &atom.kind {
             Kind::MacroCall { name, function } => if *function { format!("{name}({})", joined(&atom.cells)) } else { name.clone() },
             other => unreachable!("{other:?} 声明为具名调用"),
