@@ -17,7 +17,7 @@ from .runtime import default_workspace
 from .bridge import Core,Services
 from . import preview
 from .editor import Editor,SourceEditor,decorate_failed_formulas,MessagePanel
-from .mathview import Typesetter,MathCanvas
+from .mathview import Typesetter,MathCanvas,active_list
 from .svg import qt_svg
 from .rawcache import RawCache,signature,reusable,raw_key,signature_digest
 from .incremental import merge as incremental_merge
@@ -150,7 +150,7 @@ class Window(QMainWindow):
     def build_actions(self):
         files=self.menuBar().addMenu("文件");edit=self.menuBar().addMenu("编辑");view=self.menuBar().addMenu("视图")
         math=self.menuBar().addMenu("数学");tools=self.menuBar().addMenu("工具")
-        bar=self.addToolBar("文档");mathbar=self.addToolBar("数学")
+        bar=self.addToolBar("文档");mathbar=self.addToolBar("数学");listbar=self.addToolBar("列表")
         entries=[(files,"newFile","新建",self.new_file,"Ctrl+N",bar),(files,"openFile","打开…",self.open_file,"Ctrl+O",bar),
             (files,"save","保存",self.save,"Ctrl+S",bar),(files,"saveCopy","另存为…",lambda:self.save(True),"Ctrl+Shift+S",None),
             (files,"newWindow","新窗口",self.new_window,"Ctrl+Shift+N",None),(files,"importFile","导入 Typst / 插入资源…",self.import_file,None,None),
@@ -159,16 +159,18 @@ class Window(QMainWindow):
             (edit,"copy","复制",lambda:self.focus_edit("copy"),"Ctrl+C",None),(edit,"cut","剪切",lambda:self.focus_edit("cut"),"Ctrl+X",None),
             (edit,"paste","粘贴",lambda:self.focus_edit("paste"),"Ctrl+V",None),(edit,"findReplace","查找 / 替换…",self.find_replace,"Ctrl+H",None),
             (view,"toggleSource","显示 / 隐藏源码栏",lambda:self.source_dock.setVisible(not self.source_dock.isVisible()),None,None),
-            (view,"togglePreview","显示 / 隐藏实时预览",lambda:self.set_preview(not self.preview_dock.isVisible()),None,None),
+            (view,"togglePreview","显示 / 隐藏实时预览",lambda:self.set_preview(not self.preview_dock.isVisible()),None,bar),
             (view,"split","分栏",self.split,None,None),
             (view,"increaseEditorFont","放大编辑字号",lambda:self.change_font(1),"Ctrl+=",None),(view,"decreaseEditorFont","缩小编辑字号",lambda:self.change_font(-1),"Ctrl+-",None),
             (math,"insertInline","行内公式",lambda:self.insert_formula(False),"Ctrl+Alt+I",mathbar),
             (math,"insertDisplay","行间公式",lambda:self.insert_formula(True),"Ctrl+Alt+B",mathbar),
             (math,"finishFormula","完成公式",self.finish_formula,"Ctrl+Alt+Return",mathbar),
-            (math,"addRow","矩阵增加行",lambda:self.math_action("add_row"),None,mathbar),
-            (math,"addColumn","矩阵增加列",lambda:self.math_action("add_column"),None,mathbar),
+            (math,"addRow","新建行",lambda:self.math_action("add_row"),None,listbar),
+            (math,"addColumn","新建列",lambda:self.math_action("add_column"),None,listbar),
+            (math,"removeRow","删除行",lambda:self.math_action("remove_row"),None,listbar),
+            (math,"removeColumn","删除列",lambda:self.math_action("remove_column"),None,listbar),
             (math,"refreshMath","刷新全部 SVG 缓存",self.refresh_svg,None,mathbar),
-            (tools,"compilePdf","编译 PDF 并打开",self.compile_pdf,"F5",bar),
+            (tools,"compilePdf","编译 PDF 并打开",self.compile_pdf,"F5",None),
             (tools,"completion","自动补全",self.complete,"Ctrl+Space",None),
             (tools,"format","格式化",self.format_source,"Ctrl+Alt+F",None),
             (tools,"hover","显示符号说明",lambda:self.language_help.hover(self.source_view if self.source_view.hasFocus() else self.focused_editor()),"Ctrl+K, Ctrl+I",None),
@@ -176,6 +178,21 @@ class Window(QMainWindow):
             (tools,"settings","设置 / 快捷键…",self.configure,None,None),
             (tools,"packages","浏览 @local / @preview 包…",self.packages,None,None)]
         for entry in entries:self.action(*entry)
+        # The list toolbar is a toolbar of the *caret*, not of the window: all four
+        # commands act on the list the caret is inside, so it stays out of the way until
+        # there is one. `update_list_bar` is the only thing that shows it.
+        self.listbar=listbar;listbar.setVisible(False)
+
+    def update_list_bar(self):
+        """Show the list toolbar only while the caret is in a list.
+
+        A list is a matrix (`mat`, `vec`, `cases`) or an alignment, and the caret is in it
+        when it sits in one of its cells. That is read off the display tree the core has
+        just projected — the same tree the box is drawn from — so there is no second
+        opinion about what the caret's list is.
+        """
+        state=self.math_state
+        self.listbar.setVisible(bool(state) and active_list(state['view']) is not None)
 
     def report(self,message):self.statusBar().showMessage(str(message),12000)
 
@@ -462,6 +479,7 @@ class Window(QMainWindow):
         self.stamp_contexts(state['view'])
         self.active_position=position if position is not None else editor.mapping.display_position(from_byte(self.source,start))
         self.math_scroll.setParent(editor.viewport());self.math_canvas.refresh(state)
+        self.update_list_bar()
         if last and self.math_canvas.box.stops:self.math_action("click",cursor=self.math_canvas.box.stops[-1][3])
         self.reposition_math();self.math_scroll.show();self.math_scroll.raise_();self.math_canvas.setFocus()
         self.raw_cache.track(state,self.typesetter.cache);self.raw_timer.start()
@@ -521,7 +539,7 @@ class Window(QMainWindow):
             self.analysis=self.update_analysis(before,a,b,text,core_current=True);self.raw_cache.rebind(old,self.analysis)
             self.project(incremental=True);self.compile_timer.start()
         self.stamp_contexts(state['view'])
-        self.math_canvas.refresh(state);self.reposition_math()
+        self.math_canvas.refresh(state);self.reposition_math();self.update_list_bar()
         # A confirmed draft is the other deliberate act: the person has said what the
         # fragment should be, and wants to see whether it draws now. When the source did
         # change, `revision` moved and the refusal was already dropped; when it did not --
@@ -562,6 +580,7 @@ class Window(QMainWindow):
         if invalidated:self.invalidate_raw(invalidated);self.raw_timer.start()
         self.math_popup.hide()
         self.core.call("deactivate_formula");self.math_state=None;self.active_editor=None;self.math_scroll.hide()
+        self.update_list_bar()
         if focus and editor:editor.project((end,end));editor.setFocus()
         return True
 

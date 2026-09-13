@@ -31,7 +31,7 @@ pub enum Action {
     LspCompletions { draft: String, caret: usize, items: Vec<CommandCompletion> },
     Geometry { stops: Vec<StopGeometry> },
     Undo, Redo, Clear,
-    AddRow, AddColumn,
+    AddRow, AddColumn, RemoveRow, RemoveColumn,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct StopGeometry { pub cursor: Cursor, pub x: f64, pub y: f64 }
@@ -275,6 +275,8 @@ impl Editor {
             Action::Clear => { self.root.clear(); self.cursor = Cursor::default(); self.anchor = None; }
             Action::AddRow => self.grow_grid(false),
             Action::AddColumn => self.grow_grid(true),
+            Action::RemoveRow => self.shrink_grid(false),
+            Action::RemoveColumn => self.shrink_grid(true),
             Action::Geometry { .. } | Action::LspCompletions { .. } | Action::PreviewResult { .. } | Action::PreviewResults { .. } => unreachable!(),
         }
         let typed_before = self.typing;
@@ -952,5 +954,80 @@ impl Editor {
                 _ => {}
             }
         }
+    }
+    /// Remove the row or the column the caret is in.
+    ///
+    /// Which one goes is LyX's answer to the same request (`tabular-feature
+    /// delete-row` / `delete-column`): the one the caret sits in. So is the floor below
+    /// it — LyX's `delRow`/`delCol` return without doing anything at one row or one
+    /// column, and here the refusal is said out loud instead, because the toolbar that
+    /// offers the command is what a person just pressed.
+    ///
+    /// An alignment has a floor of its own, and it is **not** a cell count: `&` and `\\`
+    /// are the only things that make an alignment an alignment, so what has to survive is
+    /// one of those markers. A single row whose rows are one cell wide writes back as
+    /// plain content and reads back as a plain formula, which would leave the tree saying
+    /// something the source does not — the round trip `tests/round_trip.rs` guards. A
+    /// matrix has no such floor, because `mat(a)` is a spelling for one cell.
+    ///
+    /// The caret's `pos` becomes 0 rather than being kept: the cell it was sitting in is
+    /// the one that went away, so whatever now holds that index is a different cell.
+    fn shrink_grid(&mut self, column: bool) {
+        if self.pending().is_some() { self.message = "请先按 Enter 确认命令".into(); return; }
+        let outside = "请先进入矩阵或对齐公式的一个格子";
+        let Some(atom) = self.owner() else { self.message = outside.into(); return; };
+        let (columns, multiline, widths) = match &atom.kind {
+            Kind::Table { columns, row_lengths, .. } => (*columns, false, row_lengths.clone()),
+            Kind::Multiline { columns, row_lengths } => (*columns, true, row_lengths.clone()),
+            _ => { self.message = outside.into(); return; }
+        };
+        let columns = columns.max(1);
+        let rows = atom.cells.len() / columns;
+        let index = self.cursor.slices.last().unwrap().cell;
+        let (row, col) = (index / columns, index % columns);
+        let (rows_left, columns_left) = if column { (rows, columns - 1) } else { (rows - 1, columns) };
+        // What is left for the host to read back, checked before anything is removed. Only
+        // the rows that had a cell in the removed column get narrower; the padding of a
+        // short alignment row was never one of its visible cells.
+        let widths_left: Vec<usize> = if column {
+            widths.iter().map(|width| if *width > col { width - 1 } else { *width }).collect()
+        } else {
+            let mut rest = widths.clone();
+            if row < rest.len() { rest.remove(row); }
+            rest
+        };
+        let refusal = if columns_left == 0 || rows_left == 0 {
+            Some(if column { "只剩一列，无法删除" } else { "只剩一行，无法删除" })
+        } else if multiline && widths_left.len() < 2 && widths_left.first().copied().unwrap_or(0) < 2 {
+            Some("多行公式只剩一格，无法删除")
+        } else { None };
+        if let Some(message) = refusal { self.message = message.into(); return; }
+        let grid = self.owner_mut().unwrap();
+        if column {
+            // From the last row down, so every index is still the one it was computed as.
+            for r in (0..rows).rev() { grid.cells.remove(r * columns + col); }
+        } else {
+            grid.cells.drain(row * columns..(row + 1) * columns);
+        }
+        match &mut grid.kind {
+            Kind::Table { columns: count, row_lengths, .. } if column => {
+                // A matrix is a complete rectangle: every row has every column.
+                *count = columns_left; row_lengths.fill(columns_left);
+            }
+            Kind::Multiline { columns: count, row_lengths } if column => {
+                for length in row_lengths.iter_mut() { if *length > col { *length -= 1; } }
+                *count = columns_left;
+            }
+            Kind::Table { row_lengths, .. } | Kind::Multiline { row_lengths, .. } => { row_lengths.remove(row); }
+            _ => {}
+        }
+        // A selection is expressed in the cell that just went away (LyX clears it too).
+        self.anchor = None;
+        self.cursor.pos = 0;
+        self.cursor.slices.last_mut().unwrap().cell = if column {
+            row * columns_left + col.min(columns_left - 1)
+        } else {
+            row.min(rows_left - 1) * columns + col
+        };
     }
 }

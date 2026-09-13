@@ -88,6 +88,74 @@ fn matrices_have_lyx_cells_and_typst_semicolon_output() {
     e.apply(Action::AddRow).unwrap(); assert_eq!(e.root[0].cells.len(),9);
 }
 #[test]
+fn a_matrix_loses_the_row_and_the_column_the_caret_is_in() {
+    // Filled column by column so the caret ends where it started: the first row of
+    // the first column, which is the row and column these commands name.
+    let mut e = Editor::default(); insert(&mut e,"mat");
+    for s in ["a","b","c","d"] { input(&mut e,s); key(&mut e,"Tab"); }
+    assert_eq!(source(&e),"mat(a, b; c, d)"); assert_eq!(e.cursor.slices[0].cell,0);
+    e.apply(Action::RemoveColumn).unwrap();
+    assert_eq!(source(&e),"mat(b; d)");
+    // The caret stays in the row and the column it was in: `a`'s column went away, so
+    // its index now holds what was in the next column of the same row. One row down
+    // the same column is where `RemoveRow` then acts.
+    assert_eq!(e.cursor.slices[0].cell,0); assert_eq!(e.cursor.pos,0);
+    e.apply(Action::RemoveRow).unwrap();
+    assert_eq!(source(&e),"mat(d)");
+    e.apply(Action::RemoveColumn).unwrap();
+    assert_eq!(source(&e),"mat(d)"); assert_eq!(e.message,"只剩一列，无法删除");
+    e.apply(Action::RemoveRow).unwrap();
+    assert_eq!(source(&e),"mat(d)"); assert_eq!(e.message,"只剩一行，无法删除");
+    // `mat(a)` is a spelling, so one cell is where a matrix legitimately stops.
+    assert_eq!(load(&source(&e)).root,e.root);
+}
+#[test]
+fn the_caret_row_decides_which_row_of_a_matrix_goes() {
+    let mut e=load("mat(a, b; c, d)");
+    // Into the table, then down one row: the caret is in `c`'s row.
+    key(&mut e,"ArrowRight"); key(&mut e,"ArrowDown");
+    assert_eq!(e.cursor.slices[0].cell,2);
+    e.apply(Action::RemoveRow).unwrap();
+    assert_eq!(source(&e),"mat(a, b)");
+    // The last row went away, so the caret moves up to the row that is left.
+    assert_eq!(e.cursor.slices[0].cell,0);
+}
+#[test]
+fn an_alignment_keeps_a_marker_or_says_why_it_cannot_shrink() {
+    // Rows of two, one and two: the removed row's own width is what has to be dropped
+    // from the flat cell list, padding included.
+    let mut e=load("a & b \\ c \\ d & e");
+    key(&mut e,"ArrowRight"); key(&mut e,"ArrowDown"); assert_eq!(e.cursor.slices[0].cell,2);
+    e.apply(Action::RemoveRow).unwrap();
+    assert_eq!(source(&e),"a & b \\\nd & e");
+    assert_eq!(e.cursor.slices[0].cell,2);
+    assert_eq!(load(&source(&e)).root,e.root);
+    e.apply(Action::RemoveColumn).unwrap();
+    assert_eq!(source(&e),"b \\\ne");
+    assert_eq!(load(&source(&e)).root,e.root);
+    // One row and one column left: `b \\ e` would write as `e`, which reads back as a
+    // plain formula rather than an alignment, so the last step is refused.
+    e.apply(Action::RemoveRow).unwrap();
+    assert_eq!(source(&e),"b \\\ne"); assert_eq!(e.message,"多行公式只剩一格，无法删除");
+    e.apply(Action::RemoveColumn).unwrap();
+    assert_eq!(source(&e),"b \\\ne"); assert_eq!(e.message,"只剩一列，无法删除");
+}
+#[test]
+fn deleting_a_row_is_one_undo_step() {
+    let mut e=load("mat(a, b; c, d)");
+    key(&mut e,"ArrowRight");
+    e.apply(Action::RemoveRow).unwrap(); assert_eq!(source(&e),"mat(c, d)");
+    e.apply(Action::Undo).unwrap(); assert_eq!(source(&e),"mat(a, b; c, d)");
+    e.apply(Action::Redo).unwrap(); assert_eq!(source(&e),"mat(c, d)");
+}
+#[test]
+fn a_caret_outside_a_grid_is_told_where_the_command_works() {
+    let mut e=load("frac(a, b)");
+    e.apply(Action::RemoveRow).unwrap();
+    assert_eq!(e.message,"请先进入矩阵或对齐公式的一个格子");
+    assert_eq!(source(&e),"frac(a, b)");
+}
+#[test]
 fn typst_parser_roundtrips_supported_layouts_and_keeps_code_hashes() {
     for s in ["frac(12, sqrt(x))", "root(3, y)", "x_1^2", "(a + b)", "mat(a, b; c, d)", "\"hello world\"", "#foo + alpha"] {
         let first=load(s);let serialized=source(&first);let second=load(&serialized);

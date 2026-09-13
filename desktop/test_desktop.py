@@ -10,7 +10,7 @@ from PyQt5.QtGui import QTextCursor,QImage,QPainter,QFontDatabase,QFont
 from PyQt5.QtCore import Qt,QEventLoop,QTimer,QRect
 from .model import Projection,to_byte,from_byte,u16,from_u16,validate_settings,atomic_write
 from .bridge import Core
-from .mathview import Typesetter
+from .mathview import Typesetter,active_list
 from .window import Window,initial_window_geometry
 from .rawcache import signature,raw_key
 
@@ -502,6 +502,58 @@ class NativeTest(unittest.TestCase):
         self.assertEqual(window.source,'$mat(a, b; c, z)$')
         window.finish_formula();window.activate(0)
         self.assertIn('z',str(window.math_state['view']))
+
+    def test_the_list_toolbar_follows_the_caret_into_a_matrix(self):
+        self.load('$mat(1, 2; 3, 4)$');window=self.window
+        # `isVisible` answers for the whole ancestor chain, so the window has to be on
+        # screen for the toolbar's own state to be what it reports.
+        window.show();APPLICATION.processEvents()
+        self.assertFalse(window.listbar.isVisible(),'没有活动公式时不该有列表工具栏')
+        window.activate(0)
+        self.assertFalse(window.listbar.isVisible(),'光标还在公式根上，矩阵没有被激活')
+        window.math_action('key',key='ArrowRight')
+        self.assertEqual(window.math_state['cursor']['slices'][0]['cell'],0)
+        self.assertTrue(window.listbar.isVisible(),'光标进了矩阵的格子，列表工具栏该出来')
+        window.math_action('key',key='ArrowRight')
+        self.assertTrue(window.listbar.isVisible(),'在同一行的下一格仍在这个列表里')
+        window.finish_formula()
+        self.assertFalse(window.listbar.isVisible(),'离开公式后列表工具栏该收起来')
+        window.hide()
+
+    def test_the_list_toolbar_also_serves_an_alignment(self):
+        self.load('$a & b \\\\ c & d$');window=self.window
+        window.show();APPLICATION.processEvents()
+        window.activate(0);window.math_action('key',key='ArrowRight')
+        self.assertEqual(active_list(window.math_state['view'])['kind'],'multiline')
+        self.assertTrue(window.listbar.isVisible())
+        # 光标移回公式根：对齐容器还在，但列表不再“被激活”。
+        window.math_action('key',key='ArrowLeft')
+        self.assertIsNone(active_list(window.math_state['view']))
+        self.assertFalse(window.listbar.isVisible())
+        window.hide()
+
+    def test_the_list_toolbar_commands_edit_the_list_the_caret_is_in(self):
+        self.load('$mat(a, b; c, d)$');window=self.window
+        window.activate(0);window.math_action('key',key='ArrowRight')
+        window.commands['removeColumn'][0].trigger()
+        self.assertEqual(window.source,'$mat(b; d)$')
+        window.commands['addRow'][0].trigger()
+        self.assertEqual(window.source,'$mat(b; d; "")$')
+        window.commands['removeRow'][0].trigger()
+        self.assertEqual(window.source,'$mat(d; "")$')
+        window.commands['removeRow'][0].trigger()
+        self.assertEqual(window.source,'$mat("")$')
+        window.commands['removeColumn'][0].trigger()
+        self.assertEqual(window.source,'$mat("")$')
+
+    def test_deleting_the_last_row_of_a_list_says_why_it_cannot(self):
+        self.load('$mat(a)$');window=self.window
+        window.activate(0);window.math_action('key',key='ArrowRight')
+        self.assertEqual(window.math_state['cursor']['slices'][0]['cell'],0)
+        window.commands['removeRow'][0].trigger()
+        self.assertEqual(window.source,'$mat(a)$')
+        self.assertEqual(window.math_state['message'],'只剩一行，无法删除')
+        self.assertIn('只剩一行',window.statusBar().currentMessage())
 
     def test_definition_block_enters_by_arrows_and_enter_commits(self):
         from PyQt5.QtGui import QKeyEvent

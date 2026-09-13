@@ -29,6 +29,40 @@ def mark_active_path(view, slices):
         return found
     visit(view)
 
+# The display kinds that are a list of cells: a matrix (`mat`, `vec`, `cases`) and an
+# alignment. Both carry `columns` and one `row_lengths` entry per row, which is what the
+# list toolbar reads to know how much is left to delete.
+LIST_KINDS=('table','multiline')
+
+def active_list(view):
+    """The innermost list the caret is in, or None. Run after `mark_active_path`.
+
+    The caller has just marked the caret's ancestors, so the list whose cell holds the
+    caret is the innermost `table`/`multiline` node on that path. Following the core's
+    active stop rather than the caret's own indices is what keeps this right: the caret's
+    stops exist only in storage cells, so a list on the marked path is always an editable
+    one. Measured on a macro whose body is a matrix (`#let n(a) = $mat(1, 2; #a, 4)$`):
+    the projection has no `table` node at all, and the command refuses the same way this
+    returns None.
+
+    A selection is the one state the core marks no active stop in (`response` activates
+    the caret only when there is no anchor), and the atoms it selects are the caret's own
+    cell's, so the marked selection answers the same question and keeps the toolbar from
+    blinking away while a piece of a cell is selected.
+    """
+    def innermost(node,marked,grid):
+        if node.get('kind') in LIST_KINDS:grid=node
+        for child in node.get('children',[]):
+            found=innermost(child,marked,grid)
+            if found is not None:return found
+        # Only the ancestors of one stop are marked, so they form a single chain: the
+        # deepest marked node is the cell the caret is in, and `grid` is the innermost
+        # list it belongs to.
+        return grid if node.get(marked) else None
+    # `_active` is what `mark_active_path` writes (the stop itself carries `active`).
+    found=innermost(view,'_active',None)
+    return found if found is not None else innermost(view,'selected',None)
+
 class BitmapCache:
     """Bounded device-pixel cache; SVG paths are interpreted only once.
 
