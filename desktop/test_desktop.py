@@ -545,6 +545,396 @@ class NativeTest(unittest.TestCase):
         window.editor.expanded.clear();window.editor.project()
         self.assertEqual(window.editor.toPlainText(),"\ufffc")
 
+    def test_enter_lands_on_the_line_it_just_opened(self):
+        """The caret belongs on the new line, not at the next line's first character.
+
+        Enter at the end of `Text one`, with a blank line and a formula after it, must give
+        `Text one` + newline + **caret** + the two newlines that were already there. The text
+        is the same whichever newline the insertion is recorded at, so the *edit position* is
+        ambiguous and only Qt's caret says which was meant.
+        """
+        from PyQt5.QtTest import QTest
+        window=self.window;self.load("Text one\n\n$ a + b $\n\nText two")
+        editor=window.editor;window.show();editor.setFocus();APPLICATION.processEvents()
+        cursor=editor.textCursor();cursor.setPosition(editor.mapping.display_position(8))
+        editor.setTextCursor(cursor);APPLICATION.processEvents()
+        QTest.keyClick(editor,Qt.Key_Return);APPLICATION.processEvents()
+        self.assertEqual(window.source,"Text one\n\n\n$ a + b $\n\nText two")
+        self.assertEqual(editor.toPlainText(),"Text one\n\n\n\ufffc\n\nText two")
+        self.assertEqual(editor.expanded,set(),"回车不得展开下一行的公式")
+        # The caret is on the line the break opened: right after the newline it inserted,
+        # which is source offset 9 -- not 11, where the formula starts.
+        self.assertEqual(editor.source_selection(),(9,9))
+        self.assertEqual(editor.textCursor().position(),9)
+        self.assertEqual(editor.textCursor().blockNumber(),1)
+
+    def test_typing_beside_an_identical_character_keeps_the_caret_next_to_it(self):
+        """The same ambiguity without Enter: an insertion inside a run of the same character.
+
+        Typing `x` at the start of `xx` makes `xxx`, and every one of the three positions
+        produces that text. The caret must stay after the character just typed.
+        """
+        from PyQt5.QtTest import QTest
+        window=self.window;self.load("xx")
+        editor=window.editor;window.show();editor.setFocus();APPLICATION.processEvents()
+        cursor=editor.textCursor();cursor.setPosition(0);editor.setTextCursor(cursor)
+        QTest.keyClicks(editor,"x");APPLICATION.processEvents()
+        self.assertEqual(window.source,"xxx")
+        self.assertEqual(editor.textCursor().position(),1,"光标应停在刚输入的字符之后")
+
+    def test_enter_at_the_start_of_a_document_inserts_one_line(self):
+        from PyQt5.QtTest import QTest
+        window=self.window;self.load("alpha\nbeta")
+        editor=window.editor;window.show();editor.setFocus();APPLICATION.processEvents()
+        cursor=editor.textCursor();cursor.setPosition(0);editor.setTextCursor(cursor)
+        QTest.keyClick(editor,Qt.Key_Return);APPLICATION.processEvents()
+        self.assertEqual(window.source,"\nalpha\nbeta")
+        self.assertEqual(editor.textCursor().position(),1)
+
+    def test_enter_in_the_source_dock_keeps_both_carets_on_the_new_line(self):
+        """The dock is a second entry point for the same edit, with its own caret.
+
+        It captures its caret before applying the edit, and the editor derives its own from
+        the edit's position, so the two agree only if the edit is placed where the dock's
+        caret is -- not at the end of the run of newlines, where a bare diff puts it.
+        """
+        from PyQt5.QtTest import QTest
+        window=self.window;self.load("Text one\n\n$ a + b $\n\nText two")
+        window.show();window.source_dock.show();APPLICATION.processEvents()
+        view=window.source_view;view.setFocus();APPLICATION.processEvents()
+        cursor=view.textCursor();cursor.setPosition(8);view.setTextCursor(cursor)
+        APPLICATION.processEvents()
+        QTest.keyClick(view,Qt.Key_Return);APPLICATION.processEvents()
+        self.assertEqual(window.source,"Text one\n\n\n$ a + b $\n\nText two")
+        self.assertEqual(view.textCursor().position(),9)
+        self.assertEqual(window.editor.source_selection(),(9,9),"编辑区光标要跟着源码栏落到新行")
+
+    def test_backspace_inside_blank_lines_stays_where_it_deleted(self):
+        """Deleting has the same ambiguity as inserting: which newline of the run went?
+
+        A backspace in a run of blank lines removes *the one before the caret*, and the
+        caret belongs where that line was. Taking the diff's answer -- the end of the run --
+        moves the caret past the remaining blank lines, to the first character after them.
+        """
+        from PyQt5.QtTest import QTest
+        window=self.window;self.load("$x$\n\n\n\nsome text")
+        editor=window.editor;window.show();editor.setFocus();APPLICATION.processEvents()
+        # The caret sits between the second and third blank line (source offset 5).
+        cursor=editor.textCursor();cursor.setPosition(editor.mapping.display_position(5))
+        editor.setTextCursor(cursor);APPLICATION.processEvents()
+        self.assertEqual(editor.source_selection(),(5,5))
+        QTest.keyClick(editor,Qt.Key_Backspace);APPLICATION.processEvents()
+        self.assertEqual(window.source,"$x$\n\n\nsome text")
+        self.assertEqual(editor.source_selection(),(4,4),"退格后光标应停在被删掉的那一行上")
+
+    def test_backspace_in_a_plain_text_newline_run(self):
+        from PyQt5.QtTest import QTest
+        window=self.window;self.load("a\n\n\nb")
+        editor=window.editor;window.show();editor.setFocus();APPLICATION.processEvents()
+        cursor=editor.textCursor();cursor.setPosition(3);editor.setTextCursor(cursor)
+        QTest.keyClick(editor,Qt.Key_Backspace);APPLICATION.processEvents()
+        self.assertEqual(window.source,"a\n\nb")
+        self.assertEqual(editor.textCursor().position(),2)
+
+    def test_a_formula_kept_as_source_shows_its_reason_on_hover(self):
+        """The reason a formula cannot be compiled has to be readable, not just implied.
+
+        A red wave says "this is broken"; the tooltip is the only place the *reason* is
+        written. Two things used to swallow it: the editor draws a formula as one object
+        character, so the style's source range collapsed to a zero-length selection that
+        `mergeCharFormat` writes nothing into, and the source dock is fed plain text, so it
+        never received the style at all.
+        """
+        from PyQt5.QtGui import QTextCursor,QMouseEvent
+        from PyQt5.QtCore import QEvent,QPoint
+        from .model import u16
+        window=self.window;self.load("#let hidden = [inside $x+y$]")
+        window.show();window.source_dock.show();APPLICATION.processEvents()
+        failure=next(f for f in window.analysis["formulas"] if f.get("editable") is False)
+        reason=failure["reason"]
+        self.assertTrue(reason)
+        style=next(s for s in window.analysis["styles"] if s["kind"]=="formula_error")
+        self.assertEqual(style["text"],reason)
+
+        def move_at(point):
+            APPLICATION.sendEvent(window.editor.viewport(),
+                                  QMouseEvent(QEvent.MouseMove,point,Qt.NoButton,Qt.NoButton,Qt.NoModifier))
+
+        # The source dock shows the formula's own text, so its tooltip is on that text.
+        # It is written as a character format, because the dock gets plain text.
+        dock_at=u16(window.source[:style["start"]+2])
+        cursor=QTextCursor(window.source_view.document());cursor.setPosition(dock_at)
+        self.assertEqual(cursor.charFormat().toolTip(),reason,"源码栏的失败公式要带报错原因")
+        # The editor draws the whole formula as one object character, whose format cannot
+        # carry a tooltip, so the reason becomes the viewport's own tooltip as the pointer
+        # moves over it -- which is the tooltip Qt then shows after its hover delay.
+        over=QTextCursor(window.editor.document())
+        over.setPosition(window.editor.mapping.display_position(style["start"]))
+        move_at(window.editor.cursorRect(over).center())
+        self.assertEqual(window.editor.viewport().toolTip(),reason,"编辑区悬停公式对象要给出报错原因")
+        # A pristine document has no failure to explain, so hovering explains nothing.
+        self.load("plain text, nothing broken")
+        window.show();APPLICATION.processEvents()
+        move_at(QPoint(4,4))
+        self.assertEqual(window.editor.viewport().toolTip(),"")
+
+    def test_a_refused_fragment_comes_back_with_the_compilers_own_message(self):
+        """End to end through the real adapter: the fragment id *and* why it failed.
+
+        `#let z = 1` needs the semicolon its range excludes, so it cannot compile on its
+        own while `cancel(y)` can. The id says which fragment; only the engine's diagnostic
+        says why, and it is what the dock has to show.
+        """
+        source='$ #let z = 1; z + cancel(y) $'
+        a=source.index('#let z = 1');b=a+len('#let z = 1')
+        c=source.index('cancel(y)');d=c+len('cancel(y)')
+        to_bytes=lambda text:len(text.encode('utf-8'))
+        body={'path':'main.typ','source':source,'formulas':[],
+              'raw':[{'id':'0','start':to_bytes(source[:a]),'end':to_bytes(source[:b]),'occurrence':0},
+                     {'id':'1','start':to_bytes(source[:c]),'end':to_bytes(source[:d]),'occurrence':0}]}
+        result=self.service('/api/render',body)
+        self.assertTrue(result.get('salvaged'),result)
+        self.assertIn('0',result['failed'],result)
+        self.assertNotIn('1',result['failed'],"能编译的片段不该被报为失败")
+        message=(result.get('errors') or {}).get('0')
+        self.assertTrue(message,"失败片段必须带回引擎自己的诊断：%s"%result)
+        self.assertEqual(len(result['items']),1)
+        # The message is the compiler's, about the spliced source -- not the language
+        # service's wording, and not a document position.
+        self.assertIn('semicolon',message,message)
+
+    def test_the_dock_shows_the_compile_error_of_the_fragment_it_came_from(self):
+        from unittest.mock import patch
+        window=self.window;self.load('$ cancel(x) + undefined_op(y) $')
+        window.compile_timer.stop();window.raw_timer.stop()
+        seen=[]
+        def request(route,body,callback,key=None,dropped=None):
+            if route!='/api/render':callback({},None);return
+            ids=[r['id'] for r in body['raw']];seen.append(ids)
+            callback({'items':[],'failed':ids,'errors':{ids[0]:'unknown variable: undefined'}},None)
+        with patch.object(window.services,'request',side_effect=request):
+            window.load_raw();APPLICATION.processEvents();window.raw_timer.stop()
+        self.assertTrue(seen,"必须真的问过渲染服务")
+        self.assertTrue(window.render_errors,"失败片段的原因要留下")
+        window.show();window.source_dock.show();APPLICATION.processEvents()
+        shown=window.source_messages.render.body.toPlainText()
+        self.assertIn('unknown variable: undefined',shown,shown)
+        self.assertTrue(window.source_messages.render.isVisible())
+        # The language service said nothing, so its section stays empty and the two are
+        # never mixed into one list.
+        self.assertEqual(window.source_messages.language.body.toPlainText(),"")
+        # A refusal belongs to the revision it was made in, so it takes an edit to retry
+        # the fragment -- and the image that comes back ends the error.
+        def drawing(route,body,callback,key=None,dropped=None):
+            if route!='/api/render':callback({},None);return
+            ids=[r['id'] for r in body['raw']]
+            callback({'items':[{'id':ids[0],'start':0,'end':1,'svg':'<svg/>','width':1.0,'height':1.0,
+                                'baseline':0.0,'base_font_size_pt':1.0,'base_font_height_pt':1.0,
+                                'base_font_baseline_pt':1.0}],'failed':[],'errors':{}},None)
+        with patch.object(window.services,'request',side_effect=drawing):
+            window.replace(0,0," ");window.load_raw();APPLICATION.processEvents();window.raw_timer.stop()
+        self.assertEqual(window.render_errors,{},"画出来了就不该再报")
+
+    def test_a_failed_render_is_announced_in_the_bottom_message_bar(self):
+        """A box that comes back dashed has to say why without being hovered.
+
+        A hover must be discovered, and the moment this matters most is right after a
+        command is confirmed: a box the person just asked for comes back wearing the
+        "nothing to lay out here" dress, and the reason is the only thing that tells them
+        what to type instead. The bottom bar is where every other failure of this window is
+        already said, so the reason is said there too.
+        """
+        window=self.window;self.load('$ cancel(x) + undefined_op(y) $')
+        window.compile_timer.stop();window.raw_timer.stop()
+        window.statusBar().clearMessage()
+        def request(route,body,callback,key=None,dropped=None):
+            if route!='/api/render':callback({},None);return
+            ids=[r['id'] for r in body['raw']]
+            callback({'items':[],'failed':ids,'errors':{ids[0]:'expected semicolon or line break'}},None)
+        with patch.object(window.services,'request',side_effect=request):
+            window.load_raw();APPLICATION.processEvents();window.raw_timer.stop()
+        shown=window.statusBar().currentMessage()
+        self.assertIn('expected semicolon or line break',shown,"渲染失败要出现在底部消息栏：%r"%shown)
+        self.assertIn('渲染失败',shown,shown)
+        # A batch that draws everything says nothing: the bar is for failures.
+        window.statusBar().clearMessage()
+        def drawing(route,body,callback,key=None,dropped=None):
+            if route!='/api/render':callback({},None);return
+            ids=[r['id'] for r in body['raw']]
+            callback({'items':[{'id':i,'start':0,'end':1,'svg':'<svg/>','width':9.0,'height':9.0,
+                                'baseline':6.0,'base_font_size_pt':9.0,'base_font_height_pt':9.0,
+                                'base_font_baseline_pt':6.0} for i in ids],'failed':[],'errors':{}},None)
+        with patch.object(window.services,'request',side_effect=drawing):
+            window.replace(0,0," ");window.load_raw();APPLICATION.processEvents();window.raw_timer.stop()
+        self.assertEqual(window.statusBar().currentMessage(),"","渲染成功不该弹消息")
+
+    def test_a_failed_glyph_request_is_also_announced(self):
+        """The other box of the same colour: a font variant whose glyphs never came back.
+
+        It is drawn exactly like a fragment whose image did not come back, so it has to say
+        why in the same place rather than only looking broken.
+        """
+        window=self.window;self.load('$ bold(A) + B $')
+        window.compile_timer.stop()
+        # The load above already asked (unpatched), so its answer is pending; clear both
+        # caches so this pass is the one that asks and fails.
+        window.typesetter.glyphs.clear();window.glyph_pending.clear()
+        window.statusBar().clearMessage()
+        def request(route,body,callback,key=None,dropped=None):
+            if route=='/api/glyphs':callback({'items':[{'error':'字体替换失败'}]},None)
+            else:callback({},None)
+        with patch.object(window.services,'request',side_effect=request):
+            window.load_glyphs();APPLICATION.processEvents()
+        shown=window.statusBar().currentMessage()
+        self.assertIn('字体替换失败',shown,"取字形失败要出现在底部消息栏：%r"%shown)
+
+    def test_entering_a_failed_box_and_confirming_asks_the_renderer_again(self):
+        """A refusal is scoped to its revision, so opening the box alone asked for nothing.
+
+        Measured before this change: one `/api/render` for the whole round trip -- failing,
+        entering the formula, entering the fragment's source, escaping and leaving all
+        produced none, because the text had not changed and the fragment was cached as
+        refused. Entering the box is how a person says "look at this one again", and
+        confirming a draft is how they say what it should be, so both now clear the refusal
+        and let the next pass ask.
+        """
+        from .rawcache import raw_key
+        window=self.window;self.load('$ undefinedname $')
+        window.compile_timer.stop();window.diagnostic_timer.stop();window.completion_timer.stop()
+        asked=[]
+        def request(route,body,callback,key=None,dropped=None):
+            if route!='/api/render':callback({},None);return
+            ids=[r['id'] for r in body['raw']];asked.append(ids)
+            callback({'items':[],'failed':ids,
+                      'errors':{i:'unknown variable: undefinedname' for i in ids}},None)
+        def settle(milliseconds=300):
+            """Let the render timer fire; stopping it would hide what is being tested."""
+            loop=QEventLoop();QTimer.singleShot(milliseconds,loop.quit);loop.exec_()
+        with patch.object(window.services,'request',side_effect=request):
+            window.load_raw();settle()
+            self.assertEqual(len(asked),1,"第一次失败要问一次")
+            node=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n.get('kind')=='raw')
+            self.assertIs(window.typesetter.cache[raw_key(node)],False,"失败要被记下")
+            # Entering the box.
+            window.statusBar().clearMessage()
+            window.activate(0);settle()
+            self.assertEqual(len(asked),2,"进入失败框要重新问一次")
+            self.assertIs(window.typesetter.cache[raw_key(node)],False,"再问一次还是失败，就再记一次")
+            self.assertIn('unknown variable: undefinedname',window.statusBar().currentMessage(),
+                          "重新渲染又失败，原因要再说一次")
+            # Enter inside the draft, with the text unchanged.
+            window.math_action('key',key='ArrowRight');settle()
+            self.assertTrue(window.math_state['pending'],"光标要进入片段草稿")
+            before=len(asked)
+            window.math_action('key',key='Enter');settle()
+            self.assertEqual(len(asked),before+1,"回车确认后要重新渲染")
+            # Idle passes do not keep asking: exactly one attempt per deliberate act.
+            settled=len(asked)
+            for _ in range(3):
+                window.load_raw();settle(50)
+            self.assertEqual(len(asked),settled,"没有新动作就不该反复编译")
+
+    def test_the_dock_reports_a_whole_batch_compile_failure_separately(self):
+        from unittest.mock import patch
+        window=self.window;self.load('$ cancel(x) + undefined_op(y) $')
+        window.compile_timer.stop();window.raw_timer.stop()
+        def request(route,body,callback,key=None,dropped=None):
+            if route=='/api/render':callback(None,'expected expression, found end of file')
+            else:callback({},None)
+        with patch.object(window.services,'request',side_effect=request):
+            window.load_raw();APPLICATION.processEvents();window.raw_timer.stop()
+        self.assertEqual(window.render_error,'expected expression, found end of file')
+        window.show();window.source_dock.show();APPLICATION.processEvents()
+        shown=window.source_messages.render.body.toPlainText()
+        self.assertIn('expected expression, found end of file',shown,shown)
+
+    def test_the_dock_reports_language_service_diagnostics_with_their_line(self):
+        from unittest.mock import patch
+        from .model import u16
+        window=self.window;self.load('first line\n$ x + lr(a, size: #100%) $')
+        window.compile_timer.stop();window.diagnostic_timer.stop()
+        formula=next(f for f in window.analysis['formulas'] if f.get('view'))
+        marked=next(n for n in window.view_nodes(formula['view']) if n.get('render_id'))
+        start,end=(int(part) for part in marked['render_id'].split(':')[:2])
+        prefix=window.source[:start];line=prefix.count('\n');line_start=prefix.rfind('\n')+1
+        diagnostic={'range':{'start':{'line':line,'character':u16(window.source[line_start:start])},
+                             'end':{'line':line,'character':u16(window.source[line_start:end])}},
+                    'message':'unknown variable'}
+        with patch.object(window.lsp,'request',side_effect=lambda r,b,cb,key=None:cb({'diagnostics':[diagnostic]},None)):
+            window.request_diagnostics()
+        window.show();window.source_dock.show();APPLICATION.processEvents()
+        shown=window.source_messages.language.body.toPlainText()
+        self.assertIn('unknown variable',shown,shown)
+        self.assertIn('第 2 行',shown,"语言服务的诊断要带它在文档里的行号：%s"%shown)
+        # The layout service failed nothing, so its section is empty: the two engines are
+        # shown apart, never as one merged list.
+        self.assertEqual(window.source_messages.render.body.toPlainText(),"")
+        self.assertTrue(window.source_messages.isVisible())
+
+    def test_hovering_a_refused_fragment_box_says_why_it_could_not_be_drawn(self):
+        """The message is attached to the box, not only listed somewhere else.
+
+        A fragment with no image is drawn as a dashed box holding its own source, and that
+        box is what the person is looking at, so hovering it is where the reason has to be.
+        The fragment that *did* draw stays silent: otherwise the mark would be smeared over
+        the whole formula and would not say which part failed.
+        """
+        from PyQt5.QtGui import QTextCursor
+        from PyQt5.QtCore import QPoint,QPointF,QEvent
+        from PyQt5.QtGui import QMouseEvent
+        window=self.window;self.load('$ cancel(x) + undefined_op(y) $')
+        window.compile_timer.stop();window.raw_timer.stop()
+        formula=window.analysis['formulas'][0]
+        nodes=[n for n in window.view_nodes(formula['view']) if n.get('kind') in ('raw','raw_macro')]
+        self.assertEqual(len(nodes),2,nodes)
+        refused,drawn=nodes[0],nodes[1]
+        message='unknown variable: undefined'
+        def source_id(node):return ':'.join(node['render_id'].split(':')[:2])
+        def request(route,body,callback,key=None,dropped=None):
+            if route!='/api/render':callback({},None);return
+            ids=sorted(r['id'] for r in body['raw'])
+            self.assertEqual(ids,sorted(source_id(n) for n in nodes),"请求的片段 id 要与视图节点对得上")
+            callback({'items':[{'id':source_id(drawn),'start':0,'end':1,'svg':'<svg/>','width':9.0,'height':9.0,
+                                'baseline':6.0,'base_font_size_pt':9.0,'base_font_height_pt':9.0,
+                                'base_font_baseline_pt':6.0}],
+                      'failed':[source_id(refused)],'errors':{source_id(refused):message}},None)
+        with patch.object(window.services,'request',side_effect=request):
+            window.load_raw();APPLICATION.processEvents();window.raw_timer.stop()
+        # The message rides on the node the box is laid out from, and only on that one.
+        self.assertEqual(refused.get('_render_error'),message,"消息要附到框所在的节点上")
+        self.assertIsNone(drawn.get('_render_error'),"画出来的片段不该被标")
+        window.show();APPLICATION.processEvents()
+        editor=window.editor;box=editor.handler.box(formula)
+        places={node.get('text'):rect for rect,node in box.raws}
+        self.assertEqual(len(places),2,places)
+        at=next(iter(editor.object_data))
+        cursor=QTextCursor(editor.document());cursor.setPosition(at)
+        origin=editor.cursorRect(cursor).topLeft()+QPoint(4,3)   # what `drawObject` translates by
+        def move(view,target):
+            """A mouse move, which is what keeps the widget's tooltip current.
+
+            Qt shows a widget's own `toolTip` after its hover delay, beside the cursor: that
+            is the tooltip the person sees, and it is not reachable from a synthetic
+            `QEvent::ToolTip` -- an offscreen platform never runs Qt's hover timer at all.
+            So what is asserted here is the text the widget carries, which is the input to
+            that machinery.
+            """
+            point=(origin+target).toPoint() if view is editor.viewport() else (QPoint(6,6)+target).toPoint()
+            APPLICATION.sendEvent(view,QMouseEvent(QEvent.MouseMove,point,Qt.NoButton,Qt.NoButton,Qt.NoModifier))
+        move(editor.viewport(),places[refused.get('text')].center())
+        self.assertEqual(editor.viewport().toolTip(),message,"悬停失败片段的框要给出原因")
+        move(editor.viewport(),places[drawn.get('text')].center())
+        self.assertEqual(editor.viewport().toolTip(),"","画出来的片段不该弹提示")
+        # The formula being edited draws the same box, and says the same thing there.
+        window.activate(formula['start']);window.raw_timer.stop();APPLICATION.processEvents()
+        canvas=window.math_canvas
+        canvas_places={node.get('text'):rect for rect,node in canvas.box.raws}
+        self.assertIn(refused.get('text'),canvas_places,"编辑框里也要画出这个片段")
+        self.assertEqual(next(n for _,n in canvas.box.raws if n.get('text')==refused.get('text')).get('_render_error'),
+                         message,"编辑会话的新视图也要盖上这条消息")
+        move(canvas,canvas_places[refused.get('text')].center())
+        self.assertEqual(canvas.toolTip(),message,"公式编辑框里同一个框也要说明原因")
+
     def test_svg_metrics_keep_natural_size_and_font_ratio(self):
         settings={"font_size":12,"svg_scale":1,"font_family":"Consolas"}
         raw={'kind':'raw','text':'raw','render_id':'raw'}

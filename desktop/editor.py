@@ -1,9 +1,9 @@
 """Native text editor with lossless inline formula objects."""
 import re
-from PyQt5.QtCore import Qt, QMimeData, QTimer, QSize
+from PyQt5.QtCore import Qt, QMimeData, QTimer, QSize, QPointF
 from PyQt5.QtGui import QTextCursor, QTextCharFormat, QFont, QColor, QKeySequence, QTextFormat, QPainter
-from PyQt5.QtWidgets import QTextEdit, QPlainTextEdit, QMenu, QApplication, QWidget
-from .model import Projection, difference, u16, from_u16, from_byte
+from PyQt5.QtWidgets import QTextEdit, QPlainTextEdit, QMenu, QApplication, QWidget, QToolTip, QVBoxLayout, QLabel, QFrame
+from .model import Projection, difference, difference_at_caret, u16, from_u16, from_byte
 from .mathview import FormulaObject, OBJECT, OBJECT_ID
 
 def completion_key(editor,event):
@@ -18,6 +18,77 @@ def completion_key(editor,event):
         if label:completer.activated[str].emit(label)
         event.accept();return True
     return False
+
+def formula_error_format(reason):
+    """How a formula that cannot be compiled is marked: a wave, and the reason on hover.
+
+    The colour and the tooltip live together because they are one statement -- a red wave
+    says "this is broken", and the tooltip is the only place the person can read *why*.
+    """
+    fmt=QTextCharFormat();fmt.setUnderlineStyle(QTextCharFormat.WaveUnderline)
+    fmt.setUnderlineColor(QColor('#b55245'));fmt.setToolTip(reason or '公式保留源码模式')
+    return fmt
+
+def decorate_failed_formulas(view,analysis,to_position):
+    """Mark every failed formula of `analysis` in `view`, mapping through `to_position`.
+
+    Both the editor and the source dock show the document, in different coordinates, and
+    both must say why a formula was left as source: a formula the core declines to expand
+    (`editable` false) and a fragment the layout service rejected (`error`) are equally
+    unreadable otherwise. `to_position` is the view's own source-offset to character
+    position conversion.
+    """
+    document=view.document();cursor=QTextCursor(document)
+    for style in analysis.get("styles",[]):
+        if style.get("kind")!="formula_error":continue
+        start,end=to_position(style["start"]),to_position(style["end"])
+        # A formula is one object character in the editor's view, so a style covering it maps
+        # both ends onto that character's position; a zero-length selection would write the
+        # format -- and the tooltip -- nowhere, which is how the reason went missing.
+        if end<=start:end=min(start+1,document.characterCount()-1)
+        if end<=start:continue
+        cursor.setPosition(start);cursor.setPosition(end,QTextCursor.KeepAnchor)
+        cursor.mergeCharFormat(formula_error_format(style.get("text")))
+
+class MessageSection(QWidget):
+    """One engine's messages, with the heading that says which engine they came from."""
+    def __init__(self,title,parent=None):
+        super().__init__(parent)
+        layout=QVBoxLayout(self);layout.setContentsMargins(0,0,0,0);layout.setSpacing(1)
+        heading=QLabel(title);heading.setStyleSheet("color:#5a6672;font-weight:bold;")
+        self.body=QPlainTextEdit();self.body.setReadOnly(True);self.body.setFrameShape(QFrame.NoFrame)
+        self.body.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.body.setMaximumHeight(78)
+        self.body.setStyleSheet("background:#fbfbfc;color:#26384a;")
+        layout.addWidget(heading);layout.addWidget(self.body)
+    def set_messages(self,messages):
+        self.body.setPlainText("\n".join(messages))
+        self.setVisible(bool(messages))
+
+class MessagePanel(QWidget):
+    """What the two engines said about this document, each in its own section.
+
+    A formula can fail in two unrelated ways and they are **not** the same statement.
+    The language service (Tinymist) reports what is wrong with the *source* an editor
+    holds -- a name that does not resolve, a syntax error -- and it reports it where it
+    sits in the document. The layout service reports what the **compiler refused** when
+    it had to compile a fragment to draw it, which is a statement about the spliced
+    source, made because there is no picture to show. Merging them would give one list
+    that cannot say which engine to believe, so each keeps its own heading, its own
+    wording, and its own section.
+    """
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        layout=QVBoxLayout(self);layout.setContentsMargins(6,4,6,5);layout.setSpacing(5)
+        self.language=MessageSection("语言服务 · Tinymist")
+        self.render=MessageSection("编译 · Typst")
+        layout.addWidget(self.language);layout.addWidget(self.render)
+        self.setVisible(False)
+    def set_messages(self,language=(),render=()):
+        language=list(language);render=list(render)
+        self.language.set_messages(language)
+        self.render.set_messages(render)
+        self.setVisible(bool(language or render))
 
 class SourceEditor(QTextEdit):
     """The raw source beside the editor.
@@ -50,7 +121,11 @@ class Editor(QTextEdit):
     def __init__(self, owner):
         super().__init__();self.owner=owner;self.loading=False
         self.mapping=Projection("");self.object_data={};self.object_by_id={};self.expanded=set();self.source_only=False
+        # The message of the box the pointer is on, kept in step with the pointer so that
+        # the widget's own tooltip is current when Qt's hover delay expires.
+        self.tooltip_message=""
         self.setAcceptRichText(False);self.setUndoRedoEnabled(False)
+        self.viewport().setMouseTracking(True)
         self.line_numbers=LineNumberArea(self)
         self.handler=FormulaObject(self)
         self.document().documentLayout().registerHandler(OBJECT,self.handler)
@@ -221,7 +296,13 @@ class Editor(QTextEdit):
                     highlight.format.setBackground(QColor("#f4f5f7"));highlight.format.setProperty(QTextFormat.FullWidthSelection,True)
                     self.base_selections.append(highlight);block=block.next()
             if only and (b<=only[0] or a>=only[1]):continue
-            cursor.setPosition(self.mapping.display_position(a));cursor.setPosition(self.mapping.display_position(b),QTextCursor.KeepAnchor)
+            start,end=self.mapping.display_position(a),self.mapping.display_position(b)
+            # A formula is one object character in this view, so a style that covers it maps
+            # both its ends onto that character's position. A zero-length selection would
+            # write the format nowhere -- including the tooltip that says why the formula is
+            # shown as source -- so the character itself is what gets styled.
+            if end<=start:end=min(start+1,self.document().characterCount()-1)
+            cursor.setPosition(start);cursor.setPosition(end,QTextCursor.KeepAnchor)
             fmt=QTextCharFormat()
             if kind=="strong":fmt.setFontWeight(QFont.Bold)
             elif kind=="emph":fmt.setFontItalic(True)
@@ -229,7 +310,7 @@ class Editor(QTextEdit):
             elif kind=="heading":fmt.setFontWeight(QFont.Bold);fmt.setForeground(QColor("#1b6098"))
             elif kind=="let":fmt.setBackground(QColor("#f0f1f4"))
             elif kind=="formula_error":
-                fmt.setUnderlineStyle(QTextCharFormat.WaveUnderline);fmt.setUnderlineColor(QColor('#b55245'));fmt.setToolTip(style.get('text','公式保留源码模式'))
+                fmt=formula_error_format(style.get("text"))
             cursor.mergeCharFormat(fmt)
         # Literal text color calls are a safe presentation hint; source stays visible.
         for match in re.finditer(r'#text\(\s*(red|blue|green|orange|purple|black)\s*\)\[([^\]]*)\]',source):
@@ -240,7 +321,10 @@ class Editor(QTextEdit):
 
     def changed(self):
         if self.loading:return
-        after=self.toPlainText();a,b,replacement=difference(self.mapping.text,after)
+        after=self.toPlainText()
+        # Qt has already put the caret where the person is, and that is what says which of
+        # the equivalent edit positions was meant (see `model.difference_at_caret`).
+        a,b,replacement=difference_at_caret(self.mapping.text,after,self.textCursor().position())
         start,end=self.mapping.boundaries[a],self.mapping.boundaries[b]
         self.owner.replace(start,end,replacement,typed=True)
 
@@ -295,6 +379,65 @@ class Editor(QTextEdit):
                         self.owner.activate(formula["start"],self,at);event.accept();return
         self.owner.finish_formula(focus=False)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self,event):
+        """Keep the box under the pointer able to explain itself.
+
+        Qt shows a widget's **own** `toolTip` after its hover delay, beside the cursor, and
+        that is the only tooltip path this application has ever shown: `DefinitionDraft`'s
+        "Enter 确认退出…" is exactly that, set with `setToolTip`. A `QEvent::ToolTip` handler
+        does not reach these viewports -- the body's symbol hover has never popped for that
+        reason -- so the text is kept current here and Qt does the rest. Nothing is drawn on
+        the box: the message is attached to it, and appears as the ordinary tooltip.
+        """
+        if self.object_data:
+            message=self.box_message(event.pos()) or ""
+        else:
+            # No formula under the pointer at all: a message left over from another
+            # document must not stay on the viewport.
+            message=""
+        if message!=self.tooltip_message:
+            self.tooltip_message=message
+            self.viewport().setToolTip(message)
+            if not message:QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+    def box_message(self, point):
+        """What the box under `point` has to say, or None. `point` is in viewport coordinates.
+
+        Two things can be wrong with what a formula draws, and both are answered here
+        because both are asked by the same hover. A fragment whose image never came back is
+        drawn as a dashed box holding its own source -- that box *is* the thing to explain,
+        so the message is read off the node it was laid out from. A formula the core keeps
+        as source is one object character with no parts, so its reason is the whole answer.
+
+        Qt does not ask a character format for a tooltip when the character is a text
+        object: `mergeCharFormat` cannot even store one there -- the format reads back with
+        an empty tooltip -- because the glyph is drawn by the object handler. That is why
+        both answers are resolved from the pointer's position instead.
+        """
+        position=self.cursorForPosition(point).position()
+        for at in (position,position-1):
+            formula=self.object_data.get(at)
+            if not formula:continue
+            # The formula is drawn inside its object character's rectangle, offset by what
+            # `drawObject` translates the box by: `Box.raws` is in that box's own
+            # coordinates, so the pointer is moved into them before the hit test.
+            cursor=QTextCursor(self.document());cursor.setPosition(at)
+            rect=self.cursorRect(cursor)
+            node=self.handler.fragment_at(formula,QPointF(point)-QPointF(rect.x()+4,rect.y()+3))
+            message=node.get('_render_error') if node else None
+            if message:return message
+            # The object under the pointer may *contain* the failed formula rather than be
+            # it: a `#let` body is drawn as one object holding the whole definition, and a
+            # formula inside it keeps its source. So the reason belongs to any failure whose
+            # range falls inside this object's range.
+            start,end=from_byte(self.owner.source,formula['start']),from_byte(self.owner.source,formula['end'])
+            return next((style.get('text') for style in self.owner.analysis.get('styles',[])
+                         if style.get('kind')=='formula_error'
+                         and start<=from_byte(self.owner.source,style['start'])
+                         and from_byte(self.owner.source,style['end'])<=end),None)
+        return None
 
     def keyPressEvent(self,event):
         if completion_key(self,event):return

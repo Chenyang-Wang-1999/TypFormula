@@ -2,10 +2,10 @@
 from dataclasses import dataclass, field
 from collections import OrderedDict
 import hashlib,math
-from PyQt5.QtCore import Qt, QRectF, QPointF, QSizeF, QObject
+from PyQt5.QtCore import Qt, QRectF, QPointF, QSizeF, QObject, QEvent
 from PyQt5.QtGui import QFont, QFontMetricsF, QColor, QPen, QPainter, QTextObjectInterface, QTextFormat, QImage, QPixmap
 from PyQt5.QtSvg import QSvgRenderer
-from PyQt5.QtWidgets import QWidget, QApplication, QInputDialog
+from PyQt5.QtWidgets import QWidget, QApplication, QInputDialog, QToolTip
 from . import mathfont
 from . import rawcache
 from .svg import qt_svg
@@ -660,6 +660,18 @@ class FormulaObject(QObject,QTextObjectInterface):
         # it: a tall fraction/matrix must enlarge its line instead of clipping.
         return QSizeF(min(box.width+8,max(80,self.editor.viewport().width()-30)),box.height+6)
 
+    def fragment_at(self, formula, local):
+        """The Raw fragment of `formula`'s drawing whose box holds `local`, or None.
+
+        `local` is a point in the laid-out box's own coordinates. Every fragment the
+        typesetter drew records where it landed in `Box.raws`, so the box under the pointer
+        is answerable -- which is how a fragment that could not be drawn can say why it
+        could not be drawn.
+        """
+        for rect,node in self.box(formula).raws:
+            if rect.contains(local):return node
+        return None
+
     def drawObject(self,painter,rect,document,position,format):
         node=self.editor.object_by_id.get(format.property(OBJECT_ID))
         if not node:return
@@ -677,12 +689,15 @@ class FormulaObject(QObject,QTextObjectInterface):
 class MathCanvas(QWidget):
     def __init__(self,owner):
         super().__init__();self.owner=owner;self.box=Box(10,20,15);self.dragging=False
+        # The tooltip of the box under the pointer is kept current by mouse moves.
+        self.tooltip_message="";self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_InputMethodEnabled,True)
 
     def refresh(self,state):
         self.owner.bind_active_raw(state)
         self.owner.stamp_diagnostics(state['view'])
+        self.owner.stamp_render_errors(state['view'])
         for node in self.owner.view_nodes(state['view']):
             if node.get('kind')=='unknown':node['_string_mode']=state.get('string_mode',False)
         mark_active_path(state['view'],state.get('cursor',{}).get('slices',[]))
@@ -703,11 +718,30 @@ class MathCanvas(QWidget):
         best=min(self.box.stops,key=lambda s:(s[0]-x)**2+4*(s[1]+s[2]/2-y)**2)
         self.owner.math_action("click",cursor=best[3],shift=shift)
 
+    def fragment_message(self,point):
+        """What the box under `point` has to say, or None. `point` is in canvas coordinates.
+
+        The formula being edited draws the same fragments the document does, so a fragment
+        the layout service refused is the same dashed box here; the offset is the one
+        `paint` is given, which is also what the double-click editor of a Raw uses.
+        """
+        local=QPointF(point)-QPointF(6,6)
+        for rect,node in self.box.raws:
+            if not rect.contains(local):continue
+            return node.get('_render_error')
+        return None
+
     def mousePressEvent(self,event):
         self.setFocus();self.dragging=True
         self.hit(event.pos(),bool(event.modifiers()&Qt.ShiftModifier))
 
     def mouseMoveEvent(self,event):
+        # Qt shows the widget's own tooltip after its hover delay, beside the cursor, so the
+        # text is kept current with the pointer. Nothing is drawn on the box itself.
+        message=self.fragment_message(event.pos()) or ""
+        if message!=self.tooltip_message:
+            self.tooltip_message=message;self.setToolTip(message)
+            if not message:QToolTip.hideText()
         if self.dragging:self.hit(event.pos(),True)
 
     def mouseReleaseEvent(self,event):self.dragging=False

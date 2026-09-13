@@ -1,4 +1,4 @@
-﻿"""Native application window. Full source is the sole undoable document."""
+"""Native application window. Full source is the sole undoable document."""
 import json
 import os
 import re
@@ -12,11 +12,11 @@ from PyQt5.QtSvg import QSvgWidget, QSvgRenderer
 from PyQt5.QtWidgets import (QApplication,QMainWindow,QWidget,QSplitter,QDockWidget,QTreeWidget,QTreeWidgetItem,
     QPlainTextEdit,QScrollArea,QVBoxLayout,QAction,QFileDialog,QMessageBox,QInputDialog,QDialog,QDialogButtonBox,
     QLineEdit,QPushButton,QFormLayout,QComboBox,QListWidget,QTextEdit)
-from .model import ROOT,load_settings,validate_settings,config_path,atomic_write,from_byte,to_byte,u16,from_u16,difference
+from .model import ROOT,load_settings,validate_settings,config_path,atomic_write,from_byte,to_byte,u16,from_u16,difference,difference_at_caret
 from .runtime import default_workspace
 from .bridge import Core,Services
 from . import preview
-from .editor import Editor,SourceEditor
+from .editor import Editor,SourceEditor,decorate_failed_formulas,MessagePanel
 from .mathview import Typesetter,MathCanvas
 from .svg import qt_svg
 from .rawcache import RawCache,signature,reusable,raw_key,signature_digest
@@ -57,6 +57,11 @@ class Window(QMainWindow):
         super().__init__();self.loading=True;self.source="";self.saved="";self.path=None
         self.history=[];self.future=[];self.revision=0;self.analysis={};self.math_state=None
         self.semantic_spans=[];self.engine_spans=[];self.diagnostic_spans=[];self.text_diagnostics=[]
+        # What the layout service said when it could not draw a fragment, per fragment
+        # (`(text, message)`), and what it said when it could not compile the batch at all.
+        # Both are a different statement from the language service's diagnostics, so they
+        # are kept apart and shown in their own section.
+        self.render_errors={};self.render_error=None
         self.active_editor=None;self.active_position=0;self.pages=[];self.preview_revision=-1;self.preview_zoom=1.0
         self.definition_draft=None
         self.settings=load_settings();self.typesetter=Typesetter(self.settings);self.typesetter.warn=self.report
@@ -72,6 +77,9 @@ class Window(QMainWindow):
         self.raw_signature=None
         # (revision, fragments) of the last failed render request, if any.
         self.raw_error=None
+        # Fragments allowed one more request although their cache says they were refused:
+        # entering a failed box or confirming a draft puts them here. See `retry_refused`.
+        self.retry=set()
         # Source lines whose height the dock copies from the editor, by block number.
         self.source_line_heights={}
         self.formula_serial=0;self.last_reparsed=None
@@ -83,7 +91,11 @@ class Window(QMainWindow):
         self.splitter=QSplitter();self.setCentralWidget(self.splitter)
         self.editor=Editor(self);self.editors=[self.editor];self.splitter.addWidget(self.editor)
         self.source_view=SourceEditor();self.source_view.setLineWrapMode(QTextEdit.NoWrap)
-        self.source_dock=QDockWidget("Typst 源码",self);self.source_dock.setWidget(self.source_view)
+        self.source_messages=MessagePanel()
+        source_pane=QWidget();pane_layout=QVBoxLayout(source_pane)
+        pane_layout.setContentsMargins(0,0,0,0);pane_layout.setSpacing(0)
+        pane_layout.addWidget(self.source_view,1);pane_layout.addWidget(self.source_messages,0)
+        self.source_dock=QDockWidget("Typst 源码",self);self.source_dock.setWidget(source_pane)
         self.addDockWidget(Qt.RightDockWidgetArea,self.source_dock);self.source_dock.hide()
         # Token colours are applied per visible view; open the dock and it is
         # coloured at once instead of paying for a hidden widget on every reply.
@@ -210,6 +222,9 @@ class Window(QMainWindow):
         current=self.source_view.toPlainText();a,b,replacement=difference(current,self.source)
         dock_scroll=self.source_view.verticalScrollBar().value()
         cursor=QTextCursor(self.source_view.document());cursor.setPosition(u16(current[:a]));cursor.setPosition(u16(current[:b]),QTextCursor.KeepAnchor);cursor.insertText(replacement)
+        # The dock is fed plain text, so it carries no formats of its own: the reason a
+        # formula was left as source has to be written here, in the dock's UTF-16 positions.
+        decorate_failed_formulas(self.source_view,self.analysis,lambda source_offset:u16(self.source[:source_offset]))
         cursor=self.source_view.textCursor();cursor.setPosition(min(pos,u16(self.source)));self.source_view.setTextCursor(cursor)
         # Setting a cursor scrolls the pane that owns it. The dock's caret usually
         # sits near the top while the editor is scrolled far down, and
@@ -392,19 +407,30 @@ class Window(QMainWindow):
         old=self.analysis
         self.analysis=self.update_analysis(old_source,a,b,text);self.raw_cache.rebind(old,self.analysis)
         caret=a+len(text)
+        # An edit that only breaks or opens a line is not an edit *to* a formula. Pressing
+        # Enter at the end of a line puts the caret at the start of the next one, which is
+        # where the following formula begins; expanding on that boundary would replace the
+        # one formula glyph with its raw source, so the caret looks like it jumped into a
+        # line of `$...$` nobody opened. Otherwise the caret sitting inside a formula --
+        # including at its closing delimiter, which is where typing `$x$` leaves it -- opens
+        # its source, so that typing a formula's own text stays possible.
+        opened_line='\n' in text
         for editor in self.editors:
             editor.expanded.clear()
-            if typed:
+            if typed and not opened_line:
                 for formula in self.analysis["formulas"]:
                     start,end=(from_byte(self.source,formula[k]) for k in ("start","end"))
-                    if start<=caret<=end:editor.expanded.add(start)
+                    if start<caret<=end:editor.expanded.add(start)
         self.project((caret,caret),incremental=True);self.compile_timer.start()
         if typed and text and re.search(r'[#.\w]$',self.source[:caret]):self.completion_timer.start()
 
     def source_changed(self):
         if self.loading:return
         text=self.source_view.toPlainText();position=from_u16(text,self.source_view.textCursor().position())
-        a,b,replacement=difference(self.source,text)
+        # The dock's caret is captured before the edit is applied, so the same edit an
+        # ambiguous diff would report at the end of a run of characters is placed where the
+        # person is -- and the editor, whose caret is taken from the edit, follows it there.
+        a,b,replacement=difference_at_caret(self.source,text,position)
         self.replace(a,b,replacement,True)
         cursor=self.source_view.textCursor();cursor.setPosition(u16(text[:position]));self.source_view.setTextCursor(cursor)
         if re.search(r'[#.\w]$',text[:position]):self.completion_timer.start()
@@ -441,6 +467,43 @@ class Window(QMainWindow):
         self.raw_cache.track(state,self.typesetter.cache);self.raw_timer.start()
         # A new core session knows nothing about the last one's render results.
         self.report_raw_fragments(state,force=True)
+        # Entering the box is how a person says "look at this one again". A refusal is
+        # scoped to the revision it was made in, so without this a box that failed and was
+        # then entered asked the renderer nothing at all -- the text had not changed -- and
+        # no amount of opening and closing it could produce a new answer.
+        self.retry_refused(self.refused_keys(state['view']))
+
+    def refused_keys(self,view):
+        """The fragments of `view` the renderer refused, as the keys they are refused under."""
+        keys=set()
+        for node in self.view_nodes(view or {}):
+            if node.get('kind') not in ('raw','raw_macro'):continue
+            key=raw_key(node)
+            if self.typesetter.cache.get(key) is False:keys.add(key)
+        return keys
+
+    def retry_refused(self,keys):
+        """Let refused fragments be asked for again, in this revision.
+
+        They leave the revision's refusal record, so the next pass does not skip them, and
+        they join `retry`, which is what lets one request through for a fragment whose cache
+        already says it was refused. The cache entry itself stays: `False` is what draws the
+        box in its failure dress, and `None` -- what dropping it would leave -- draws a
+        `raw_macro` as its name and its argument slots instead, which is a different picture
+        than the one the person is looking at.
+
+        One attempt per deliberate act: the key leaves `retry` as soon as it is asked for,
+        so a fragment that still cannot be drawn is refused again rather than recompiled on
+        every pass.
+        """
+        keys={key for key in keys if self.typesetter.cache.get(key) is False}
+        if not keys:return
+        if self.raw_error:
+            revision,pending=self.raw_error
+            remaining=pending-keys
+            self.raw_error=(revision,remaining) if remaining else None
+        self.retry|=keys
+        self.raw_timer.start()
 
     def math_action(self,action,**arguments):
         if not self.math_state:return
@@ -459,6 +522,13 @@ class Window(QMainWindow):
             self.project(incremental=True);self.compile_timer.start()
         self.stamp_contexts(state['view'])
         self.math_canvas.refresh(state);self.reposition_math()
+        # A confirmed draft is the other deliberate act: the person has said what the
+        # fragment should be, and wants to see whether it draws now. When the source did
+        # change, `revision` moved and the refusal was already dropped; when it did not --
+        # Enter on the same text -- this is what makes the box ask again rather than keep
+        # the old verdict for the rest of the session.
+        if previous.get('pending') and not state.get('pending'):
+            self.retry_refused(self.refused_keys(state['view']))
         self.report_raw_fragments(state)
         self.raw_timer.start()
         invalidated=self.raw_cache.track(state,self.typesetter.cache)
@@ -646,7 +716,7 @@ class Window(QMainWindow):
             # A document switch may start the same spellings again. Its old reply must not
             # replace the new request's cache or trigger a repaint.
             answers=(value or {}).get("items") or []
-            for index,(key,_) in enumerate(pending.items()):
+            for index,(key,text) in enumerate(pending.items()):
                 if self.glyph_pending.get(key) is not token:continue
                 del self.glyph_pending[key]
                 answer=answers[index] if index<len(answers) else None
@@ -654,6 +724,12 @@ class Window(QMainWindow):
                 # False is a stable failure; None is pending, and an empty string
                 # is a successful empty run. Retry failures on explicit refresh.
                 self.typesetter.glyphs[key]=False if failed else answer.get("glyphs","")
+                # A variant whose glyphs never came back is drawn exactly like a fragment
+                # whose image did not: the dashed box holding its own source. So it has to
+                # say why too, and the bottom bar is where this window says such things.
+                if failed:
+                    reason=error or (answer.get("error") if isinstance(answer,dict) else None)
+                    self.report("取字形失败："+(reason or text))
                 # The views read the cache when they are laid out (see `stamp_formula`),
                 # so dropping the memoized boxes and repainting is the whole of it: the
                 # next layout picks the answer up. Stamping here would have to reach both
@@ -894,6 +970,7 @@ class Window(QMainWindow):
                 if node.get("error")!=hit:changed=True
                 node["error"]=hit
         if changed:self.typesetter.touch();self.repaint_formulas()
+        self.update_messages()
         self.apply_highlights()
 
     def stamp_diagnostics(self,view):
@@ -994,12 +1071,14 @@ class Window(QMainWindow):
                 # fragment holding a call is asked for on every pass instead; its
                 # previous image stays in the cache and keeps being drawn, so the
                 # extra render work is the only difference the switch makes.
-                if known and (any(value is False for value in known) or reusable(text)):continue
+                if known and shared not in self.retry and (any(value is False for value in known) or reusable(text)):continue
                 if shared in self.raw_pending or shared in seen:continue
                 source_range=node.get('render_request') or by_id.get(':'.join(node['render_id'].split(':')[:2]))
                 if not source_range:continue
                 source_id=source_range['id']
-                seen.add(shared);targets[source_id]=(stable,shared);ranges.append(source_range);wanted+=1
+                seen.add(shared);targets[source_id]=(stable,shared,text);ranges.append(source_range);wanted+=1
+                # The retry has been honoured: one attempt, not one per pass.
+                self.retry.discard(shared)
                 in_definition=in_definition or any(a<=source_range['start']<b for a,b in definitions)
             # Ask for a source that reaches only as far as the last fragment does:
             # the service then cuts the document there, so a mistake further down
@@ -1015,7 +1094,7 @@ class Window(QMainWindow):
         if stuck:self.typesetter.touch();self.repaint_formulas()
         if not targets:return
         body=self.body()|{'raw':ranges,'formulas':[],'context_end':context_end}
-        pending={shared for _,shared in targets.values()};self.raw_pending.update(pending)
+        pending={shared for _,shared,_ in targets.values()};self.raw_pending.update(pending)
         def superseded(pending=pending):
             """This batch was replaced in the queue, so nothing came back for it.
 
@@ -1029,23 +1108,85 @@ class Window(QMainWindow):
             self.raw_pending.difference_update(pending)
             self.raw_timer.start()
         def rendered(result,error,targets=targets,revision=revision):
-            pending={shared for _,shared in targets.values()};self.raw_pending.difference_update(pending)
+            pending={shared for _,shared,_ in targets.values()};self.raw_pending.difference_update(pending)
             if revision!=self.revision:self.raw_timer.start();return
             for shared in pending:self.typesetter.cache[shared]=False
             if error:
-                self.raw_error=(revision,pending);self.report(error)
+                self.raw_error=(revision,pending);self.render_error=error
+                for _,shared,*_ in targets.values():self.render_errors.pop(shared,None)
+                self.report(error)
             else:
                 # The renderer leaves out a fragment whose own source cannot
                 # compile instead of failing the batch. That verdict is about the
                 # document text, so the next edit clears it and asks again, the
                 # same way a failed request does.
+                self.render_error=None
                 for item in result.get('items',[]):
                     source_id=next((key for key in targets if item['id']==key or item['id'].startswith(key+':')),None)
                     if source_id in targets:self.typesetter.cache[targets[source_id][1]]=item
-                refused={shared for shared in pending if self.typesetter.cache.get(shared) is False}
-                self.raw_error=(revision,refused) if refused else None
+                # Keep the engine's own wording for the fragments it refused, keyed the way
+                # the fragment cache is, and drop it for every fragment this batch answered:
+                # an image in hand is the end of that fragment's error.
+                refused=[]
+                for source_id,(stable,shared,text) in targets.items():
+                    message=(result.get('errors') or {}).get(source_id)
+                    if message:
+                        self.render_errors[shared]=(text,message)
+                        refused.append(f"{message}（{text}）" if text else message)
+                    elif self.typesetter.cache.get(shared) is not False:self.render_errors.pop(shared,None)
+                refused_set={shared for shared in pending if self.typesetter.cache.get(shared) is False}
+                self.raw_error=(revision,refused_set) if refused_set else None
+                # Say it out loud. A fragment that cannot be drawn turns into the dashed
+                # "nothing to lay out here" box, and the reason is the one thing the person
+                # needs at that moment -- most of all right after a command is confirmed,
+                # when a box they just asked for comes back in that dress. It is said here
+                # rather than left to a hover because a hover has to be discovered, and the
+                # bottom bar is where every other failure of this window is already said.
+                if refused:self.report("渲染失败："+"；".join(refused[:3]))
+            self.update_messages()
+            self.stamp_all_render_errors()
             self.typesetter.touch();self.repaint_formulas()
         self.services.request('/api/render',body,rendered,key='raw-batch',dropped=superseded)
+
+    def stamp_render_errors(self,view):
+        """Attach each refused fragment's message to the node that fragment is drawn from.
+
+        The editor has one drawing for "there is nothing to lay out here": a fragment whose
+        image never came back is a dashed box holding its own source. That box *is* the
+        thing to explain, so the explanation belongs on the node the box is laid out from --
+        then whatever shows the box can say why, in the editor, in the formula being edited,
+        and anywhere else the same fragment lands. The message is the compiler's own, about
+        the spliced source, so it is not translated into a document position.
+
+        A view is stamped where it is displayed, not once when the reply arrives: editing a
+        formula builds a **new** view from the core, and the fragments' identities -- which
+        is what the message is filed under -- are what carry across.
+        """
+        if not view:return
+        for node in self.view_nodes(view):
+            if node.get('kind') not in ('raw','raw_macro'):continue
+            entry=self.render_errors.get(raw_key(node))
+            node['_render_error']=entry[1] if entry else None
+
+    def stamp_all_render_errors(self):
+        for formula in self.analysis.get('formulas',[]):
+            self.stamp_render_errors(formula.get('view'))
+        if self.math_state:self.stamp_render_errors(self.math_state['view'])
+
+    def update_messages(self):
+        """Fill the dock's two sections, one per engine.
+
+        The language service speaks in document positions, because that is where the person
+        has to look; the layout service speaks about a fragment, because that is what it was
+        asked to draw. Neither is translated into the other's terms: a compile error has no
+        document position -- the text it failed on is a spliced copy -- and a diagnostic is
+        not a compile failure, it is a warning about source that may still draw.
+        """
+        language=[f"第 {self.source.count(chr(10),0,min(item['start'],len(self.source)))+1} 行：{item['message']}"
+                  for item in self.text_diagnostics if item.get('message')]
+        render=[f"{message}（{text}）" if text else message for text,message in self.render_errors.values()]
+        if self.render_error:render.insert(0,f"整批编译失败：{self.render_error}")
+        self.source_messages.set_messages(language,render)
 
     def repaint_formulas(self):
         """Relay out and repaint after Raw images or fragment statuses changed."""

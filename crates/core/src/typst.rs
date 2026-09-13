@@ -260,11 +260,24 @@ pub fn macro_registry(definitions: &str) -> Arc<MacroRegistry> {
 /// from the start of the prefix through the definition, which is where
 /// `definition_raw_ranges` locates a fragment and where `document::annotate` expects it.
 fn retarget(registry: &mut MacroRegistry, context: &context::Context, definitions: &str) {
+    // A span the text it indexes into cannot hold means the reduced text and the caller's
+    // text disagree. Leaving the definition alone keeps it usable, with its offsets in the
+    // reduced text's own coordinates, instead of panicking on the slice below.
+    //
+    // The two coordinates are bounded separately: the offsets `analyze_macros` reported
+    // index the *reduced* text, while the offsets `original` returns index `definitions`.
+    fn span(len: usize, start: usize, end: usize) -> Option<(usize, usize)> {
+        (start <= end && end <= len).then_some((start, end))
+    }
+    let reduced_len = context.source.len();
     for def in registry.entries.iter_mut() {
         // `input` runs from the *previous* definition's end, so the definition's own end in
         // the reduced text is only its context plus that run.
         let (start, end) = (def.definition_start, def.context.len() + def.input.len());
+        let Some((start, end)) = span(reduced_len, start, end) else { continue };
         let (Some(start), Some(end)) = (context.original(start), context.original(end)) else { continue };
+        let Some((start, end)) = span(definitions.len(), start, end) else { continue };
+        if !definitions.is_char_boundary(start) || !definitions.is_char_boundary(end) { continue; }
         def.definition_start = start;
         def.context = Arc::new(definitions[..start].to_string());
         def.input = definitions[start..end].to_string();

@@ -73,6 +73,50 @@ fn a_template_fragment_is_asked_for_at_its_own_place_in_the_definition() {
 }
 
 #[test]
+fn every_definition_of_a_reduced_prefix_keeps_the_document_prefix_that_ends_at_it() {
+    // Prose between the definitions is what the reduction drops, and dropping it is exactly
+    // what moves the second definition's offsets: `retarget` has to put them back into the
+    // document's coordinates. One definition cannot show this, because the prefix that ends
+    // at the first one starts at the document's start and so is the same in both texts.
+    //
+    // The three arguments mirror `document::activate_equation`: `macro_text` is the reduced
+    // prefix (short, and unchanged by an edit to the prose), `prefix` is the document's own
+    // prefix (where fragments are located), and `context` maps between them.
+    let source = "#let first(x) = $#x + 1$\n\n一些正文，归约时会整段丢掉。\n\n#let second(y) = $#y + lr(a, size: #100%)$\n\n$ second(z) $";
+    let at = source.rfind("$ second").unwrap();
+    let context = typformula_core::context::context(&source, &[(at, source.len() - 1)]).unwrap();
+    let (moved_start, _) = context.ranges[0];
+    let macro_text = context.prefix(moved_start);
+    let prefix = &source[..at];
+    assert!(macro_text.len() < prefix.len(), "the reduction dropped nothing, so this proves nothing");
+    let registry = typst::macro_registry_of(macro_text, prefix, Some(&context));
+
+    // The prefix a fragment's offset is measured in must be the document's own text ending
+    // at that definition -- a wrong end offset shows up here as "the prefix is not the
+    // source" rather than as a slice out of bounds.
+    let first_end = source.find('\n').unwrap();
+    let second_end = source.find("#let second").unwrap() + "#let second(y) = $#y + lr(a, size: #100%)$".len();
+    assert_eq!(typst::definition_prefix(registry.get("first").unwrap()), source[..first_end],
+        "the first definition's prefix is not the document's");
+    assert_eq!(typst::definition_prefix(registry.get("second").unwrap()), source[..second_end],
+        "the second definition's prefix is not the document's -- the reduction moved it");
+
+    // A fragment inside the second definition is located past the prose the reduction threw
+    // away, so its offset is a document offset and the text there is the fragment itself.
+    let ranges = typst::definition_raw_ranges(registry.get("second").unwrap(), "lr(a, size: #100%)");
+    assert_eq!(ranges.len(), 1, "{ranges:?}");
+    assert_eq!(&source[ranges[0].0..ranges[0].1], "lr(a, size: #100%)");
+
+    // `definition_raw_ranges` keeps only fragments at or after `definition_start`, so an
+    // understated start lets the earlier definition claim its neighbour's fragments.
+    let first = registry.get("first").unwrap();
+    assert!(typst::definition_raw_ranges(first, "lr(a, size: #100%)").is_empty(),
+        "the first definition claims a fragment that belongs to the second");
+    assert_eq!(typst::definition_raw_ranges(first, "#x + 1").len(), 1,
+        "the first definition lost its own fragment");
+}
+
+#[test]
 fn a_call_site_fragment_carries_the_definition_range_it_is_rendered_from() {
     let source="#let fixed(x) = $#x + lr(a, size: #100%)$\n$ fixed(z) $";
     let mut doc=Document::default();doc.apply(json!({"action":"set_source","source":source})).unwrap();

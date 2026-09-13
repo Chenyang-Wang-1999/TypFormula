@@ -174,6 +174,12 @@ fn batch(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize]) -> Resu
 const SALVAGE_BUDGET: usize = 24;
 fn salvage(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize], first: String) -> Result<Value, String> {
     let mut items = vec![]; let mut warnings = vec![]; let mut failed = vec![]; let mut pages = 0;
+    // Why each fragment failed, by fragment id. The id says *which* one, and only the
+    // engine's own diagnostic says why, so the message is kept rather than dropped: it is
+    // the editor's only way to tell a person what to fix. It is deliberately not merged
+    // with the language service's diagnostics -- those describe the source in an editor's
+    // terms, this one describes what the compiler refused.
+    let mut errors = serde_json::Map::new();
     let mut queue = vec![order.to_vec()]; let mut budget = SALVAGE_BUDGET;
     while let Some(subset) = queue.pop() {
         match batch(req,world,&subset) {
@@ -182,7 +188,11 @@ fn salvage(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize], first
                 if let Some(list) = value["warnings"].as_array() { warnings.extend(list.iter().cloned()); }
                 if let Some(list) = value["items"].as_array() { items.extend(list.iter().cloned()); }
             }
-            Err(_) if subset.len() == 1 => failed.push(json!(req.raw[subset[0]].id)),
+            Err(error) if subset.len() == 1 => {
+                let id = req.raw[subset[0]].id.clone();
+                errors.insert(id.clone(), json!(error));
+                failed.push(json!(id));
+            }
             Err(_) if budget > 0 => {
                 budget -= 1;
                 let (left,right) = subset.split_at(subset.len()/2);
@@ -190,6 +200,8 @@ fn salvage(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize], first
             }
             // Out of tries: report the rest instead of retrying it, so a document
             // full of broken fragments cannot turn one keystroke into a compile storm.
+            // These were never compiled on their own, so there is no diagnostic to
+            // attribute to them and `errors` stays silent about them.
             Err(_) => { for i in &subset { failed.push(json!(req.raw[*i].id)); } }
         }
     }
@@ -197,7 +209,7 @@ fn salvage(req: &RenderRequest, world: &mut FormulaWorld, order: &[usize], first
     // context: the caller treats the whole request as failed, as before.
     if items.is_empty() { return Err(first); }
     Ok(json!({"engine":"Typst in-memory source mapping","items":items,"pages":pages,"warnings":warnings,
-        "failed":failed,"salvaged":true}))
+        "failed":failed,"errors":errors,"salvaged":true}))
 }
 fn pdf(req:&RenderRequest,world:&mut FormulaWorld)->Result<Value,String> {
     use base64::Engine as _;
@@ -376,6 +388,11 @@ mod tests {
         let result=compile(&mut world,source,&["#let z = 1","cancel(y)"]);
         assert_eq!(result["salvaged"],true);
         assert_eq!(result["failed"],json!(["0"]));
+        // The id says which fragment; only the engine's diagnostic says why. It travels
+        // with the reply so the editor can show it, and it is not the language service's
+        // message: this one is what the compiler refused, about the spliced source.
+        let message=result["errors"]["0"].as_str().unwrap_or_default();
+        assert!(!message.is_empty(),"失败片段必须带回引擎自己的诊断：{result}");
         assert_eq!(result["items"].as_array().unwrap().len(),1);
         assert!(result["items"][0]["svg"].as_str().unwrap().contains("<svg"));
         // A document that is broken everywhere has nothing to salvage, so it is

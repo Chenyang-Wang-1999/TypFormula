@@ -2381,3 +2381,73 @@ Editor 现在在 clear/insertText/setCharFormat 等 Qt 文档操作前，发布�
 - 缓存身份：核心在 `analyze`/`state` 里为每个公式给出 `context` 摘要，前端用它作为图像与 placement 的键（原来是整段前缀）。该 deck 实测：正文里插入一个字后**重新请求 0 次**（原为 63 次，全部 placement 保留）；改 `#set` 后重问 60 次（正确——上下文真的变了）。
 
 验证：`cargo test --offline --locked` 20 个测试目标全过（内核 24 项含 `context` 的 11 项）；适配器 24 项；桌面离屏 **121/121**。全部 release 二进制按当前源码重建（含随后那一步的 Editor 改动）。
+
+### 2026-09-13（续二）：回车键逻辑与失败公式的报错悬停
+
+两项前端修复，各自先复现再改，改完都用"回退改动→测试必须失败"验过牙齿。
+
+**一、回车键不再"跳多行"（两处根因，第二处是第一轮漏掉的）。**
+
+第一轮：源文 `Text one\n\n$ a + b $\n\nText two`，在 `Text one` 末尾按回车，源码只多了一个空行（正确），但**显示文本从 `\ufffc` 变成了 `$ a + b $`**——公式被展开成源码。根因在 `window.py:replace`：换行后插入点落在下一行行首，而下一行行首**正是下一个公式的起始偏移**，判断式 `start<=caret<=end` 把这个边界当成了"光标在公式里"，于是 `editor.expanded.add(start)`，`Projection` 便跳过该公式并原样吐出它的源码。改法：插入换行（`'\n' in text`）时不展开；边界收成 `start<caret<=end`，保留"输入 `$x$` 后停在收尾 `$` 上要展开"这条既有语义。
+
+第二轮（用户指出：光看源码文本"对"不能算修好）：正确的落点应是 `Text one` + 换行 + **光标** + 原有的 `\n\n$ a + b $`，即源码偏移 **9**；实际却是 `Text one\n\n\n<光标>$ a + b $`，光标在 **11**（公式起点）。真根因不在展开，而在**编辑位置本身选错了**：`Editor.changed` 用 `difference(mapping.text, after)` 求编辑区间，而这是纯文本 diff——在 `\n` 这种**相同字符连续段**里的插入，无论落在段内哪一处得到的文本都一样，`difference` 取的是使公共前缀最长的那个位置，也就是**段尾**（实测：Qt 光标在 9，`difference` 报 a=b=**10**）。`replace` 再用 `caret=a+len(text)` 反推光标，于是把光标钉在了段尾。同一个歧义**不止影响回车**：在 `xx` 开头输入 `x` 得到 `xxx` 后，Qt 光标在 1 而 `difference` 报 2，光标跳到 3。
+
+改法：新增 `model.difference_at_caret(before, after, caret)`——把编辑放在光标所指的位置：`removed = len(before)+len(replacement)-len(after)`，`at = caret-len(replacement)`，并**验证文本确实一致**（`after == before[:at] + replacement + before[at+removed:]`）才采纳，否则原样返回，因此本已无歧义的 diff、以及光标不在编辑处的编辑都不受影响。这条恒等式还带来一个好性质：采纳后 `replace` 反推出的光标（`a+len(text)`）**恰好等于视图已有的光标**，视图纹丝不动。两个入口都用它：`Editor.changed` 用编辑区自己的 Qt 光标，`window.source_changed` 用源码栏在编辑前捕获的光标（后者原来只靠"事后按位置复原光标"掩盖了症状，但**编辑区**的光标仍从错位的 `a` 推出 11，现实测两边都是 9）。
+
+第三轮（用户指出**删除也一样**）：在 `$x$\n\n<光标>\n\nsome text` 处按退格，光标直接跳到 `some text` 前面。复现：源码 `$x$\n\n\n\nsome text`，光标在源码 5（第二、三个空行之间），退格后源码正确变成 `$x$\n\n\nsome text`，但光标落在 **(6,6)** 而不是 **(4,4)**——即被删掉的那一行上；纯文本 `a\n\n\nb` 同理（光标 3 → 期望 2，实得 3）。原因同一条：`difference('a\n\n\nb','a\n\nb')` 报的是删掉索引 **3**（段尾），而不是光标所在的 2。第二轮的实现只覆盖了纯插入（`a==b`），删除仍走 diff，所以这次把判据推广到**任意编辑**：用上面那条通用恒等式，插入、退格、前向 Delete、选区替换都走同一条路径。实测四类都对：退格把光标留在被删那行（4）、纯文本退格到 2、前向 Delete 光标原地不动（2）、选 `a\n\n\nb` 的 (1,3) 输入 `z` 得 `az\nb` 且光标在 2。
+
+**二、编译失败的公式悬停显示原因。** 失败公式的两条通路都断着，各自查明原因：
+- **源码栏**（`SourceEditor`）根本没有样式：它只被 `insertText` 灌入纯文本，`apply_styles` 只在 `Editor` 上调用过。新增 `decorate_failed_formulas(view, analysis, to_position)` 在灌文本后把 `formula_error` 写进源码栏（用它自己的 UTF-16 坐标）。
+- **编辑区**的样式**写不进去**：一个公式在编辑区是**一个对象字符**，样式的源码区间 `[22,27]` 经 `display_position` 映射后两端同点 → 零长度选区 → `mergeCharFormat` 什么也没写（实测 `charFormat().toolTip()` 为空）。故 `apply_styles` 里把退化区间补成那一个字符。但对象字符的格式**存不住 tooltip**（实测 `objectType=4097`，合并后 tooltip 仍为空字符串），因为绘制由对象处理器负责，所以改为在 `Editor.event` 里按指针位置解析原因。这里还发现一处结构性事实：指针下的对象**可能"包含"失败公式而非"就是"它——`#let` 体整个是一个对象（`_object_id: 'definitions:0'`，range `[0,28]`），其中的公式 `[22,27]` 没有自己的对象。故匹配用区间包含而非起点相等。
+
+附带查明（**未改，属于既有行为，特此记录**）：`window.py` 里 `apply_highlights` 给 `text_diagnostics` 的 `ExtraSelection` 设了 `setToolTip`，但 `ExtraSelection` 的格式是**只影响绘制**的，不会进入 `charFormat()`——实测 `QToolTip.text()` 为空。也就是说这条 LSP 诊断的悬停提示**从来不会显示**。它与本次要修的 `formula_error` 是两条不同通路，本次未动，是否改为真实字符格式待定。
+
+验证：`cargo test --offline --locked` 20 个测试目标全过；桌面离屏 **128/128**（新增 7 条：回车落在新开的行上、源码栏回车两边光标一致、相同字符旁输入光标不跳、文档开头回车只插一行、退格停在被删的那一行、纯文本退格、失败公式悬停给出原因）。各处修复回退后对应新用例分别失败（`(11,11)!=(9,9)`、`3!=1`、`(6,6)!=(4,4)`、`3!=2` 等），确认有牙齿。
+
+### 2026-09-13（续三）：源码栏的两个报错区，以及渲染后端带回编译报错
+
+用户要求两件事，并明确指出**两个报错来源不同、不要合并**：(1) 在源码栏加报错信息显示框，显示 LSP 报错；(2) 公式渲染后端要返回报错信息，渲染失败时把消息传给前端。经确认，报错框放在**源码栏**，渲染报错**按片段记账 + 整批失败也显示**。
+
+**一、渲染报错此前在后端就被丢掉了。** `native-adapter/src/render.rs` 的 `salvage` 里，单片段编译失败那一支原本是 `Err(_) if subset.len() == 1 => failed.push(json!(req.raw[subset[0]].id))`——`failed` 只留下**片段 id**，`Err(_)` 把引擎的诊断**直接丢弃**。于是前端只知道"这个片段没画出来"，永远不知道原因（`desktop/mathview.py` 只能画成虚线源码框）。改法：新增 `errors` 字段（片段 id → 消息），与既有 `failed`（哪些失败）并列，`errors` 不改变 `failed` 的形状，因此既有用例与前端推断逻辑都不受影响。配额耗尽那一支（`Err(_)` 兜底）**本来就没单独编译过**，没有可归属的诊断，`errors` 对它保持沉默——这是诚实的做法，而不是编一条消息。整批失败仍走 `Err(first)`，消息一直在。
+
+诊断只带 **message**，不带行号：adapter 编译的是**拼接后的源码**（插了 `#set text(...)` 首行、替换了区间），行号对文档没有意义。
+
+**二、前端把它显示出来。** 新增 `desktop/editor.py` 的 `MessageSection` / `MessagePanel`：两个各自带标题的小节（「语言服务 · Tinymist」「编译 · Typst」），各自一段只读文本，**互不翻译**——语言服务用**文档行号**说话（人要知道去哪一行看），布局服务用**片段**说话（那才是它被要求画的东西），合并成一张表反而说不清该信谁、该改哪。`window.py` 把源码栏包成 `QWidget`（`source_view` + `source_messages` 上下布局），并新增 `render_errors`（片段 → `(源码文本, 消息)`）与 `render_error`（整批失败），在 `/api/render` 回复里读 `errors`，由 `update_messages()` 组装；`request_diagnostics` 末尾也调用它。画出来的片段会**清掉**自己的报错（手里有图就是那条报错的终点），而"拒绝"属于它被作出的那个 revision——要下一次**编辑**才重试，这是既有语义，本轮的清理逻辑跟着它走。
+
+**三、一处把我误导了一阵的坑（第二次遇到）：** 端到端探针起初报 `errors = None`，我一度怀疑是 rpc 过滤字段。实测是**适配器二进制过期**——`target/adapter/release/typformula-layout.exe` 的时间戳是 04:28，而源码改于 11:12：`cargo test --release --manifest-path native-adapter/Cargo.toml --target-dir target/adapter` 构建的是**测试产物**，不更新这个 exe。显式 `cargo build --offline --locked --release --manifest-path native-adapter/Cargo.toml --target-dir target/adapter` 之后立刻得到 `errors = {'0': 'expected semicolon or line break'}`。以后改适配器后要跑构建，不能只跑它的测试。
+
+**四、两个额外发现（未改，记录）**：`$ cancel(x) $` **不产生任何 raw 片段**（`cancel` 由前端原生绘制），所以"渲染失败"的探针必须用真正会产生片段的式子（如 `undefined_op(y)`）；另外上一轮记录的 `ExtraSelection` tooltip 不显示问题，现在有了这个报错区，同一个需求已被满足，那段死代码是否清理待定。
+
+验证：`cargo test --offline --locked` 20 个测试目标全过；适配器 **24/24**（`one_broken_fragment_does_not_blank_the_batch` 增补断言：失败片段必须带回非空诊断）；桌面离屏 **132/132**（新增 4 条：真实适配器端到端带回编译消息、片段报错显示在编译小节并在画出后消失、整批失败单独显示、LSP 诊断按行号显示在语言服务小节）。牙齿两处都验过：把后端的 `errors.insert` 去掉 → 端到端用例失败（`errors` 为空）；把前端的组装清空 → 显示用例失败。
+
+**五、补做：消息要附在“渲染错误框”上，悬停显示。** 用户反馈"渲染后端的报错现在是在哪显示的？鼠标悬停不显示呀"——上一轮只把消息放进了源码栏的文字区，而被拒绝的片段在编辑区是**一个虚线框**（`failed_box`：暖色底、虚线，里面放它自己的源码），那个框才是人在看的东西。
+
+改法：`window.stamp_render_errors(view)` 把消息记到该片段被排版的视图节点（`_render_error`，**只被读取、从不绘制**——没有在框上画任何字）；显示走**控件自己的 `toolTip`**：Qt 在悬停延迟之后把它画在光标旁边，这是本应用里唯一确实显示过的提示通路（`DefinitionDraft` 的"Enter 确认退出…"就是 `setToolTip`）。`Editor.mouseMoveEvent` 随指针更新**视口**的 `toolTip`（`Editor.box_message` 命中失败片段或"保留为源码"的公式；指针换算进 `Box.raws` 坐标，`FormulaObject.fragment_at`，偏移取 `drawObject` 的 `(4,3)`），`MathCanvas.mouseMoveEvent` 同理（偏移 `(6,6)`，与既有"双击编辑 Raw"一致）。指针移开或文档里没有公式时把 `toolTip` 清空，避免上一次的消息留在视口上。
+
+**六、测试方法的教训（两轮，都很重要）。** 第一轮：我把悬停判定写在 `Editor.event` 上，用"手工 `sendEvent` 一个 `QEvent.ToolTip`"验证，用例是绿的；改用 `QTest.mouseMove` 之后再也弹不出来。查下去发现 `QTest.mouseMove(widget,…)` 把合成事件直接投给控件、**绕过了 `QWidgetWindow`**（Qt 的悬停延迟计时器在那里），所以它不算验证。
+第二轮：改用窗口系统级的 `QTest.mouseMove(windowHandle,…)`，连**对照组**（给视口 `setToolTip('CONTROL-TIP')`，Qt 文档保证会显示的那种）也一条都不弹——说明 **offscreen 平台根本不跑 Qt 的悬停计时器**，这个探针是**无结论**的。结论：**离屏无法验证真实鼠标的悬停投递**，只能验证"给出哪条消息"的**输入**。因此现在的用例断言的是**视口 `toolTip` 属性的当前值**（Qt 那套机制的输入），而不是"提示弹出来了"。
+第三轮（用户提供的关键事实）：用户告诉我"正文一直都没有弹符号悬停，但宏编辑框的 Enter/Shift+Enter 提示是弹的"。后者是 `setToolTip` 的静态提示——于是有了唯一被实机确认过的通路：**控件自己的 `toolTip` 属性会被显示，而视口事件过滤器上的 `QEvent::ToolTip` 收不到**。我之前"符号悬停走通了所以那条路可靠"的推断是**错的**，已按这个事实改掉实现（不再用 `QEvent::ToolTip`，`language.py` 保持原样未改）。顺带查清：语言服务的 hover **内容其实是有的**（实测 `#text(red)` 的 `result.contents` 是一大段 `text(...)` 签名文档），所以符号悬停不弹**不是**"没内容可显示"，而是投递/展示环节的问题；具体是"事件根本没送到"还是"异步回包被随后的 MouseMove 取消（`LanguageHelp.cancel` 会 `token+=1`）"，离屏分不出来——**待你在实机上确认，我没有擅自改符号悬停**。
+
+验证：`cargo test --offline --locked` 20 个目标全过；桌面离屏 **133/133**（悬停用例：失败片段的框让视口带上原因、画出来的片段让它为空、公式编辑框里同一个框同样给出原因）。牙齿两处都验过：把盖章改成不写消息 → 用例失败（`'' != 'unknown variable: undefined'`）；把随指针更新 `toolTip` 的那段短路 → 两条用例同时失败。
+
+### 2026-09-13（续四）：渲染失败要说出来，并且进入失败框要能重试
+
+用户报告"主编辑器还是不显示"，并给出判断："编辑失败的框进入变成源码模式再退出，但是内容没有改变，它是不是不刷新？"——**这个判断是对的**，我实测确认了它，并据此改了行为。
+
+**一、先说被证伪的一个前提。** 上一节我写"视口事件过滤器是应用里唯一被实机验证过的悬停投递路径（符号悬停一直走它）"，用户随后告知"正文一直都没有弹符号悬停，但宏编辑框的 Enter/Shift+Enter 提示是弹的"。后者是 `setToolTip` 的**静态控件提示**。所以事实是：**控件自己的 `toolTip` 会被显示，视口事件过滤器上的 `QEvent::ToolTip` 收不到**——我原来那条路是死的。顺带查清：语言服务的 hover **内容其实是有的**（实测 `#text(red)` 的 `result.contents` 是一大段 `text(...)` 签名文档），所以符号悬停不弹不是"没内容"，而是投递/展示环节的问题（是事件没送到，还是异步回包被随后的 `MouseMove` 经 `LanguageHelp.cancel()` 取消，离屏分不出来）。**符号悬停本轮未改**，`desktop/language.py` 保持原样。
+
+**二、悬停改成控件 `toolTip`。** 消息仍只记在框对应的视图节点上（`_render_error`，只读不画，框上不写任何字）；显示交给 Qt 自己的机制：`Editor.mouseMoveEvent` 随指针更新**视口**的 `toolTip`，`MathCanvas.mouseMoveEvent` 同理（偏移 `(6,6)`）。指针移开或文档里没有公式时清空，避免上一次的消息留在视口上。**但用户反馈主编辑器仍不显示**，所以这条只是保留，真正的可见通路是下面两条。
+
+**三、渲染失败在底部消息栏播报。** `/api/render` 回包里有 `errors` 时 `self.report("渲染失败：…")`（`report` 即 `statusBar().showMessage(msg,12000)`）；字形/样式请求失败同样播报（`取字形失败：…`），因为两者画的是同一个"没有东西可排"的虚线框。实测这条通路是有效的：进入失败框重试又失败之后，消息栏里确实出现了 `渲染失败：unknown variable: undefinedname（undefinedname）`。
+
+**四、进入失败框/回车确认会重试（用户选定方案 3）。** 实测的旧行为：让 `$ undefinedname $` 渲染失败后，`activate` 进入公式、`ArrowRight` 进入片段源码、`Escape`、`finish_formula` 全程**只发出 1 次** `/api/render`，revision 始终是 2——因为 (a) `load_raw` 对缓存里是 `False` 的片段直接跳过，(b) `raw_error` 只在 revision 前进时清除。所以框会永远停在失败的样子。现在 `activate` 与草稿确认（`previous['pending']` 为真、`state['pending']` 为假，即回车）都会调用 `retry_refused(refused_keys(view))`。
+
+实现上有一处必须注意的耦合：**缓存条目不能删**。`False` 才是"画出失败装束"的状态；删掉会变成"尚未询问"，而 `raw_macro` 在 `None` 下改画成*名字与参数槽*，是另一张图。第一版实现删了缓存，结果 `test_failed_raw_macro_enters_source_and_can_be_repaired` 立刻失败（`'$unknownfn(s q r t ( 3 ))$' != '$sqrt(3)$'`——修复路径整个走偏）。改成保留缓存、另加 `retry` 集合放行**一次**请求：`load_raw` 的跳过条件加 `shared not in self.retry`，key 一进请求就 `discard`，所以是"一次动作一次尝试"，不会每趟重编译。
+
+验证：`cargo test --offline --locked` 20 个目标全过；桌面离屏 **136/136**。新增 4 条：渲染失败播报到底部消息栏（成功时不播报）、字形请求失败也播报、进入失败框与回车确认各重新问一次渲染且再失败会再报一次原因、以及"没有新动作就不反复编译"（连调 3 次 `load_raw` 请求数不变）。牙齿逐条验过：不写 `report` → 播报用例失败；去掉 `activate` 里的 `retry_refused` → `1 != 2`；去掉回车那一处 → `2 != 3`。
+
+
+
+
+
+

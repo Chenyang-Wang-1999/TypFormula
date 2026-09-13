@@ -62,6 +62,32 @@ def difference(before, after):
         c -= 1
     return a, b, after[a:c]
 
+def difference_at_caret(before, after, caret):
+    """`difference`, with the edit placed where the caret says it happened.
+
+    A text diff cannot tell where inside a run of identical characters an edit went. Enter
+    at the end of `Text one` followed by a blank line is a newline inserted before either of
+    the newlines already there; a backspace inside a run of blank lines deletes whichever of
+    them; typing `x` before `xx` is an insertion at either end of the run. The resulting text
+    is the same in every case. `difference` answers with the end of the run, because that
+    maximises the common prefix, and the caret derived from it (`replace` uses
+    `a + len(text)`) would land there too -- on the next line's first character instead of the
+    line just opened, or past the blank lines a backspace was meant to remove.
+
+    The view has already put its caret where the person is, and that is what says which of
+    the equivalent positions was meant. Placing the edit there makes the caret `replace`
+    derives equal to the one the view already has, so the view does not move at all. The
+    position is only taken when the text really does agree, so a diff that is already
+    unambiguous -- and any edit whose caret is not at the edit -- is returned untouched.
+    """
+    a, b, replacement = difference(before, after)
+    removed = len(before) + len(replacement) - len(after)
+    at = caret - len(replacement)
+    if removed >= 0 and at >= 0 and at + removed <= len(before) \
+            and after == before[:at] + replacement + before[at + removed:]:
+        return at, at + removed, replacement
+    return a, b, replacement
+
 def config_path():
     base = Path(os.environ.get("APPDATA", Path.home() / ".config"))
     return Path(os.environ.get("TYPFORMULA_CONFIG", base / "TypFormula" / "settings.json"))

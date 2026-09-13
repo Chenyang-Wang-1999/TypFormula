@@ -164,7 +164,7 @@ $ vec(1, 2, 3) , mat(1, 2; 3, 4) , cases(1 "if" x > 0, - 1 "if" x < 0) $
 == 宏
 正如上文中的 mathbf，TypFormula 编辑器支持将当前文档中的“let + 公式环境” 识别成宏，并且在编辑器中展开。例如：
 
-#let pd(f, x) = $frac(partial #f, partial #x)$ 
+#let pd(f, x) = $frac(partial #f, partial #x)$
 
 $f$对$x$的偏导数是$pd(f, x)$
 
@@ -173,7 +173,7 @@ $f$对$x$的偏导数是$pd(f, x)$
 
 宏还可以支持一个变量多次引用。例如：
 
-#let jac(f,g,x,y) = $mat(pd(#f, #x), pd(#f, #y); pd(#g, #x), pd(#g, #y))$ 
+#let jac(f,g,x,y) = $mat(pd(#f, #x), pd(#f, #y); pd(#g, #x), pd(#g, #y))$
 
 $f , g$对$x , y$的雅可比矩阵是
 $ jac(f, g, x, y) $
