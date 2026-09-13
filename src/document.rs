@@ -73,15 +73,27 @@ impl Document {
     }
     pub fn equation_nodes(&self)->Vec<(Equation,SyntaxNode)> { self.equation_index().as_ref().clone() }
     pub fn activate_equation(&mut self,range:Equation,node:&SyntaxNode)->Result<(),String> {
-        // TODO: this prefix is the whole of what stands before the formula. Reducing it to the
-        // part the formula can see (`typformula_core::context`) would make the macro registry's
-        // cache survive prose edits, but the view hands `definitions` and the definition
-        // offsets to the host, which maps them back into the document by assuming they are the
-        // real prefix (`self.source[..range.start]`, see `Locator` in `document.rs`). The
-        // reduction needs an offset mapping alongside it before that can change.
-        let definitions=&self.source[..range.start];
-        let parsed=typst::parse_formula_node(node,definitions)?;
-        self.editor=Editor::default();self.editor.root=parsed.root;self.editor.definitions=definitions.into();self.editor.display=range.display;self.active=Some(range);Ok(())
+        // The formula only sees part of what stands before it: the statements that can reach
+        // it, reduced by the kernel (`typformula_core::context`) against the tree this document
+        // already keeps up to date. Both the parse and the macro registry then work on that
+        // text, and the registry's offsets and definition texts are retargeted back into the
+        // prefix, so the view and `Locator` see the coordinates they always did.
+        let prefix=&self.source[..range.start];
+        let context=typformula_core::context::context_in(&self.syntax,&[(range.start,range.end)]);
+        // The text before the formula: the reduction keeps the formula itself too, because the
+        // render path needs it, and the editor needs exactly its prefix.
+        let macro_text=match &context {
+            Some(context)=>{let (start,_)=context.ranges[0];context.prefix(start).to_owned()},
+            None=>prefix.to_owned(),
+        };
+        let registry=match &context {
+            Some(context)=>typst::macro_registry_of(&macro_text,prefix,Some(context)),
+            None=>typst::macro_registry(prefix),
+        };
+        let parsed=typst::parse_formula_node_with(node,&registry,&macro_text)?;
+        self.editor=Editor::default();self.editor.root=parsed.root;
+        self.editor.set_macro_context(prefix.to_owned(),macro_text,registry);
+        self.editor.display=range.display;self.active=Some(range);Ok(())
     }
     pub fn apply(&mut self, value: Value) -> Result<(), String> {
         let name = value["action"].as_str().ok_or("缺少操作")?;

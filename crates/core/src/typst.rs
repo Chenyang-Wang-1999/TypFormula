@@ -209,19 +209,17 @@ fn scope_bindings<'a>(node: &'a SyntaxNode, offset: usize, out: &mut Vec<ScopeBi
     let mut at = offset;
     for child in node.children() { scope_bindings(child, at, out); at += child.len(); }
 }
-pub fn macro_registry(definitions: &str) -> Arc<MacroRegistry> {
+/// The bindings of `text`, reported in `original`'s coordinates.
+///
+/// `context` is what produced `text` from `original` (`crate::context`), and it is what lets
+/// the registry keep the caller's offsets and text. A caller that already has the document's
+/// tree -- the host keeps one, incrementally -- passes that in instead of letting this module
+/// parse the prefix again; `macro_registry` is the shape for callers that have only text.
+pub fn macro_registry_of(text: &str, original: &str, context: Option<&context::Context>) -> Arc<MacroRegistry> {
     // The desktop passes the full lexical prefix. Most documents and most
     // early formulas contain no bindings at all; avoid parsing that markup a
     // second time merely to construct an empty registry.
-    if !definitions.contains("let") { return empty_macros(); }
-    // Only the statements that can reach the end of the prefix can bind anything there, and
-    // that part of the text does not change when the prose around it does. Reducing first
-    // therefore makes the cache below hit on a keystroke that only touched prose, instead of
-    // rebuilding every definition's template once per formula. Everything the registry reports
-    // is translated back (`retarget`) because its offsets and its `definition_prefix` are read
-    // as offsets and text of `definitions`.
-    let reduced = context::context_before(definitions, definitions.len());
-    let text = reduced.as_ref().map_or(definitions, |context| context.source.as_str());
+    if !text.contains("let") { return empty_macros(); }
     let hash = key_hash(text);
     let mut cache = poison_free(&MACROS);
     if let Some(index) = cache.find(text, hash) {
@@ -239,10 +237,20 @@ pub fn macro_registry(definitions: &str) -> Arc<MacroRegistry> {
     // analyze_macros still reuses, one definition at a time.
     let previous = cache.entries.last().map(|entry| entry.registry.clone());
     let mut registry = analyze_macros(text, previous.as_deref());
-    if let Some(context) = &reduced { retarget(&mut registry, context, definitions); }
+    if let Some(context) = context { retarget(&mut registry, context, original); }
     let registry = Arc::new(registry);
     cache.retain(text, hash, &registry);
     registry
+}
+
+pub fn macro_registry(definitions: &str) -> Arc<MacroRegistry> {
+    if !definitions.contains("let") { return empty_macros(); }
+    // Only the statements that can reach the end of the prefix can bind anything there, and
+    // that part of the text does not change when the prose around it does. Reducing first
+    // therefore makes the cache hit on a keystroke that only touched prose, instead of
+    // rebuilding every definition's template once per formula.
+    let reduced = context::context_before(definitions, definitions.len());
+    macro_registry_of(reduced.as_ref().map_or(definitions, |context| context.source.as_str()), definitions, reduced.as_ref())
 }
 
 /// Move a registry analyzed from reduced text back into the caller's coordinates.
@@ -253,7 +261,9 @@ pub fn macro_registry(definitions: &str) -> Arc<MacroRegistry> {
 /// `definition_raw_ranges` locates a fragment and where `document::annotate` expects it.
 fn retarget(registry: &mut MacroRegistry, context: &context::Context, definitions: &str) {
     for def in registry.entries.iter_mut() {
-        let (start, end) = (def.definition_start, def.definition_start + def.input.len());
+        // `input` runs from the *previous* definition's end, so the definition's own end in
+        // the reduced text is only its context plus that run.
+        let (start, end) = (def.definition_start, def.context.len() + def.input.len());
         let (Some(start), Some(end)) = (context.original(start), context.original(end)) else { continue };
         def.definition_start = start;
         def.context = Arc::new(definitions[..start].to_string());
@@ -460,11 +470,18 @@ pub fn parse_formula(text: &str, context: &str) -> Result<Parsed, String> {
 /// syntax tree. This preserves Typst's incremental AST and avoids reparsing the
 /// equation string for every static projection during import.
 pub fn parse_formula_node(node:&SyntaxNode,context:&str)->Result<Parsed,String> {
+    parse_formula_node_with(node,&macro_registry(context),context)
+}
+
+/// The same, against a registry the caller already has.
+///
+/// An `Editor` holds the registry of its formula and the text the host reduced it from, so
+/// activating a formula neither parses the prefix for the bindings nor analyzes them twice.
+pub fn parse_formula_node_with(node:&SyntaxNode,registry:&Arc<MacroRegistry>,context:&str)->Result<Parsed,String> {
     let (errors, _) = node.errors_and_warnings();
     if let Some(error) = errors.first() { return Err(error.message.to_string()); }
     let eq=node.cast::<ast::Equation>().ok_or("缺少公式")?;
-    let registry = macro_registry(context);
-    let ctx = ParseContext { params: &[], locals: &HashSet::new(), registry: &registry, template: false };
+    let ctx = ParseContext { params: &[], locals: &HashSet::new(), registry, template: false };
     Ok(Parsed { root: parse_cell(eq.body().to_untyped(), &ctx), definitions: context.to_owned(), display: eq.block() })
 }
 

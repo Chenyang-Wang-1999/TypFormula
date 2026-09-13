@@ -2370,6 +2370,14 @@ Editor 现在在 clear/insertText/setCharFormat 等 Qt 文档操作前，发布�
 - `/api/attachments`：host 自己从文档 + 公式区间合成上下文（前端不改）。该 deck：63/63 成功、整轮 **1.5 s**、单次中位数 **21 ms**。
 - 适配器：方程搜索改为沿**元素字段**的 DFS（保持文档顺序，遇方程不下钻），并沿父链重建 `StyleChain`。新增 `a_formula_inside_a_container_or_under_a_theme_is_still_found`（7 种形状：plain/`#columns`/`#grid`/列表项/`#block`/`#show box`/主题+嵌套），用替身主题而非真包。
 - 宏管理：`macro_registry` 先归约再分析，缓存键变成"稳定文本"，偏移与 `definition_prefix` 用 `retarget` 译回调用方坐标（`tests/macro_scope.rs::a_template_fragment_is_asked_for_at_its_own_place_in_the_definition` 的 `definition_prefix(def) == source` 仍然成立）；`scan_syntax`/`analyze_formula` 的"能否展开"检查也用该定义自己的上下文。实测 307 KB：`set_source` 12→6 ms、`edit_source` 7–10→4.9 ms；`activate_formula` 22.6–31.7→21.2 ms（**没有实质变化**：归约自己要解析一次前缀，抵消了它省下的那次解析；真正要省下它得让 `Editor` 直接持有注册表与上下文，尚未做）。
+
+### 2026-09-13（续）：Editor 直接持有注册表与上下文
+
+上一条留下的 TODO 做掉了。`Editor` 现在有三个字段：`definitions`（调用方的文本：视图、失败集合与 host 的偏移都用它）、`macro_text`（注册表所分析的那段文本）、`registry`（`Arc<MacroRegistry>`，偏移已在 `definitions` 坐标里）。host 用文档**已有的增量语法树**算出上下文（`context_in`），取它在公式之前的**前缀**当 `macro_text`，再用 `macro_registry_of(macro_text, prefix, Some(context))` 把注册表译回前缀坐标，最后 `set_macro_context(...)` 一次性装进编辑器——归约与寄存器表都不再各自解析一遍前缀，`parse_formula_node_with` 直接在归约后的文本上解析。
+
+实现中被测试抓到两处真问题：(1) `retarget` 用 `definition_start + input.len()` 当作定义在归约文本里的**结束**偏移，而 `input` 是从**上一个定义末尾**开始的（含间隔），所以第二个定义会算错——改为 `context.len() + input.len()`，并以 `definition_prefix(def) == source` 的既有断言守着；(2) `macro_text` 一开始直接用了上下文的全文，而上下文**包含公式自身**（取图路径需要它），于是命令草稿的重新解析多出一条"请将 #let 定义放在公式之前"——改为取 `context.prefix(moved_start)`。
+
+实测 307 KB（同一批形状）：`activate_formula` **21.2 → 13.1 ms**、`analyze_formula`（编辑公式时的每键路径）**9.7 → 3.4 ms**、`edit_source` 4.9→4.5 ms、整篇 `analyze`（打开文档）**485 → 264 ms**（注册表缓存现在跨公式命中）。`cargo test --offline --locked` 20 个测试目标全过，桌面离屏 121/121。
 - 缓存身份：核心在 `analyze`/`state` 里为每个公式给出 `context` 摘要，前端用它作为图像与 placement 的键（原来是整段前缀）。该 deck 实测：正文里插入一个字后**重新请求 0 次**（原为 63 次，全部 placement 保留）；改 `#set` 后重问 60 次（正确——上下文真的变了）。
 
-验证：`cargo test --offline --locked` 20 个测试目标全过（内核 24 项含 `context` 的 11 项）；适配器 24 项；桌面离屏 **121/121**。全部 release 二进制按当前源码重建。未修改 `Editor.definitions`（见上面的 `activate_formula` 备注与 `document.rs::activate_equation` 的 TODO）。
+验证：`cargo test --offline --locked` 20 个测试目标全过（内核 24 项含 `context` 的 11 项）；适配器 24 项；桌面离屏 **121/121**。全部 release 二进制按当前源码重建（含随后那一步的 Editor 改动）。

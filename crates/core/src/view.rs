@@ -228,7 +228,7 @@ impl Editor {
         // The projection is scoped: it borrows the definition registry and the caret,
         // and the caret is touched again below (`self.cursor.occurrence` is rewritten
         // once the view exists).
-        let registry = typst::macro_registry(&self.definitions);
+        let registry = self.registry.clone();
         let mut view = {
             let projector = Projector {
                 registry: &registry,
@@ -265,7 +265,7 @@ impl Editor {
             pending: self.pending().is_some(), undo: self.can_undo(), redo: self.can_redo(), message: self.message.clone(),
             command: if self.string_mode() { None } else { self.command_context() }, definitions: self.definitions.clone(), string_mode: self.string_mode(),
             display: self.display,
-            macros: typst::macro_registry(&self.definitions).entries.clone(),
+            macros: self.registry.entries.clone(),
         }
     }
 }

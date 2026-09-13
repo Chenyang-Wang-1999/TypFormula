@@ -4,7 +4,7 @@
 // Authors of original algorithms are listed in docs/LYX-CREDITS.
 use crate::{editing, math::*, slots, typst};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CommandCompletion { pub label: String, pub replacement: String, pub caret: usize }
@@ -38,13 +38,23 @@ pub struct StopGeometry { pub cursor: Cursor, pub x: f64, pub y: f64 }
 // Only a hint about which Raws are worth opening their source for; dropping the
 // whole set at the limit is harmless.
 const FAILED_PREVIEW_LIMIT: usize = 256;#[derive(Clone)]
-pub(crate) struct Snapshot { root: MathData, cursor: Cursor, anchor: Option<Cursor>, definitions: String, display: bool }
+pub(crate) struct Snapshot { root: MathData, cursor: Cursor, anchor: Option<Cursor>, definitions: String, macro_text: String, registry: Arc<typst::MacroRegistry>, display: bool }
 
 pub struct Editor {
     pub root: MathData,
     pub cursor: Cursor,
     pub anchor: Option<Cursor>,
+    /// The caller's text: the identity the view, the failed-preview set and the host's
+    /// offsets are all expressed in.
     pub definitions: String,
+    /// The text the registry was built from. The host reduces the prefix to the statements
+    /// that can reach the formula (`crate::context`) and hands that in, so this is usually a
+    /// small part of `definitions`; everything the registry reports has already been moved
+    /// back into `definitions` coordinates, which is what keeps the two interchangeable for
+    /// every consumer except the parse itself.
+    pub macro_text: String,
+    /// The bindings of `macro_text`, in `definitions` coordinates.
+    pub registry: Arc<typst::MacroRegistry>,
     pub display: bool,
     pub message: String,
     pub completion_index: usize,
@@ -62,7 +72,7 @@ pub struct Editor {
     failed_context: Option<(String, bool)>,
 }
 impl Default for Editor {
-    fn default() -> Self { Self { root: vec![], cursor: Cursor::default(), anchor: None, definitions: String::new(), display: true, message: String::new(), completion_index: 0, revision: 0, geometry: vec![], target_x: None, history: vec![], future: vec![], typing: false, lsp_completions: None, failed_previews: HashSet::new(), failed_context: None } }
+    fn default() -> Self { Self { root: vec![], cursor: Cursor::default(), anchor: None, definitions: String::new(), macro_text: String::new(), registry: typst::macro_registry(""), display: true, message: String::new(), completion_index: 0, revision: 0, geometry: vec![], target_x: None, history: vec![], future: vec![], typing: false, lsp_completions: None, failed_previews: HashSet::new(), failed_context: None } }
 }
 /// The shape a new matrix starts with, which is what `mat` builds when it is typed
 /// with no arguments: one row of two columns, the same as `\mat` + Enter has always
@@ -98,21 +108,36 @@ fn fill_command_cells(atom: &mut MathAtom, registry: &typst::MacroRegistry) {
 }
 
 impl Editor {
-    pub(crate) fn snapshot(&self) -> Snapshot { Snapshot { root: self.root.clone(), cursor: self.cursor.clone(), anchor: self.anchor.clone(), definitions: self.definitions.clone(), display: self.display } }
-    pub(crate) fn restore(&mut self, s: Snapshot) { self.root = s.root; self.cursor = s.cursor; self.anchor = s.anchor; self.definitions = s.definitions; self.display = s.display; }
+    pub(crate) fn snapshot(&self) -> Snapshot { Snapshot { root: self.root.clone(), cursor: self.cursor.clone(), anchor: self.anchor.clone(), definitions: self.definitions.clone(), macro_text: self.macro_text.clone(), registry: self.registry.clone(), display: self.display } }
+    pub(crate) fn restore(&mut self, s: Snapshot) { self.root = s.root; self.cursor = s.cursor; self.anchor = s.anchor; self.definitions = s.definitions; self.macro_text = s.macro_text; self.registry = s.registry; self.display = s.display; }
+    /// Take a definition text as both identity and macro source, when there is no document to
+    /// reduce it against (the inline definition block editor, a pasted document).
+    pub fn set_macro_source(&mut self, definitions: String) {
+        self.definitions = definitions;
+        self.macro_text = self.definitions.clone();
+        self.registry = typst::macro_registry(&self.macro_text);
+    }
+    /// Take a reduction of `definitions` the caller already built, together with the registry
+    /// it retargeted. The host does this from the document's own tree, which is parsed
+    /// incrementally, so neither the reduction nor the analysis parses the prefix here.
+    pub fn set_macro_context(&mut self, definitions: String, macro_text: String, registry: Arc<typst::MacroRegistry>) {
+        self.definitions = definitions; self.macro_text = macro_text; self.registry = registry;
+    }
     pub fn can_undo(&self) -> bool { !self.history.is_empty() }
     pub fn can_redo(&self) -> bool { !self.future.is_empty() }
-    // Adopting a definition set always replaces the whole projected tree, so the
-    // cursor cannot survive it: the structural paths it points at are re-derived.
+    // Adopting a parsed tree always replaces the whole projection, so the cursor cannot
+    // survive it: the structural paths it points at are re-derived. The texts are the
+    // caller's business -- `set_macro_source` takes a new definition text, and a reparse of
+    // the same formula leaves both alone.
     fn adopt(&mut self, parsed: typst::Parsed) {
-        self.root = parsed.root; self.definitions = parsed.definitions;
+        self.root = parsed.root;
         self.cursor = Cursor::default(); self.anchor = None; self.geometry.clear();
         self.lsp_completions = None;
     }
-    // Reclassify the current cell against the current definitions. A MacroCall
+    // Reclassify the current cell against the current bindings. A MacroCall
     // must never outlive the arity it was parsed with.
     fn rebind(&mut self) -> Result<(), String> {
-        let parsed = typst::parse_document(&typst::write_document_mode(&self.root, &self.definitions, self.display))?;
+        let parsed = typst::parse_document(&typst::write_document_mode(&self.root, &self.macro_text, self.display))?;
         self.adopt(parsed);
         Ok(())
     }
@@ -120,7 +145,7 @@ impl Editor {
     // same reparse as an explicit definition update instead of leaving the cell
     // parsed against the previous registry.
     fn refresh_definitions(&mut self, previous: &str) {
-        if self.definitions == previous { return; }
+        if self.macro_text == previous { return; }
         if let Err(error) = self.rebind() { self.message = error; }
     }
     fn data(&self) -> &MathData { cell(&self.root, &self.cursor.slices) }
@@ -168,7 +193,7 @@ impl Editor {
         let Some(prefix) = self.pending() else { return vec![]; };
         let prefix = prefix.trim();
         if !prefix.chars().all(|c| c.is_alphanumeric() || c == '.') { return vec![]; }
-        let registry = typst::macro_registry(&self.definitions);
+        let registry = self.registry.clone();
         let mut names: Vec<_> = slots::command_names().into_iter().map(str::to_string)
             .chain(registry.entries.iter().filter(|d| d.expandable && !d.shadowed).map(|d| d.name.clone()))
             .filter(|n| n.starts_with(prefix)).collect();
@@ -208,7 +233,11 @@ impl Editor {
                 // Reclassify calls only when the definition context changes.
                 // Serialize first, so removing/changing a definition cannot lose arguments.
                 if definitions != self.definitions {
-                    let parsed = typst::parse_document(&typst::write_document_mode(&self.root, &definitions, self.display))?;
+                    // This text is the whole definition set the editor was handed -- the inline
+                    // definition block or a pasted document -- so it is both the identity and
+                    // the macro source; there is no document here to reduce it against.
+                    self.set_macro_source(definitions);
+                    let parsed = typst::parse_document(&typst::write_document_mode(&self.root, &self.macro_text, self.display))?;
                     self.adopt(parsed);
                 }
             }
@@ -240,7 +269,8 @@ impl Editor {
             }
             Action::Import { source } => {
                 let parsed = typst::parse_document(&source)?;
-                self.root = parsed.root; self.definitions = parsed.definitions; self.display = parsed.display; self.cursor = Cursor::default(); self.anchor = None;
+                self.set_macro_source(parsed.definitions.clone());
+                self.root = parsed.root; self.display = parsed.display; self.cursor = Cursor::default(); self.anchor = None;
             }
             Action::Clear => { self.root.clear(); self.cursor = Cursor::default(); self.anchor = None; }
             Action::AddRow => self.grow_grid(false),
@@ -423,7 +453,7 @@ impl Editor {
         // Asked before the draft is removed: an unparseable edit of a Raw fragment
         // is committed as that fragment's source instead of being refused.
         let from_source = self.editing_source();
-        let previous_definitions = self.definitions.clone();
+        let previous_definitions = self.macro_text.clone();
         let name = completion.clone().unwrap_or_else(|| draft.trim().to_string());
         let name = if name == "/" { "frac".to_string() } else { name };
         // A command *name* typed on its own is read as the call it spells, so `\frac`
@@ -436,8 +466,8 @@ impl Editor {
         let bare_name = (completion.is_some() || draft.trim() == name || draft.trim() == "/")
             && self.is_callable(&name);
         let parsed = if cancel || name.is_empty() { None } else {
-            let text = if bare_name { typst::parse_command_invocation(&name, &self.definitions) }
-                else { typst::parse_command(&name, &self.definitions) };            match text {
+            let text = if bare_name { typst::parse_command_invocation(&name, &self.macro_text) }
+                else { typst::parse_command(&name, &self.macro_text) };            match text {
                 Ok(doc) => Some(doc),
                 Err(error) => { self.message = format!("公式尚未完成：{error}"); return true; }
             }
@@ -458,7 +488,9 @@ impl Editor {
         if name.is_empty() { return true; }
         if let Some(doc) = parsed {
             let mut data = doc.root;
-            self.definitions = doc.definitions;
+            // A draft that carried its own definitions -- a pasted document -- replaces them;
+            // the usual case is that the parser echoed the text it was given back.
+            if doc.definitions != self.macro_text { self.set_macro_source(doc.definitions); }
             if self.text_cell() {
                 let text = data.iter().map(|a| if matches!(a.kind, Kind::Text) {
                     a.cells[0].iter().map(typst::write_atom).collect::<String>()
@@ -478,7 +510,7 @@ impl Editor {
                 // `frac(a, b)` parse to the same kind, and only the first needs cells
                 // added. `fill_command_cells` leaves a node that already has them
                 // alone, so this is safe for both.
-                let registry=typst::macro_registry(&self.definitions);
+                let registry=self.registry.clone();
                 for atom in &mut data { fill_command_cells(atom,&registry); }
                 let n = data.len(); self.data_mut().splice(pos..pos, data); self.cursor.pos += n;
                 // A lone command node is entered at its first slot, the way a
@@ -566,7 +598,7 @@ impl Editor {
                 if self.quoted_draft() { self.interpret_char('"'); return; }
                 // Built-in exact names still create empty, editable LyX slots; a
                 // macro name comes from the completion list instead.
-                let exact = self.pending().map(str::trim).is_some_and(|s| self.is_command_name(s) || typst::macro_registry(&self.definitions).is_bound(s))
+                let exact = self.pending().map(str::trim).is_some_and(|s| self.is_command_name(s) || self.registry.is_bound(s))
                     || list.iter().any(|name| Some(name.as_str()) == self.pending().map(str::trim));
                 let single_name = self.pending().is_some_and(|s| !s.trim().is_empty() && s.trim().chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_'));
                 if !exact && single_name {
@@ -631,7 +663,7 @@ impl Editor {
     /// name a node the editor can put slots in; a variable or an unknown name is left
     /// as the text it is.
     fn is_callable(&self, name: &str) -> bool {
-        let registry=typst::macro_registry(&self.definitions);
+        let registry=self.registry.clone();
         if registry.is_bound(name) {return registry.get(name).is_some_and(|def|def.function);}
         self.is_command_name(name)
     }
@@ -660,13 +692,13 @@ impl Editor {
         let pos = self.cursor.pos;
         // A command with no arguments of its own is read as the call it spells, so
         // `mat` builds a matrix rather than an identifier called `mat`.
-        let invocation = typst::parse_command_invocation(name, &self.definitions);
+        let invocation = typst::parse_command_invocation(name, &self.macro_text);
         match invocation {
             Ok(doc) => {
-                let previous = self.definitions.clone();
-                self.definitions = doc.definitions;
+                let previous = self.macro_text.clone();
+                if doc.definitions != self.macro_text { self.set_macro_source(doc.definitions); }
                 let mut data = doc.root;
-                let registry=typst::macro_registry(&self.definitions);
+                let registry=self.registry.clone();
                 for atom in &mut data { fill_command_cells(atom,&registry); }
                 // The caret enters the node when it has a first slot to sit in, which
                 // is what makes a fresh `\frac` land in the numerator whether the
