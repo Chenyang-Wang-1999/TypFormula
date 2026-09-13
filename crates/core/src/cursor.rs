@@ -573,9 +573,10 @@ impl Editor {
     }
     pub(crate) fn text_cell(&self) -> bool { matches!(self.owner().map(|o| &o.kind),Some(Kind::Text)) }
     /// Whether the caret is inside a number run, whose cell takes digits and
-    /// nothing else. Unlike a text run it does **not** trap the arrow keys: a run
-    /// is something the reader passes through, so `key` leaves the boundaries to
-    /// the ordinary cell handling and left/right walk out of it.
+    /// nothing else. A run does not trap the arrow keys: it is something the reader
+    /// passes through, so `key` leaves the boundaries to the ordinary cell handling
+    /// and left/right walk out of it. A text cell is the same at its two ends --
+    /// see the `text_cell` branch in `key`.
     fn number_cell(&self) -> bool { matches!(self.owner().map(|o| &o.kind), Some(Kind::Number)) }
     fn quoted_draft(&self) -> bool {
         let Some(name) = self.pending() else { return false; };
@@ -881,8 +882,17 @@ impl Editor {
         if self.text_cell() {
             match key {
                 "Enter" => { self.anchor=None; self.pop(true); return; }
-                "ArrowLeft" if self.cursor.pos == 0 => return,
-                "ArrowRight" if self.cursor.pos == self.data().len() => return,
+                // A text cell is a box the caret can walk out of: at an end of the string,
+                // Left/Right leaves the box for the level above instead of being
+                // swallowed. `"` and Enter are the other two ways a string ends, and
+                // neither is what a person reaches for when they want to *leave* the box,
+                // so an arrow that could not move the caret used to strand it there.
+                //
+                // Up/Down and Tab stay swallowed: a string has one line, so a vertical
+                // move has no meaning inside it, and `Tab` means "next cell" rather than
+                // "out". Only the pair that reads along the text's own axis leaves.
+                "ArrowLeft" if self.cursor.pos == 0 => { self.anchor=None; self.pop(false); return; }
+                "ArrowRight" if self.cursor.pos == self.data().len() => { self.anchor=None; self.pop(true); return; }
                 "ArrowUp" | "ArrowDown" | "Tab" => return,
                 "Home" | "End" => {
                     if shift { self.anchor.get_or_insert(self.cursor.clone()); } else {self.anchor=None;}

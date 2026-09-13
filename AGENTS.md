@@ -99,6 +99,7 @@ typformula/
 ├── vendor/typst/               固定版本的 Typst 引擎（含本项目的数学 IR 标签桥接补丁，见 UPSTREAM.md）
 ├── fonts/                      随附数学字体（NewCM Math 与 NewCM10 Italic）与 NOTICE
 ├── workspace/                  源码运行的默认工作目录（未跟踪）；便携版使用 LOCALAPPDATA
+├── TODO/                       待处理的开发任务
 ├── build-desktop.cmd           构建 release 后端 + 适配器，并检查 PyQt5（只构建，不启动）
 ├── build-release.cmd           构建便携版并离屏自检，默认包含 Tinymist，不上传发布
 ├── start-desktop.cmd           启动窗口（`python -m desktop`）

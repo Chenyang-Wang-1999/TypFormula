@@ -137,6 +137,7 @@ class Editor(QTextEdit):
         self.verticalScrollBar().valueChanged.connect(lambda _:self.line_numbers.update())
         self.document().documentLayout().documentSizeChanged.connect(lambda _:self.line_numbers.update())
         self.setStyleSheet("QTextEdit {border:0; padding:16px; background:#fff; selection-background-color:#a8cdf3;}")
+        self.setTabStopDistance(20)
         self.update_line_number_width()
 
     def line_number_width(self):

@@ -574,6 +574,81 @@ class NativeTest(unittest.TestCase):
         APPLICATION.sendEvent(draft,QKeyEvent(6,Qt.Key_Return,Qt.NoModifier))
         self.assertIsNone(window.definition_draft);self.assertIn('#x - 1',window.source)
 
+    def test_definition_draft_leaves_on_an_arrow_that_cannot_move(self):
+        """The macro box is left by losing focus; an arrow at the edge is one way to ask.
+
+        Enter and Esc were the only exits, so clicking away left the box open with the
+        caret outside it -- unable to type, unable to close. The arrows are the same
+        request as clicking: at the first line Up, at the last line Down, at the very
+        start Left, at the very end Right. Inside the text they must still move the caret,
+        or a multi-line definition could not be edited.
+        """
+        from PyQt5.QtGui import QKeyEvent
+        source='before\n#let dbl(x) = $#x + 1$\nafter $dbl(a)$'
+        for key in (Qt.Key_Up,Qt.Key_Left):
+            self.load(source);window=self.window
+            block=next(f for f in window.editor.object_data.values() if f.get('definition_block'))
+            window.activate(block['start']);draft=window.definition_draft.source
+            APPLICATION.sendEvent(draft,QKeyEvent(6,key,Qt.NoModifier))
+            self.assertIsNone(window.definition_draft,f'{key} at the start of the box must leave it')
+            self.assertIn('dbl(x)',window.source,'leaving by an arrow keeps the text, like Enter')
+        # A multi-line definition keeps its internal movement: Down walks to line two.
+        self.load('before\n#let dbl(x) = $#x + \\\n  1$\nafter $dbl(a)$')
+        window=self.window
+        block=next(f for f in window.editor.object_data.values() if f.get('definition_block'))
+        window.activate(block['start']);draft=window.definition_draft.source
+        self.assertGreater(draft.document().blockCount(),1,'fixture must be multi-line')
+        APPLICATION.sendEvent(draft,QKeyEvent(6,Qt.Key_Up,Qt.NoModifier))
+        self.assertIsNone(window.definition_draft)
+        window.activate(block['start']);draft=window.definition_draft.source
+        APPLICATION.sendEvent(draft,QKeyEvent(6,Qt.Key_Down,Qt.NoModifier))
+        self.assertIsNotNone(window.definition_draft,'Down has a line to move to, so it must stay')
+        self.assertEqual(draft.textCursor().blockNumber(),1)
+        window.cancel_definitions()
+
+    def test_definition_draft_leaves_when_focus_goes_elsewhere(self):
+        """Clicking outside the box is the general exit, and it commits like Enter.
+
+        The draft is a floating widget over the document, not a mode: nothing about it
+        says the caret may not go elsewhere. Walking away is a person saying "this is what
+        I meant", so the edit is kept rather than silently dropped.
+        """
+        source='before\n#let dbl(x) = $#x + 1$\nafter $dbl(a)$'
+        from PyQt5.QtTest import QTest
+        self.load(source);window=self.window;window.show();APPLICATION.processEvents()
+        block=next(f for f in window.editor.object_data.values() if f.get('definition_block'))
+        window.activate(block['start']);draft=window.definition_draft.source
+        draft.setPlainText('#let dbl(x) = $#x - 1$')
+        APPLICATION.processEvents()
+        # Moving focus to the editor is what a click in the document does.
+        window.editor.setFocus();APPLICATION.processEvents()
+        QTest.qWait(20);APPLICATION.processEvents()
+        self.assertIsNone(window.definition_draft,'focus moving away must close the box')
+        self.assertIn('#x - 1',window.source,'leaving by clicking keeps the edit')
+        window.hide()
+
+    def test_a_string_box_is_left_by_arrows_back_to_its_parent(self):
+        """The `"..."` box hands the caret back to the formula, and only a root arrow exits.
+
+        Leaving the box is *not* leaving the formula: the caret returns to the level above
+        the string, which is an ordinary position inside the formula. The formula session
+        stays open -- what a further arrow at the very root does is the pre-existing
+        rule, and it must not have moved.
+        """
+        self.load('Before $x$ After');window=self.window
+        window.activate(window.analysis['formulas'][0]['start'])
+        window.math_action('input',text='"');window.math_action('input',text='ab')
+        self.assertTrue(window.math_state['string_mode'],'quote enters the text box')
+        window.math_action('key',key='ArrowLeft');window.math_action('key',key='ArrowLeft')
+        self.assertTrue(window.math_state['string_mode'],'walking to the string head stays in the box')
+        window.math_action('key',key='ArrowLeft')
+        self.assertFalse(window.math_state['string_mode'],'one more Left leaves the box')
+        self.assertIsNotNone(window.math_state,'leaving the box returns to the formula, not out of it')
+        self.assertEqual(window.math_state['cursor']['slices'],[])
+        self.assertEqual(window.source,'Before $"ab" x$ After','the string itself is untouched')
+        window.math_action('key',key='ArrowLeft')
+        self.assertIsNone(window.math_state,'an arrow already at the formula root leaves the formula')
+
     def test_formula_session_edits_authoritative_source(self):
         self.load("Before $a/b$ after")
         window=self.window;formula=window.analysis['formulas'][0];before=window.source

@@ -64,6 +64,39 @@ fn quote_mode_keeps_literal_operators_and_finishes_with_quote_or_enter() {
 }
 
 #[test]
+fn a_text_cell_is_left_by_arrows_at_its_ends_not_only_by_enter() {
+    // A string is a box the caret can walk out of. Swallowing Left/Right at either end
+    // stranded the caret: the only ways out were `"` and Enter, and neither is what a
+    // person reaches for when they want to leave a box. Up/Down already popped out, so
+    // the horizontal pair was the inconsistent one.
+    let mut e=Editor::default();input(&mut e,"\"");input(&mut e,"ab");
+    assert!(e.string_mode());assert_eq!(e.cursor.slices.len(),1);
+    key(&mut e,"ArrowLeft");key(&mut e,"ArrowLeft");
+    assert!(e.string_mode(),"walking to the start of the string stays inside it");
+    assert_eq!(e.cursor.pos,0);
+    // The third Left is the one with nowhere to go, so it leaves the cell for the level
+    // above -- the formula root here, which is still *inside* the formula.
+    key(&mut e,"ArrowLeft");
+    assert!(!e.string_mode(),"an arrow at the string's start leaves the text cell");
+    assert!(e.cursor.slices.is_empty(),"leaving the cell returns to the level above it");
+    assert_eq!(source(&e),r#""ab""#,"leaving the box must not touch the string");
+    // And the same from the right-hand end, walking in the other direction.
+    let mut e=Editor::default();input(&mut e,"\"");input(&mut e,"ab");
+    key(&mut e,"ArrowRight");
+    assert!(!e.string_mode(),"an arrow at the string's end leaves the text cell");
+    assert!(e.cursor.slices.is_empty());
+    assert_eq!(source(&e),r#""ab""#);
+    // Up/Down do **not** leave: a string has one line, so a vertical move means nothing
+    // inside it, and only the axis the text is read along carries the caret out.
+    for k in ["ArrowUp","ArrowDown"] {
+        let mut e=Editor::default();input(&mut e,"\"");input(&mut e,"ab");
+        key(&mut e,k);
+        assert!(e.string_mode(),"{k} has no meaning in a one-line string, so it must not leave");
+        assert_eq!(e.cursor.slices.len(),1);
+    }
+}
+
+#[test]
 fn quote_inside_command_uses_enter_to_close_string_before_confirming() {
     // The string is left open on purpose: Enter closes it before the command is
     // confirmed. The named argument is typed only after that, so the draft still

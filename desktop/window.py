@@ -557,7 +557,15 @@ class Window(QMainWindow):
         self.show_math_completions()
         if state.get('pending') and state.get('command')!=previous.get('command'):self.completion_timer.start()
         arrow=arguments.get('key','')
-        if action=='key' and arrow in ('ArrowLeft','ArrowRight','ArrowUp','ArrowDown') and not arguments.get('shift') and not arguments.get('ctrl') and not previous.get('pending') and not previous.get('string_mode') and not previous.get('selected_source'):
+        # An arrow exits the formula when it did not move the caret: the core walks the
+        # caret to the outermost level and pops it out, so an unmoved caret means there
+        # was nowhere left to go inside the formula. Leaving a text cell (`"..."`) is a
+        # different act and must NOT be caught here -- the caret moving back to the level
+        # above the box is an ordinary move *within* the formula, and the formula stays
+        # active. What lets a string be left at all is the core popping the text cell at
+        # either end; the frontend only has to stop excluding `string_mode`, which it used
+        # to do because the core swallowed those arrows instead of acting on them.
+        if action=='key' and arrow in ('ArrowLeft','ArrowRight','ArrowUp','ArrowDown') and not arguments.get('shift') and not arguments.get('ctrl') and not previous.get('pending') and not previous.get('selected_source'):
             if state['cursor']==previous['cursor']:self.exit_formula(arrow)
 
     def reposition_math(self,*args):

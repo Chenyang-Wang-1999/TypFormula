@@ -2462,6 +2462,24 @@ Editor 现在在 clear/insertText/setCharFormat 等 Qt 文档操作前，发布�
 
 验证：`cargo test --offline --locked` 18 个测试目标全过（`lyx_traces` 新增 5 条：矩阵按光标删行列、光标行决定删哪一行、对齐公式保住标记或说原因、删除是一步撤销、光标不在列表里时给出提示）；桌面离屏 **140/140**（新增 4 条：工具栏跟着光标进矩阵、对齐公式同样服务、四个命令改的是光标所在的列表、删最后一行不动源码并报出原因）。前端用例的牙齿：`update_list_bar` 不接 → 可见性两条失败；`active_list` 用第一版的 `active` 或"第一个带标记的节点" → 同样失败。
 
+### 2026-09-13：离开草稿统一为"失焦"，以及文字框的方向键出口
+
+用户报告：宏编辑框"只有回车才能退出"，所以鼠标点到框外就会出现"光标在框外却无法编辑"。要求把宏编辑框的逻辑改成**失焦退出**（鼠标点击和回车只是两种退出手段），并给它和"公式编辑器里加双引号进入的那个小框"都加上方向键退出。用户随后澄清了关键一点：**"光标离开文字框"是回到上一级，不是退出公式**。
+
+**一、宏编辑框：把四种手法收成一种机制。** `definitions.py` 里原先只有 Enter（确认写回）与 Esc（丢弃），没有第三条路。现在 `DefinitionSource` 的注释与实现都按"离开＝失去焦点"写：Enter、Esc、边缘方向键都只是**请求**失焦，真正的出口是 `DefinitionDraft` 上装的 `eventFilter` 监听 `QEvent.FocusOut`——鼠标点到文档任何地方都会走到它。失焦按**确认**处理（与 Enter 一致）：走开的人是在说"我就是要这样"，误点一下就把改动丢掉是更坏的意外。判定用 `self.owner.definition_draft is self`，所以被替换掉的旧草稿不会被迟到的 FocusOut 提交；`confirm_definitions` 本身对 `draft is None` 已经幂等，重复触发是空操作。确认动作走 `QTimer.singleShot(0, ...)` 延后一拍：FocusOut 触发时 Qt 还在搬焦点，而确认会重建草稿脚下的文档。
+
+方向键的判据是"这一下**动不了**才算离开"，全部问 Qt 自己的光标：在第一行按上、在最后一行按下、在文档最开头按左、在最末尾按右。多行定义因此不受影响（中间按上下是普通的换行移动，实测 Down 从第 0 块走到第 1 块且草稿仍在），有选区时也不离开（那是扩展选区）。带 Ctrl/Alt/Meta 的组合一律不认。
+
+**二、公式里的文字框：内核在格两端改成 `pop`。** `cursor.rs` 的 text 格原先把 `ArrowLeft`/`ArrowRight` 直接 `return` 掉（`ArrowUp`/`ArrowDown`/`Tab` 也是），理由是"字符串只有一个格，走到头没地方去"。实测这条理由站不住——**没地方去不等于要把按键吃掉**：走出字符串本来就应该回到上一层。改成与数字串、与上下键一致：两端的方向键 `pop`。注意上下键仍**不**离开（一格字符串里竖直移动没有意义），`Tab` 仍是"下一格"，只有读文本的那条轴负责把光标带出去。这个改动让"离开文字框"和"退出公式"彻底分开：离开文字框后光标在公式根、**会话照旧**，只有在公式最外层再按一次方向键才退出公式。内核对齐后，前端 `math_action` 里那句 `not previous.get('string_mode')` 的排除项也随之删掉——它存在的原因（内核吞掉那些键）已经没有了。
+
+**三、我第一版前端改错了，是测试档下来的。** 我当时把"光标到公式根"整个当成"离开公式"的信号（`at_root`），于是 `test_the_list_toolbar_also_serves_an_alignment` 立刻变红：在 `$a & b \\ c & d$` 第一格按左键**本来**就该回到公式根、公式仍激活、只是列表工具栏收起来。这正是用户澄清的那句话。改回"光标没动才算退出"后两条行为都成立。**记一笔教训**：那一瞬间我差点改动上一轮刚验收过的行为，是既有的断言把它拦住的——交叉验证过的用例值得留在套件里。
+
+**四、牙齿。** 宏编辑框两侧各验一次：把 `if self.leave_key(event)` 改成恒假 → `test_definition_draft_leaves_on_an_arrow_that_cannot_move` 失败（报 `16777235 at the start of the box must leave it`，16777235 就是 `Qt.Key_Up`）；把 `eventFilter` 里的 FocusOut 分支改成恒假 → `test_definition_draft_leaves_when_focus_goes_elsewhere` 失败（`focus moving away must close the box`）。内核侧 `a_text_cell_is_left_by_arrows_at_its_ends_not_only_by_enter` 在改动前实测 `Left` 三次都停在 `slices=1`、消息为空，改动后第三次 `slices=0`。
+
+**五、环境上有两件事值得写下来。** 一是这次会话的 sandbox 起先是 `workspace-write`，桌面套件**根本跑不起来**：Qt 经由命名管道与核心子进程通信，被拒后表现为 `QProcess: CreateFile failed（拒绝访问）`＋`RuntimeError: 公式核心没有返回响应`。判据是**未经改动的既有用例也以同样方式失败**，所以那不是代码问题。二是探针脚本里 `Window(path)` 这种写法是错的（构造函数不接路径，要用 `replace()`），而 `window.activate(0)` 在偏移 0 不是公式时会抛"公式范围已变化"——两处都是我自己写错，不是被测代码的问题。
+
+验证：`cargo test --offline --locked` 18 个测试目标全过（`source_modes` 17→18）；桌面离屏 **143/143**（140 + 新增 3 条：宏框边缘方向键离开并保留文本且多行仍可内部移动、失焦点击离开并保留编辑、文字框方向键回到上一级而公式不退出）。`python tools/kind_inventory.py` 退出码 0（23 个线名双向对齐）。改了内核，故按 AGENTS.md 重建了 `target/server/release/typformula.exe`；`native-adapter/` 未改动，未重跑那套。
+
 
 
 
