@@ -198,16 +198,19 @@ impl Lsp {
 pub struct CompletionRequest { pub source: String, pub start: usize, pub end: usize, pub caret: usize }
 #[derive(Serialize)]
 pub struct CompletionReply { pub engine: &'static str, pub items: Vec<typformula_core::cursor::CommandCompletion> }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct RenderRequest { #[serde(default)] pub preview: bool, #[serde(default)] pub pdf:bool, #[serde(default)] pub overlays: std::collections::HashMap<String,String>, #[serde(default="default_path")] pub path: String, pub source: String, pub raw: Vec<RawRange>, #[serde(default)] pub formulas: Vec<RawRange>, #[serde(default)] pub preview_hashes:Vec<String>,
-    /// Render the requested fragments on a source cut after this byte offset.
+    /// Where the requested fragments end, so the source can be cut after the node that
+    /// holds them.
     ///
     /// Fragments are images taken out of a full document compile, so one mistake
-    /// anywhere in the document leaves every one of them without an image. This
-    /// value says how far the requested fragments reach; the source is then cut
-    /// after the outermost node that holds them.
+    /// anywhere in the document leaves every one of them without an image. This value
+    /// says how far the requested fragments reach; the source is then cut after the
+    /// outermost node that holds them. It is the fallback now: a raw batch is compiled
+    /// against the reduced context (`render_context`), which drops what follows the
+    /// batch, and this cut is only used when that context does not compile.
     #[serde(default)] pub context_end: Option<usize> }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct RawRange {
     pub id: String, pub start: usize, pub end: usize,
     #[serde(default,skip_serializing_if="Option::is_none")] pub call: Option<[usize;2]>,
@@ -233,9 +236,62 @@ fn context_source(source: &str, end: usize) -> Result<String,String> {
     Ok(source[..cut].to_owned())
 }
 
-struct RenderAdapter { child: Child, requests: mpsc::Sender<Vec<u8>>, replies: mpsc::Receiver<Result<Value,String>> }
-impl Drop for RenderAdapter { fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); } }
-impl RenderAdapter {
+/// The part of the document one batch of fragments depends on, and the ranges moved into it.
+///
+/// The reduction itself lives in the kernel (`typformula_core::context`), beside the macro
+/// registry that asks the same question about a formula. It used to be here, and a fragment
+/// was compiled against everything before the node that held it: a keystroke anywhere
+/// invalidated that compile, and on a long document one pass cost about a second (measured:
+/// 32ms at 15KB, 157ms at 76KB, 1280ms at 307KB, all of it re-laid out for a handful of
+/// pictures). What a fragment can actually see is the statements that reach it, so those are
+/// what travels to the adapter now: the same 307KB document compiles in 1.6ms, and the
+/// fragments come back byte-identical, geometry and SVG.
+///
+/// `None` means this batch has no home in a reduced document, and the caller compiles the
+/// whole prefix instead.
+fn reduce_request(req: &RenderRequest) -> Option<RenderRequest> {
+    // A fragment inside a `#let` body is written in the command while the call that renders it
+    // is in a formula, so both ranges are asked about; the answers come back in the order they
+    // were asked for.
+    let mut wanted: Vec<(usize,usize)> = vec![];
+    for range in req.raw.iter().chain(req.formulas.iter()) {
+        wanted.push((range.start, range.end));
+        if let Some([a,b]) = range.call { wanted.push((a,b)); }
+    }
+    let context = typformula_core::context::context(&req.source, &wanted)?;
+    let mut index = 0;
+    let mut translate = |ranges: &[RawRange]| -> Option<Vec<RawRange>> {
+        ranges.iter().map(|range| {
+            let (start,end) = context.ranges[index]; index += 1;
+            let call = match range.call { Some(_) => { let (a,b) = context.ranges[index]; index += 1; Some([a,b]) }, None => None };
+            Some(RawRange { id: range.id.clone(), start, end, call, occurrence: range.occurrence })
+        }).collect()
+    };
+    let raw = translate(&req.raw)?; let formulas = translate(&req.formulas)?;
+    Some(RenderRequest { source: context.source, raw, formulas, context_end: None, ..req.clone() })
+}
+
+/// Apply the editor's cut to one attempt at a request.
+fn cut_context(mut req: RenderRequest) -> Result<RenderRequest,String> {
+    if let Some(end) = req.context_end.take() {
+        req.source = context_source(&req.source, end)?;
+        // A range that the cut removed cannot be rendered, and the cut is only ever
+        // chosen at the end of a node that holds these ranges.
+        if req.raw.iter().chain(req.formulas.iter()).any(|range| range.end > req.source.len()) { return Err("取图区间不在编译上下文内".into()); }
+    }
+    Ok(req)
+}
+
+/// One persistent `--server` child, answering one request at a time.
+///
+/// Two of these are kept, because they answer different questions from different worlds:
+/// rendering compiles the document and lays it out, while an attachment or glyph request
+/// asks about one expression in the editor's math font. Starting the child is what used to
+/// make those requests cost 50ms (`typformula-layout.exe` is 49.7MB) plus up to 20ms of the
+/// old poll interval, for 2ms of work.
+struct ServerAdapter { child: Child, requests: mpsc::Sender<Vec<u8>>, replies: mpsc::Receiver<Result<Value,String>> }
+impl Drop for ServerAdapter { fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); } }
+impl ServerAdapter {
     pub(crate) fn start(bin: &Path, root: &Path) -> Result<Self,String> {
         let mut child = hidden(Command::new(bin).arg("--server")).current_dir(root)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
@@ -256,9 +312,9 @@ impl RenderAdapter {
         });
         Ok(Self { child,requests,replies })
     }
-    fn request(&mut self, req: &RenderRequest) -> Result<Value,String> {
+    fn request<T: Serialize>(&mut self, req: &T, timeout: &str) -> Result<Value,String> {
         self.requests.send(serde_json::to_vec(req).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
-        let value = self.replies.recv_timeout(Duration::from_secs(30)).map_err(|_|"Typst 实时编译超时；源码已保留")??;
+        let value = self.replies.recv_timeout(Duration::from_secs(30)).map_err(|_|timeout.to_string())??;
         // A document diagnostic is a valid protocol reply; keep the warm engine.
         Ok(value)
     }
@@ -280,17 +336,33 @@ pub struct AttachmentContext { pub source:String, pub start:usize, pub end:usize
 #[derive(Deserialize, Serialize)]
 pub struct GlyphRequest { #[serde(default="default_path")] pub path: String, pub expression: String, #[serde(default)] pub definitions: String, pub display: bool }
 
-pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, document_lsp: Mutex<Option<DocumentLsp>>, pub workspace: PathBuf, render_adapter: Mutex<Option<RenderAdapter>> }
+pub struct Services { bin: Result<PathBuf, String>, root: PathBuf, completion_lock: Mutex<()>, document_lsp: Mutex<Option<DocumentLsp>>, pub workspace: PathBuf, render_adapter: Mutex<Option<ServerAdapter>>, math_adapter: Mutex<Option<ServerAdapter>> }
 impl Services {
-    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("TYPFORMULA_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None) } }
+    pub fn new(root: PathBuf) -> Self { Self { bin: find_tinymist(), workspace: std::env::var_os("TYPFORMULA_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| root.join("workspace")), root, document_lsp: Mutex::new(None), completion_lock: Mutex::new(()), render_adapter: Mutex::new(None), math_adapter: Mutex::new(None) } }
     fn adapter_bin(&self) -> PathBuf {
         if let Some(path)=std::env::var_os("TYPFORMULA_ADAPTER") { return path.into(); }
         let name=if cfg!(windows) { "typformula-layout.exe" } else { "typformula-layout" };
         let packaged=self.root.join(name); if packaged.is_file() { return packaged; }
         self.root.join("target/adapter").join(if cfg!(debug_assertions) { "debug" } else { "release" }).join(if cfg!(windows) { "typformula-layout.exe" } else { "typformula-layout" }) }
     pub fn status(&self) -> Value { match &self.bin { Ok(path) => json!({"available":true,"attachments":self.adapter_bin().is_file(),"engine":"Tinymist LSP + Typst","path":path}), Err(error) => json!({"available":false,"attachments":self.adapter_bin().is_file(),"error":error}) } }
+    /// The placement of one attachment: does its script sit above/below or beside the base?
+    ///
+    /// The question is about one formula, so the document is reduced to what that formula can
+    /// see before it is sent -- the same reduction the render path and the macro registry use
+    /// (`typformula_core::context`). It used to send the whole document and let the adapter
+    /// evaluate a cut prefix of it, which cost 1.2s per query on a 7KB slide deck (and a deck
+    /// asks one query per scripted atom), and never answered at all when a document-level
+    /// `#show` wrapped the formula in an element.
     pub fn attachments(&self, mut req: AttachmentRequest) -> Result<Value, String> {
-        if let Some(context)=&mut req.context {context.source=context_source(&context.source,context.end)?;}
+        if let Some(context)=&mut req.context {
+            if let Some(reduced)=typformula_core::context::context(&context.source,&[(context.start,context.end)]) {
+                let (start,end)=reduced.ranges[0];
+                req.definitions=reduced.prefix(start).to_owned();
+                context.source=reduced.source; context.start=start; context.end=end;
+            } else if context.end <= context.source.len() {
+                context.source=context_source(&context.source,context.end)?;
+            } else { return Err("附件公式区间无效".into()); }
+        }
         self.ask_adapter(serde_json::to_value(&req).map_err(|e| e.to_string())?, "Typst 附件布局超时；保留原编辑结构")
     }
     /// The substituted glyphs of a font variant: `bold(upright(a))` → `𝐚`.
@@ -298,45 +370,37 @@ impl Services {
     /// The adapter reads them back out of the math IR, where the substitution has already
     /// happened, so this asks the engine rather than reproducing its table. One query per
     /// expression is enough even for a nested call — the engine collapses the nesting.
-    pub fn glyphs(&self, req: GlyphRequest) -> Result<Value, String> {
-        let mut body = serde_json::to_value(&req).map_err(|e| e.to_string())?;
-        body["glyphs"] = Value::Bool(true);
+    ///
+    /// One expression, or a list of them: the window asks about every spelling an analysis
+    /// mentions at once, and the adapter answers all of them from the same warm engine.
+    pub fn glyphs(&self, body: Value) -> Result<Value, String> {
+        // The single-expression shape is what the release self-check and the protocol tests
+        // use; a batch carries its expressions already.
+        let body = if body.get("expressions").is_some() { body } else {
+            let mut body = serde_json::to_value(serde_json::from_value::<GlyphRequest>(body).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            body["glyphs"] = Value::Bool(true);
+            body
+        };
         self.ask_adapter(body, "取字形簇超时；先按调用本身（名字与主体）显示")
     }
-    /// Run the layout adapter once, with one request on stdin and one reply on stdout.
+    /// Ask the layout adapter's own `--server` about one expression.
+    ///
+    /// The engine is kept between requests (see `ServerAdapter`): an attachment or glyph
+    /// request is 2ms of work, and starting a process for it cost fifty times that. A
+    /// document diagnostic -- a name that does not resolve, say -- is an answer, so the
+    /// warm engine survives it; only a transport failure drops it.
     fn ask_adapter(&self, body: Value, timeout: &str) -> Result<Value, String> {
         let path = body["path"].as_str().unwrap_or_default().to_string();
         crate::workspace::resolve(&self.workspace, &path)?;
         if !self.adapter_bin().is_file() { return Err("请运行 build-desktop.cmd 并重启服务，以启用 Typst limits/stretch 适配器".into()); }
-        let body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-        let mut child = hidden(&mut Command::new(self.adapter_bin())).current_dir(&self.workspace)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
-        let mut input = child.stdin.take().unwrap();
-        // Put writes on a separate thread so even a stuck child cannot block
-        // the request timeout. Dropping stdin tells the adapter the request ends.
-        let writer = std::thread::spawn(move || input.write_all(&body));
-        let stdout = child.stdout.take().unwrap(); let stderr = child.stderr.take().unwrap();
-        let output = std::thread::spawn(move || { let mut b = vec![]; let _ = stdout.take(64*1024*1024).read_to_end(&mut b); b });
-        let errors = std::thread::spawn(move || { let mut b = vec![]; let _ = stderr.take(1024*1024).read_to_end(&mut b); b });
-        let until = Instant::now() + Duration::from_secs(30);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
-                result => {
-                    let _ = child.kill(); let _ = child.wait();
-                    let _ = writer.join(); let _ = output.join(); let _ = errors.join();
-                    return Err(match result { Err(e) => e.to_string(), _ => timeout.to_string() });
-                }
-            }
+        let mut adapter = self.math_adapter.lock().map_err(|e| e.to_string())?;
+        if adapter.is_none() { *adapter = Some(ServerAdapter::start(&self.adapter_bin(), &self.workspace)?); }
+        let value = match adapter.as_mut().unwrap().request(&body, timeout) {
+            Ok(value) => value,
+            Err(error) => { *adapter = None; return Err(error); }
         };
-        let _ = writer.join();
-        let bytes = output.join().map_err(|_| "无法读取附件布局")?;
-        let error = errors.join().unwrap_or_default();
-        if !status.success() { return Err(String::from_utf8_lossy(&error).into_owned()); }
-        let result: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if let Some(error) = result["error"].as_str() { return Err(error.into()); }
-        Ok(result)
+        if let Some(error) = value["error"].as_str() { return Err(error.into()); }
+        Ok(value)
     }
     pub fn complete(&self, mut req: CompletionRequest) -> Result<CompletionReply, String> {
         let bin = self.bin.as_ref().map_err(Clone::clone)?;
@@ -392,21 +456,34 @@ impl Services {
         return Ok(CompletionReply { engine: "Tinymist LSP", items });
         }
     }
-    pub fn render(&self, mut req: RenderRequest) -> Result<Value, String> {
+    pub fn render(&self, req: RenderRequest) -> Result<Value, String> {
         crate::workspace::resolve(&self.workspace, &req.path)?;
-        if let Some(end) = req.context_end.take() {
-            req.source = context_source(&req.source, end)?;
-            // A range that the cut removed cannot be rendered, and the cut is only
-            // ever chosen at the end of a node that holds these ranges.
-            if req.raw.iter().chain(req.formulas.iter()).any(|range| range.end > req.source.len()) { return Err("取图区间不在编译上下文内".into()); }
-        }
+        // A raw batch is compiled against the context the kernel keeps for it; a preview or a
+        // PDF is the document, so it is never reduced. The request as it came in is always the
+        // second attempt: a document the context cannot compile -- a kept command that refers
+        // to prose that was dropped, say -- still renders the way it always did, only slower.
+        let reduced = (!req.preview && !req.pdf && !req.raw.is_empty() && req.formulas.is_empty())
+            .then(|| reduce_request(&req)).flatten();
+        let attempts = reduced.map_or_else(|| vec![req.clone()], |reduced| vec![reduced, req.clone()]);
         let mut adapter = self.render_adapter.lock().map_err(|e| e.to_string())?;
-        if adapter.is_none() { *adapter = Some(RenderAdapter::start(&self.adapter_bin(), &self.workspace)?); }
-        let result = adapter.as_mut().unwrap().request(&req);
-        if result.is_err() { *adapter = None; }
-        let value = result?;
-        if let Some(error) = value["error"].as_str() { return Err(error.into()); }
-        Ok(value)
+        if adapter.is_none() { *adapter = Some(ServerAdapter::start(&self.adapter_bin(), &self.workspace)?); }
+        let mut last = Err("取图请求没有上下文".to_string());
+        for attempt in attempts {
+            let result = adapter.as_mut().unwrap().request(&cut_context(attempt)?, "Typst 实时编译超时；源码已保留");
+            match result {
+                // A diagnostic about the context is not a verdict about the document, so the
+                // whole prefix is tried next; a diagnostic about the whole prefix is the
+                // caller's answer, exactly as before.
+                Ok(value) => match value["error"].as_str() {
+                    Some(error) => last = Err(error.to_string()),
+                    None => return Ok(value),
+                },
+                // A protocol failure is not a context problem: the engine is dropped and
+                // the next request rebuilds it.
+                Err(error) => { *adapter = None; return Err(error); }
+            }
+        }
+        last
     }
 }
 pub fn position(source: &str, byte: usize) -> Value {

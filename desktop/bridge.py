@@ -226,14 +226,26 @@ class Services(QObject):
         if not text:text=self.last_detail
         return ("；后端错误输出："+text) if text else ""
 
-    def request(self, route, body, callback, key=None):
+    def request(self, route, body, callback, key=None, dropped=None):
+        """Queue one request. A later request with the same `key` replaces a queued one.
+
+        The replaced request is never sent, so its callback never runs. Most callers want
+        exactly that -- a coalesced search or export has nothing to report -- but a caller
+        that keeps bookkeeping for a request in flight has to hear about the replacement:
+        otherwise the bookkeeping outlives the request, and whatever it was holding is
+        never asked for again. Such a caller passes `dropped` and clears its own state.
+        Coalescing never touches the request being executed, only queued ones.
+        """
         if self.closed:
             callback(None, "后端已关闭")
             return
-        # Coalesce pending preview/LSP work; never drop file/export actions.
         if key:
+            # Coalesce pending preview/LSP work; never drop file/export actions.
+            replaced = [item for item in self.queue if item[3] == key]
             self.queue = [item for item in self.queue if item[3] != key]
-        self.queue.append((route, body, callback, key))
+            for item in replaced:
+                if item[4] is not None: item[4]()
+        self.queue.append((route, body, callback, key, dropped))
         self.advance()
 
     def advance(self):
@@ -246,7 +258,7 @@ class Services(QObject):
             self.child.blockSignals(True);self.child.deleteLater();self.spawn()
         self.active = self.queue.pop(0)
         self.sequence += 1
-        route, body, _, _ = self.active
+        route, body, _, _, _ = self.active
         self.child.write((json.dumps({"id": self.sequence, "route": route, "body": body}, ensure_ascii=False) + "\n").encode())
         self.timer.start(65000)
 

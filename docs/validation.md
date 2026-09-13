@@ -1676,7 +1676,7 @@ thread '…is_writable' panicked at crates\core\src\typst.rs:730:27:
 | | Tinymist 预览（采用） | 复用 `/api/preview`（未采用） |
 | --- | --- | --- |
 | 实时性 | Tinymist 推送**增量**帧 | 自己 debounce |
-| 与片段取图抢锁 | **不抢**（Tinymist 自己的进程） | **抢**：`/api/render`、`/api/preview`、`/api/pdf` 共用同一个 `render_adapter` 互斥量 |
+| 与片段取图抢锁 | **不抢**（Tinymist 自己的进程） | **抢**：`/api/render`、`/api/preview`、`/api/pdf` 共用同一个渲染引擎互斥量；附件与字形另有自己的引擎，不在这把锁上 |
 | 新依赖 | `PyQtWebEngine` | 无 |
 | 编译器份数 | 2（Tinymist + 适配器） | 1 |
 
@@ -2352,3 +2352,24 @@ Editor 现在在 clear/insertText/setCharFormat 等 Qt 文档操作前，发布�
 新增回归用例在修复前捕获 18 次 Qt 回调异常，修复后通过，覆盖双栏、命令确认、撤销/重做、正文插入与全量投影。完整桌面离屏测试 119 项通过（60.669 秒）；随附教程加真实 Tinymist 补全验证通过。打包自检也加入中文上下文中的 dots 命令确认，并捕获 Qt excepthook 异常。
 
 使用已有 release 后端重新打包为 TypFormula-0.1.0-dots-fix-windows-x64.zip，冻结自检 unicode_command_edit=true，字体、字形、SVG/PDF、LSP 均通过。ZIP CRC 与 SHA256 核对通过。没有重编译 Rust，没有使用 computer use 或可见桌面测试，没有修改教程文档。
+
+
+### 2026-09-13：合成上下文：取图与附件查询只编译它们看得见的东西
+
+用户报告"attachment 文档一长就没响应"，并给出真实文档 `brute-force-SGBZ-amoeba/paper/slides/pygbz2d-details.typ`（Touying 幻灯片，7 186 B，64 个公式）。复现与测量（release 后端 + release 适配器，`--stdio` 直连，非 Qt）：
+
+- `Window.background` 对这份 deck 发出 **63 个**附件查询（`view.rs` 给每个上下标都盖上 `attachment`），每个都带**整篇文档**（`definitions` = 整段前缀 + `context` = 全文）：整轮 **76.3 s**，单次中位数 **1230 ms**，而且 **62/62 全部失败**（`适配请求缺少公式`）。
+- 失败原因有两个，都实测过：(1) 适配器只在求值内容里沿 `Sequence`/`Styled` 找方程，而这份 deck 的公式在 `#columns(2)[…]`、`#grid(…)`、列表项的**元素字段**里；(2) 文档级 `#show: group-meeting-theme.with(…)` 由求值器施加到 `module.content()` 上，整篇文档被搬进一个元素（诊断 dump：`styled > box > [body] sequence > equation <typformula-attachment-target>`，而遍历看不到字段，于是 `0 equations`）。逐段二分：去掉那条 `#show` 后同一请求立刻答出 `{"lower":"scripts"}`；`#show: doc => box(doc)` 复现同一失败，`#show: doc => doc` 与 `#show: doc => [#metadata(..) <m> #doc]` 不影响。
+- 对照：同一条请求走 `/api/render` 正常（208 ms）。原因是渲染在**排版之后**的帧树里按标签收帧，标签跟着内容进了主题造出的结构；附件查询在**排版之前**的求值内容里找，而遍历不进字段。
+- 缩放：同一 deck 复制 ×2/×4/×8（52 KB）时单次请求 171 → 321 → **1035 ms**，所以"文档一长"确实成立。
+
+修复（内核 `crates/core/src/context.rs` 为唯一实现，host 与内核共用）：
+
+- `context(source, wanted)`：保留每层祖先路径上在目标**之前**的语句（`SyntaxKind::is_stmt` = `LetBinding|SetRule|ShowRule|ModuleImport|ModuleInclude`，来自引擎本身）、**尚未闭合的块**（`typst-eval` 只跳过以闭合符结尾的块，其绑定与规则仍在作用域内——这条是被 `tests/macro_scope.rs` 抓住后补的）、承载目标的节点，以及足够的容器结构；丢掉正文、没问到的公式、已闭合兄弟块里的规则、目标之后的语句。区间映射到新坐标，`Context::digest()` 给出与文档无关的身份，`Context::original()` 把偏移映射回去。
+- `/api/render`：改用该实现（原来的 host 私有版本删除）；`context_end` 截断保留为回退。307 KB 文档冷编译 **1280 ms → 4.6 ms**，片段几何与 SVG 逐字节相同（warm 3.8 ms）。
+- `/api/attachments`：host 自己从文档 + 公式区间合成上下文（前端不改）。该 deck：63/63 成功、整轮 **1.5 s**、单次中位数 **21 ms**。
+- 适配器：方程搜索改为沿**元素字段**的 DFS（保持文档顺序，遇方程不下钻），并沿父链重建 `StyleChain`。新增 `a_formula_inside_a_container_or_under_a_theme_is_still_found`（7 种形状：plain/`#columns`/`#grid`/列表项/`#block`/`#show box`/主题+嵌套），用替身主题而非真包。
+- 宏管理：`macro_registry` 先归约再分析，缓存键变成"稳定文本"，偏移与 `definition_prefix` 用 `retarget` 译回调用方坐标（`tests/macro_scope.rs::a_template_fragment_is_asked_for_at_its_own_place_in_the_definition` 的 `definition_prefix(def) == source` 仍然成立）；`scan_syntax`/`analyze_formula` 的"能否展开"检查也用该定义自己的上下文。实测 307 KB：`set_source` 12→6 ms、`edit_source` 7–10→4.9 ms；`activate_formula` 22.6–31.7→21.2 ms（**没有实质变化**：归约自己要解析一次前缀，抵消了它省下的那次解析；真正要省下它得让 `Editor` 直接持有注册表与上下文，尚未做）。
+- 缓存身份：核心在 `analyze`/`state` 里为每个公式给出 `context` 摘要，前端用它作为图像与 placement 的键（原来是整段前缀）。该 deck 实测：正文里插入一个字后**重新请求 0 次**（原为 63 次，全部 placement 保留）；改 `#set` 后重问 60 次（正确——上下文真的变了）。
+
+验证：`cargo test --offline --locked` 20 个测试目标全过（内核 24 项含 `context` 的 11 项）；适配器 24 项；桌面离屏 **121/121**。全部 release 二进制按当前源码重建。未修改 `Editor.definitions`（见上面的 `activate_formula` 备注与 `document.rs::activate_equation` 的 TODO）。

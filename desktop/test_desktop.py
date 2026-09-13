@@ -145,7 +145,7 @@ class NativeTest(unittest.TestCase):
         source='#[\n#let mathbf(x) = $bold(upright(#x))$\n#let rme = $upright(e)$\n#let rmi = $upright(i)$\n\n$ H_("int") = & g sum_(j) sigma_(x) (a rme^(i) + a^(dagger)) '+chr(92)+'\n= & x $\n]'
         self.load(source);formula=window.analysis['formulas'][-1]
         window.activate(formula['start']);window.background()
-        key=(source[:from_byte(source,formula['start'])],'sum_(j)',True)
+        key=(window.formula_context(formula),'sum_(j)',True)
         loop=QEventLoop();timer=QTimer()
         timer.timeout.connect(lambda:loop.quit() if key in window.typesetter.placements else None)
         deadline=QTimer();deadline.setSingleShot(True);deadline.timeout.connect(loop.quit)
@@ -183,7 +183,7 @@ class NativeTest(unittest.TestCase):
         self.load('中文😀 $x$ #text("ok")');window=self.window;asked=[]
         at=window.source.index('text')+2
         cursor=window.editor.textCursor();cursor.setPosition(window.editor.mapping.display_position(at));window.editor.setTextCursor(cursor)
-        def request(route,body,callback,key=None):asked.append((body,callback))
+        def request(route,body,callback,key=None,dropped=None):asked.append((body,callback))
         with patch.object(window.lsp,'request',side_effect=request),patch.object(QToolTip,'showText') as shown:
             window.language_help.hover(window.editor)
             self.assertEqual(asked[0][0]['position'],{'line':0,'character':u16(window.source[:at])})
@@ -198,7 +198,7 @@ class NativeTest(unittest.TestCase):
         self.load('#let fnn(x) = x\n#fnn(1)');window=self.window
         bounds={'start':{'line':0,'character':5},'end':{'line':0,'character':8}}
         result={'targetUri':(window.workspace/'untitled.typ').as_uri(),'targetSelectionRange':bounds,'targetRange':bounds}
-        def request(route,body,callback,key=None):callback({'result':[result]},None)
+        def request(route,body,callback,key=None,dropped=None):callback({'result':[result]},None)
         with patch.object(window.lsp,'request',side_effect=request):window.language_help.goto(position=window.source.rindex('fnn'))
         self.assertIsNone(window.definition_draft)
         self.assertFalse(window.source_dock.isHidden())
@@ -292,7 +292,7 @@ class NativeTest(unittest.TestCase):
 
     def test_style_failure_is_cached_and_reply_only_relayouts_its_readers(self):
         window=self.window;asked=[]
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             if route=='/api/glyphs':asked.append((body,callback))
         with patch.object(window.services,'request',side_effect=request):
             self.load('$bold(x)$ between $frac(a,b)$')
@@ -305,7 +305,7 @@ class NativeTest(unittest.TestCase):
             style=window.analysis['formulas'][0]
             self.assertTrue(any(op[0]=='failed' for op in window.editor.handler.box(style).operations))
             window.refresh_svg();self.assertEqual(len(asked),2)
-            asked[-1][1]({'glyphs':''},None)
+            asked[-1][1]({'items':[{'glyphs':''}]},None)
             window.load_glyphs();self.assertEqual(len(asked),2)
             self.assertFalse(any(op[0]=='failed' for op in window.editor.handler.box(style).operations))
 
@@ -336,9 +336,9 @@ class NativeTest(unittest.TestCase):
     def test_template_call_images_are_distinct_through_real_frontend_service(self):
         self.load('#let wrap(x) = $bold(#x/2)$\n$wrap(a) + wrap(b b b b)$');window=self.window
         requests=[];original=window.services.request
-        def observed(route,body,callback,key=None):
+        def observed(route,body,callback,key=None,dropped=None):
             if route=='/api/render':requests.append(body)
-            return original(route,body,callback,key)
+            return original(route,body,callback,key,dropped)
         with patch.object(window.services,'request',side_effect=observed):window.load_raw()
         loop=QEventLoop();timer=QTimer();timer.timeout.connect(lambda:loop.quit() if not window.raw_pending else None)
         limit=QTimer();limit.setSingleShot(True);limit.timeout.connect(loop.quit)
@@ -357,6 +357,61 @@ class NativeTest(unittest.TestCase):
         moved=[n for n in window.view_nodes(window.analysis['formulas'][-1]['view']) if n['kind']=='raw_macro']
         self.assertEqual([raw_key(n) for n in moved],identities)
         self.assertEqual(len(requests),1,'移动公式只更新请求坐标，不丢弃已渲染的实例')
+
+    def test_a_replaced_render_batch_does_not_strand_its_fragments(self):
+        """A batch replaced in the queue must not leave its fragments pending for good.
+
+        `Services.request` coalesces by key and a replaced request is never sent, so its
+        callback never runs. `load_raw` skips fragments by `raw_pending`, which only a
+        reply clears, and the pass that replaces a batch asks for a different set of
+        fragments -- so a replaced batch used to strand the fragments it was carrying:
+        never requested again, not marked failed either, drawn as source for the rest of
+        the session. It is what made a long document lose images while scrolling.
+        """
+        window=self.window
+        self.load('$floor(a)$')
+        window.compile_timer.stop();window.raw_timer.stop()
+        window.show();APPLICATION.processEvents();window.compile_timer.stop()
+        fragment=window.raw_fragments(window.analysis['formulas'][0]['view'])[0]
+        bounds=(fragment['render_request']['start'],fragment['render_request']['end'])
+        wanted=raw_key(fragment)
+        seen=[];original=window.services.request
+        def observed(route,body,callback,key=None,dropped=None):
+            if route!='/api/render':return original(route,body,callback,key,dropped)
+            record={'ranges':[(r['start'],r['end']) for r in body['raw']],'called':0,'dropped':0}
+            seen.append(record)
+            def counted(result,error,record=record):
+                record['called']+=1;return callback(result,error)
+            def replaced(record=record):
+                record['dropped']+=1
+                if dropped:dropped()
+            # Forward `dropped` only when the sender passed one: without the fix there is
+            # no such argument, and this test is about the strands, not about the shim.
+            return original(route,body,counted,key,**({'dropped':replaced} if dropped else {}))
+        with patch.object(window.services,'request',side_effect=observed):
+            # One request occupies the pipe, so the next two both stay queued: the second
+            # replaces the first before either is sent.
+            original('/api/render',window.body()|{'raw':[],'formulas':[],'context_end':0},lambda result,error:None,key='blocker')
+            window.load_raw()
+            self.assertEqual([record['ranges'] for record in seen],[[bounds]])
+            # A second formula gives the next pass a fragment the first one was not asked
+            # for, which is exactly what makes it a different batch rather than a rerun.
+            window.replace(len(window.source),len(window.source),'\n\n$ceil(b)$')
+            window.compile_timer.stop();window.raw_timer.stop()
+            window.load_raw()
+            self.assertEqual(len(seen),2)
+            for _ in range(80):
+                loop=QEventLoop();timer=QTimer();timer.setSingleShot(True);timer.timeout.connect(loop.quit);timer.start(50);loop.exec_()
+                if wanted not in window.raw_pending and isinstance(window.typesetter.raw(fragment),dict):break
+            window.compile_timer.stop();window.raw_timer.stop()
+        # The strand first, because that is the half a reader can see: a batch with no
+        # bookkeeping leaves its fragments pending, and the next pass asks for a different
+        # set, so nothing ever asks for them again.
+        self.assertNotIn(wanted,window.raw_pending,'a replaced batch must not leave its fragments pending')
+        self.assertTrue(any(bounds in record['ranges'] for record in seen[1:]),'the stranded fragment has to be asked for again')
+        self.assertIsInstance(window.typesetter.raw(fragment),dict,'and its image has to arrive')
+        self.assertEqual(seen[0]['dropped'],1,'a replaced batch has to hear that it never ran')
+        self.assertEqual(seen[0]['called'],0,'and its callback must not run')
 
     def test_native_objects_copy_and_edit_undo(self):
         self.load("中文😀 $ a/b $ 末尾")
@@ -673,7 +728,7 @@ class NativeTest(unittest.TestCase):
     def test_unchanged_preview_pages_reuse_qt_widgets(self):
         window=self.window;page={'svg':'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>','width':10,'height':10,'mapping':[]}
         replies=[{'pages':[page,page]},{'pages':[page,page]}]
-        def request(route,body,callback,key=None):callback(replies.pop(0),None)
+        def request(route,body,callback,key=None,dropped=None):callback(replies.pop(0),None)
         with patch.object(window.services,'request',side_effect=request):
             window.compile();first=list(window.pages);window.compile()
         self.assertEqual(window.pages,first)
@@ -779,7 +834,10 @@ class NativeTest(unittest.TestCase):
 
     def fake_render(self):
         calls=[]
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
+            # The real `Services.request` coalesces queued requests by key and tells a
+            # caller that passed `dropped` when its request was replaced. This fake
+            # answers every request at once, so nothing is ever queued or replaced.
             if route=='/api/render':
                 calls.append(body)
                 callback({'items':[{'id':r['id']+':0:0','svg':'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>','base_font_size_pt':1,'base_font_height_pt':1,'base_font_baseline_pt':.8} for r in body['raw']]},None)
@@ -788,7 +846,8 @@ class NativeTest(unittest.TestCase):
                 answers={'bold(A)':'\U0001D468','upright(A)':'A','bold(upright(a))':'\U0001D41A',
                          'bold(x)':'\U0001D499','upright(x)':'x','bold(upright(x))':'\U0001D431',
                          'bold(a)':'\U0001D482'}
-                callback({'glyphs':answers.get(body['expression'],'')},None)
+                items=[{'glyphs':answers.get(query['expression'],'')} for query in body['expressions']]
+                callback({'items':items},None)
             elif route=='/api/preview':callback({'pages':[]},None)
             else:callback({},None)
         return calls,request
@@ -870,7 +929,7 @@ class NativeTest(unittest.TestCase):
             window.compile_timer.stop()
             # Nothing else: no `load_glyphs`, no `load_raw`. The window must do it all.
             window.load_raw()
-        self.assertIn('bold(x)',[body.get('expression') for body in calls],'加载后自己去取字形簇')
+        self.assertIn('bold(x)',[query['expression'] for body in calls for query in body.get('expressions',[])],'加载后自己去取字形簇')
         box=window.editor.handler.box(window.analysis['formulas'][0])
         style=next(n for n in window.view_nodes(window.analysis['formulas'][0]['view']) if n['kind']=='style')
         self.assertEqual(style.get('_glyph'),'\U0001D499','取到的字形簇要盖上节点')
@@ -915,7 +974,7 @@ class NativeTest(unittest.TestCase):
         different object from the page's.
         """
         window=self.window;asked=[]
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             if route=='/api/glyphs':asked.append((body,callback))
             else:callback({},None)
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
@@ -925,12 +984,12 @@ class NativeTest(unittest.TestCase):
             window.math_action('input',text='\\')
             window.math_action('input',text='bold(x)')
             window.math_action('key',key='Enter')
-            self.assertIn('bold(x)',[body['expression'] for body,_ in asked],
+            self.assertIn('bold(x)',[query['expression'] for body,_ in asked for query in body['expressions']],
                           '确认命令后要问引擎取字形簇')
             # The service answers out of band, so the fake one must too: answering
             # inline would drive a path the window never takes.
             for body,callback in asked:
-                callback({'glyphs':'\U0001D499' if body['expression']=='bold(x)' else ''},None)
+                callback({'items':[{'glyphs':'\U0001D499' if query['expression']=='bold(x)' else ''} for query in body['expressions']]},None)
         drawn=[value[0] for kind,_,_,value in window.math_canvas.box.operations if kind=='text']
         self.assertIn('\U0001D499',drawn,f'答案到达后公式框要画出替换后的字形簇：{drawn}')
 
@@ -944,16 +1003,16 @@ class NativeTest(unittest.TestCase):
         it was built draws the *call* here instead of the variant.
         """
         window=self.window;asked=[]
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             if route=='/api/glyphs':asked.append((body,callback))
             else:callback({},None)
         with patch.object(window.services,'request',side_effect=request),patch.object(window,'semantic_highlight'):
             window.replace(0,len(window.source),'$x + bold(x)$')
             window.compile_timer.stop()
-            self.assertIn('bold(x)',[body['expression'] for body,_ in asked],'新拼写要问引擎')
+            self.assertIn('bold(x)',[query['expression'] for body,_ in asked for query in body['expressions']],'新拼写要问引擎')
             # Out of band, like the real service: answering inline would test the order the
             # fake happens to have, not the one the window has.
-            for body,callback in asked:callback({'glyphs':'\U0001D499'},None)
+            for body,callback in asked:callback({'items':[{'glyphs':'\U0001D499'} for _ in body['expressions']]},None)
             box=window.editor.handler.box(window.analysis['formulas'][0])
         drawn=[value[0] for kind,_,_,value in box.operations if kind=='text']
         self.assertIn('\U0001D499',drawn,f'晚到的答案要画在页面上：{drawn}')
@@ -1254,7 +1313,7 @@ class NativeTest(unittest.TestCase):
         """
         from unittest.mock import patch
         self.load('$ sum_1^2 lr(a, size: #100%) $');window=self.window;window.raw_timer.stop();calls=[]
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             calls.append(route)
             callback({},None)
         document_revision=window.editor.document().revision()
@@ -1284,7 +1343,7 @@ class NativeTest(unittest.TestCase):
             def load(self,url):loaded.append(url.toString())
             def setUrl(self,url):loaded.append('blank:'+url.toString())
         window.preview_view=View()
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             asked.append((route,body.get('action')))
             if route=='/api/preview/live' and body.get('action')=='start':
                 callback({'staticServerPort':38251,'dataPlanePort':38251,'isPrimary':True},None)
@@ -1311,7 +1370,7 @@ class NativeTest(unittest.TestCase):
             def load(self,url):pass
             def setUrl(self,url):pass
         window.preview_view=View()
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             if route=='/api/preview/live' and body.get('action')=='kill':killed.append(route)
             callback({'staticServerPort':1,'dataPlanePort':1,'isPrimary':True},None)
         with patch.object(window.lsp,'request',side_effect=request):
@@ -1327,7 +1386,7 @@ class NativeTest(unittest.TestCase):
             def load(self,url):loaded.append(url.toString())
             def setUrl(self,url):pass
         window.preview_view=View()
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             asked.append((route,body.copy()))
             if route=='/api/preview/live':
                 running[0]={'staticServerPort':38251,'dataPlanePort':38251} if body['action']=='start' else None
@@ -1354,7 +1413,7 @@ class NativeTest(unittest.TestCase):
             def setUrl(self,url):pass
         window.preview_view=View()
         # Use files in the current workspace so both requests share the pipe.
-        def request(route,body,callback,key=None):requests.append((route,body.copy(),callback))
+        def request(route,body,callback,key=None,dropped=None):requests.append((route,body.copy(),callback))
         with patch.object(window.lsp,'request',side_effect=request):
             window.set_preview(True);old=requests[-1][2]
             window.set_preview(False)
@@ -1447,18 +1506,40 @@ class NativeTest(unittest.TestCase):
             fresh=window.core.call('analyze_formula',start=formula['start'])
             self.assertEqual(signature(formula['view']),signature(fresh['view']))
 
+    def test_every_variant_in_the_document_is_asked_for_in_one_request(self):
+        """One request carries every spelling the analysis mentions, and each answer lands
+        on its own spelling.
+
+        Each expression used to be its own adapter process — 50ms of startup for 2ms of
+        work — so a document with four variants paid that four times.
+        """
+        window=self.window;asked=[]
+        def request(route,body,callback,key=None,dropped=None):
+            if route=='/api/glyphs':asked.append((body,callback))
+        with patch.object(window.services,'request',side_effect=request):
+            self.load('$bold(x) + upright(y) + bold(z)$ 与 $upright(x)$')
+            window.load_glyphs()
+        self.assertEqual(len(asked),1,'一次请求')
+        queries=asked[0][0]['expressions']
+        self.assertEqual(sorted(query['expression'] for query in queries),['bold(x)','bold(z)','upright(x)','upright(y)'])
+        self.assertTrue(all(query['definitions']=='' for query in queries),'字形与文档上下文无关')
+        asked[0][1]({'items':[{'glyphs':f'<{query["expression"]}>'} for query in queries]},None)
+        for query in queries:
+            self.assertEqual(window.typesetter.glyphs[('',query['expression'],query['display'])],f'<{query["expression"]}>')
+        self.assertFalse(window.glyph_pending)
+
     def test_styles_share_empty_context_cache_and_pending_requests(self):
         window=self.window;asked=[]
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             if route=='/api/glyphs':asked.append((body,callback))
         with patch.object(window.services,'request',side_effect=request):
             self.load('#let value = 1\nBefore $bold(x)$ between $bold(x)$')
             window.load_glyphs();window.load_glyphs()
             self.assertEqual(len(asked),1)
-            self.assertEqual(asked[0][0]['definitions'],'')
+            self.assertEqual([query['definitions'] for query in asked[0][0]['expressions']],[''],'字形不依赖文档上下文')
             window.replace(window.source.index('Before'),window.source.index('Before')+6,'正文 ')
             self.assertEqual(len(asked),1,'正文变化不能重复发送在途字形请求')
-            asked[0][1]({'glyphs':'\U0001D499'},None)
+            asked[0][1]({'items':[{'glyphs':'\U0001D499'}]},None)
             at=window.source.index('1');window.replace(at,at+1,'2')
             self.assertEqual(len(asked),1,'宏定义变化不清空无定义上下文的字形缓存')
             for formula in window.analysis['formulas']:
@@ -1474,13 +1555,14 @@ class NativeTest(unittest.TestCase):
         window=self.window
         for source in ('$unknownfn(a)$\n$bold(x)$','#block[$bold(x)$]'):
             asked=[];window.typesetter.glyphs.clear();window.glyph_pending.clear()
-            def request(route,body,callback,key=None):
+            def request(route,body,callback,key=None,dropped=None):
                 if route=='/api/glyphs':asked.append((body,callback))
             with patch.object(window.services,'request',side_effect=request):self.load(source)
             self.assertEqual(len(asked),1)
-            body,callback=asked[0];self.assertEqual(body['definitions'],'')
+            body,callback=asked[0]
+            self.assertEqual([query['definitions'] for query in body['expressions']],[''])
             result=self.service('/api/glyphs',body)
-            self.assertEqual(result['glyphs'],'\U0001D499')
+            self.assertEqual(result['items'][0]['glyphs'],'\U0001D499')
             callback(result,None)
             formula=window.analysis['formulas'][-1]
             self.assertIn('\U0001D499',[op[3][0] for op in window.editor.handler.box(formula).operations if op[0]=='text'])
@@ -1658,7 +1740,7 @@ class NativeTest(unittest.TestCase):
         nodes=[node for formula in window.analysis['formulas'] for node in window.view_nodes(formula['view']) if node['kind']=='raw']
         self.assertTrue(nodes)
         requests=[]
-        def failing(route,body,callback,key=None):
+        def failing(route,body,callback,key=None,dropped=None):
             requests.append((route,body,key))
             if len(requests)==1:callback(None,'渲染后端编译失败')
             else:callback({'items':[]},None)
@@ -1682,7 +1764,7 @@ class NativeTest(unittest.TestCase):
         self.assertTrue(nodes)
         refused=nodes[0];source_id=':'.join(refused['render_id'].split(':')[:2])
         requests=[]
-        def salvaged(route,body,callback,key=None):
+        def salvaged(route,body,callback,key=None,dropped=None):
             requests.append((route,body,key))
             callback({'items':[],'failed':[source_id]},None)
         with patch.object(window.services,'request',side_effect=salvaged):
@@ -1820,8 +1902,9 @@ class NativeTest(unittest.TestCase):
         self.load('$ $')
 
     def test_fragments_render_even_when_the_document_has_a_later_error(self):
-        """The request compiles only as far as the fragments reach, so an error
-        further down the document cannot take their images with it."""
+        """A batch is compiled against the commands and the formula it asked for, so an
+        error further down the document is not compiled at all and cannot take their
+        images with it."""
         window=self.window
         self.load('正文 $ sum_(n=1)^oo frac(1, n^2) $ 与 $ dif x $。\n\n#panic("坏了")\n')
         window.compile_timer.stop();window.raw_timer.stop()
@@ -1833,14 +1916,24 @@ class NativeTest(unittest.TestCase):
         self.assertTrue(nodes)
         drawn=[node['text'] for node in nodes if isinstance(window.typesetter.raw(node),dict)]
         self.assertEqual(len(drawn),len(nodes),'fragments before a document error must still get images')
-        # The same fragments asked for without the context cannot compile.
         formula=window.analysis['formulas'][0]
+        # Control: the document itself does not compile, so those images are the reduced
+        # context's doing and not an error-free document's.
         outcome={};loop=QEventLoop()
-        def done(result,error):outcome['error']=error;loop.quit()
-        window.services.request('/api/render',window.body()|{'raw':formula['render']['raw'],'formulas':[]},done,key='raw-whole')
+        def previewed(result,error):outcome['error']=error;loop.quit()
+        window.services.request('/api/preview',window.body()|{'preview':True},previewed,key='preview-whole')
         QTimer.singleShot(5000,loop.quit)
         loop.exec_()
         self.assertIn('坏',outcome.get('error') or '')
+        # And the same fragments render even with no cut asked for at all: `context_end` is
+        # no longer what keeps the batch alive, the reduced context is.
+        outcome={};loop=QEventLoop()
+        def done(result,error):outcome.update(result=result,error=error);loop.quit()
+        window.services.request('/api/render',window.body()|{'raw':formula['render']['raw'],'formulas':[]},done,key='raw-whole')
+        QTimer.singleShot(5000,loop.quit)
+        loop.exec_()
+        self.assertIsNone(outcome.get('error'))
+        self.assertTrue(outcome['result']['items'],'an unrelated later error cannot blank the batch')
 
     def test_semantic_highlights_follow_an_incremental_edit(self):
         self.load('= 标题\n\n正文 $x$\n\n尾部 $y$')
@@ -1892,7 +1985,7 @@ class NativeTest(unittest.TestCase):
                              'end':{'line':line,'character':character+length}},
                     'message':'unknown variable'}
         asked=[]
-        def request(route,body,callback,key=None):
+        def request(route,body,callback,key=None,dropped=None):
             asked.append((route,body.get('method'),key));callback({'diagnostics':[diagnostic]},None)
         with patch.object(window.lsp,'request',side_effect=request):
             window.request_diagnostics()

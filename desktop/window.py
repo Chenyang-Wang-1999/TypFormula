@@ -1,9 +1,10 @@
-"""Native application window. Full source is the sole undoable document."""
+﻿"""Native application window. Full source is the sole undoable document."""
 import json
 import os
 import re
 import base64,tempfile
 import time
+import random
 from pathlib import Path
 from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSizeF, QUrl
 from PyQt5.QtGui import QFont, QKeySequence, QTextCursor, QTextCharFormat, QTextBlockFormat, QPainter, QPdfWriter, QPageSize, QPageLayout, QCursor, QDesktopServices
@@ -201,7 +202,7 @@ class Window(QMainWindow):
         self.loading=True
         self.attachments.clear()
         for formula in self.analysis.get("formulas",[]):
-            if "view" in formula:self.remember_attachments(formula,self.prepare_view(formula["view"],self.source[:from_byte(self.source,formula["start"])],formula["display"]))
+            if "view" in formula:self.remember_attachments(formula,self.prepare_view(formula["view"],self.formula_context(formula),formula["display"]))
         for editor in self.editors:
             if incremental:editor.incremental_project(selection,schedule_raw,self.last_reparsed)
             else:editor.project(selection,schedule_raw)
@@ -622,6 +623,9 @@ class Window(QMainWindow):
         turns them into answers. Font variants are evaluated with empty definitions;
         both page and active formula reuse the spelling/display cache across prose
         and macro-definition edits.
+
+        Every spelling still unanswered travels as **one** request: each expression used to
+        be its own adapter process, and the answers come from one warm engine now.
         """
         want={}
         for formula in self.analysis.get("formulas",[]):
@@ -629,29 +633,55 @@ class Window(QMainWindow):
             display=bool(formula.get("display"))
             for text in Window.glyph_expressions([formula]):
                 want[("",text,display)]=text
-        for key,text in want.items():
-            # Only a **real answer** counts as cached. A `None` means "asked, nothing came
-            # back" — a service that was not up yet, a core that restarted — and treating it
-            # as cached would leave that variant blank for the rest of the session.
-            if self.typesetter.glyphs.get(key) is not None or key in self.glyph_pending: continue
-            definitions,_,display=key
-            token=object();self.glyph_pending[key]=token
+        # Only a **real answer** counts as cached. A `None` means "asked, nothing came
+        # back" — a service that was not up yet, a core that restarted — and treating it
+        # as cached would leave that variant blank for the rest of the session.
+        pending={key:text for key,text in want.items() if self.typesetter.glyphs.get(key) is None and key not in self.glyph_pending}
+        if not pending:return
+        token=object()
+        for key in pending:
+            self.glyph_pending[key]=token
             self.typesetter.glyphs[key]=None
-            def arrived(value,error,key=key,token=token):
-                # A document switch may start the same expression again. Its old
-                # reply must not replace the new request's cache or trigger a repaint.
-                if self.glyph_pending.get(key) is not token:return
+        def arrived(value,error,pending=pending,token=token):
+            # A document switch may start the same spellings again. Its old reply must not
+            # replace the new request's cache or trigger a repaint.
+            answers=(value or {}).get("items") or []
+            for index,(key,_) in enumerate(pending.items()):
+                if self.glyph_pending.get(key) is not token:continue
                 del self.glyph_pending[key]
+                answer=answers[index] if index<len(answers) else None
+                failed=bool(error) or not isinstance(answer,dict) or bool(answer.get("error"))
                 # False is a stable failure; None is pending, and an empty string
                 # is a successful empty run. Retry failures on explicit refresh.
-                self.typesetter.glyphs[key]=False if error else (value or {}).get("glyphs","")
+                self.typesetter.glyphs[key]=False if failed else answer.get("glyphs","")
                 # The views read the cache when they are laid out (see `stamp_formula`),
                 # so dropping the memoized boxes and repainting is the whole of it: the
                 # next layout picks the answer up. Stamping here would have to reach both
                 # projections of every formula, which is what let the box stay blank.
                 self.repaint_glyphs(key)
-            self.services.request("/api/glyphs",{"path":"main.typ","expression":text,"definitions":definitions,"display":display},
-                                  arrived,key="glyphs:"+str(key))
+        def superseded(pending=pending,token=token):
+            """This batch was replaced in the queue, so nothing came back for it.
+
+            Its spellings did not fail and are not in flight, and the request that replaced
+            it asked for a different set — so releasing the tokens is not enough, they have
+            to be asked for again. Without this they would sit in `glyph_pending` for the
+            rest of the session and never be requested.
+            """
+            for key in pending:
+                if self.glyph_pending.get(key) is token:del self.glyph_pending[key]
+            QTimer.singleShot(0,self.load_glyphs)
+        queries=[{"expression":text,"definitions":key[0],"display":key[2],"glyphs":True} for key,text in pending.items()]
+        self.services.request("/api/glyphs",{"path":"main.typ","expressions":queries},arrived,key="glyphs-batch",dropped=superseded)
+
+    def formula_context(self,formula):
+        """What this formula's images and placements are keyed by.
+
+        The core reduces the document to the part a formula can see and hands its digest over
+        (`desktop.rs::project`), so a keystroke outside that part leaves the key alone. It used
+        to be the whole prefix, which every unrelated edit changed -- and a document with an
+        attachment or a variant per formula then asked the engine for all of them again.
+        """
+        return formula.get("context") or self.source[:from_byte(self.source,formula["start"])]
 
     def stamp_formula(self,formula):
         """Stamp one formula's view, the way every draw of it does.
@@ -661,7 +691,7 @@ class Window(QMainWindow):
         that call, where the context is the formula's own (`source[:start]` and its display
         mode) rather than the active session's.
         """
-        return self.stamp_draw(formula['view'],self.source[:from_byte(self.source,formula['start'])],bool(formula.get('display')))
+        return self.stamp_draw(formula['view'],self.formula_context(formula),bool(formula.get('display')))
 
     def stamp_draw(self,view,definitions,display):
         """Stamp what a draw reads out of the caches; answer which attachments it holds.
@@ -793,7 +823,7 @@ class Window(QMainWindow):
         if not view:return ()
         entry=self.attachments.get(id(view))
         if entry is not None and entry[0] is view:return entry[1]
-        definitions=self.source[:from_byte(self.source,formula["start"])]
+        definitions=self.formula_context(formula)
         attachments=self.prepare_view(view,definitions,formula["display"])
         self.remember_attachments(formula,attachments)
         return self.attachments[id(view)][1]
@@ -986,9 +1016,19 @@ class Window(QMainWindow):
         if not targets:return
         body=self.body()|{'raw':ranges,'formulas':[],'context_end':context_end}
         pending={shared for _,shared in targets.values()};self.raw_pending.update(pending)
+        def superseded(pending=pending):
+            """This batch was replaced in the queue, so nothing came back for it.
+
+            `raw_pending` is what this pass skips fragments by, and only a reply clears
+            it. A batch that never ran would leave its fragments pending for the rest of
+            the session: never asked for again, not marked failed either, so they would
+            draw as source with no image and no way back. The pass that replaced this one
+            asked for a different set of fragments, so releasing them is not enough --
+            the next pass has to ask for them again.
+            """
+            self.raw_pending.difference_update(pending)
+            self.raw_timer.start()
         def rendered(result,error,targets=targets,revision=revision):
-            # I don't know why but it works. Without the sleep, the renderer may fail when the document is long.
-            time.sleep(0.1)
             pending={shared for _,shared in targets.values()};self.raw_pending.difference_update(pending)
             if revision!=self.revision:self.raw_timer.start();return
             for shared in pending:self.typesetter.cache[shared]=False
@@ -1005,7 +1045,7 @@ class Window(QMainWindow):
                 refused={shared for shared in pending if self.typesetter.cache.get(shared) is False}
                 self.raw_error=(revision,refused) if refused else None
             self.typesetter.touch();self.repaint_formulas()
-        self.services.request('/api/render',body,rendered,key='raw-batch')
+        self.services.request('/api/render',body,rendered,key='raw-batch',dropped=superseded)
 
     def repaint_formulas(self):
         """Relay out and repaint after Raw images or fragment statuses changed."""

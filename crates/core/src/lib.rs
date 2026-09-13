@@ -15,12 +15,14 @@
 //! * `editing` — the editing model: where the caret enters, how it walks, and
 //!   which cells it can reach.
 //! * `typst` — parsing Typst source into that tree, and writing it back.
+//! * `context` — the part of a document a piece of source still depends on.
 //! * `cursor` — `Editor`: every editing action, in terms of the tree.
 //! * `view` — the tree as the frontend receives it.
 //!
 //! What lives in the host crate: `document` (source is authoritative), `desktop`
 //! and `rpc` (transports), `services`/`packages`/`workspace` (process, network,
 //! paths). See `docs/architecture.md`.
+pub mod context;
 pub mod cursor;
 pub mod editing;
 pub mod math;

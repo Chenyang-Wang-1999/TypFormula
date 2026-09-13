@@ -77,7 +77,7 @@ Scripts 恒有三个 View 子节点：有内容的脚标正常投影，未使用
 
 style 不进入 render.raw；即使带有模板来源区间，也不等于有取图请求。host 为外层 raw_macro 内的片段保留定位信息，但批次只选择当前显示所需的非重叠区间。
 
-style 使用 `/api/glyphs`，definitions 固定为空，缓存键为 `("", text, display)`，在途、成功（含空串）和失败分别处理。raw/raw_macro 使用 `/api/render`；带 call 的模板 raw_macro 按调用实例缓存，普通 Raw（包括模板中的 Raw）仍按源码和脚本摘要共享。具体失效规则见 [architecture.md](architecture.md) 与 [desktop.md](desktop.md)。
+style 使用 `/api/glyphs`，definitions 固定为空；一次请求带上文档里所有还没答案的拼写（`{"expressions":[…]}`，逐项回包），缓存键为 `("", text, display)`，在途、成功（含空串）和失败分别处理。raw/raw_macro 使用 `/api/render`；带 call 的模板 raw_macro 按调用实例缓存，普通 Raw（包括模板中的 Raw）仍按源码和脚本摘要共享。公式的图像与 attachment 的 placement 都以该公式**上下文的摘要**为身份（`desktop.rs::project` 里的 `context`，内核 `context::digest`）：正文里与它无关的一次编辑不再让它们作废。具体失效规则见 [architecture.md](architecture.md) 与 [desktop.md](desktop.md)。
 
 ## 四、引擎对应关系与当前缺口
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Typst replaces MathParser/TeXMathStream at import and command confirmation.
 // Structural editing and draft keystrokes do not reparse the formula.
+use crate::context;
 use crate::math::*;
 use crate::slots::{self, Write};
 use crate::view::{self, ViewTemplate};
@@ -213,9 +214,17 @@ pub fn macro_registry(definitions: &str) -> Arc<MacroRegistry> {
     // early formulas contain no bindings at all; avoid parsing that markup a
     // second time merely to construct an empty registry.
     if !definitions.contains("let") { return empty_macros(); }
-    let hash = key_hash(definitions);
+    // Only the statements that can reach the end of the prefix can bind anything there, and
+    // that part of the text does not change when the prose around it does. Reducing first
+    // therefore makes the cache below hit on a keystroke that only touched prose, instead of
+    // rebuilding every definition's template once per formula. Everything the registry reports
+    // is translated back (`retarget`) because its offsets and its `definition_prefix` are read
+    // as offsets and text of `definitions`.
+    let reduced = context::context_before(definitions, definitions.len());
+    let text = reduced.as_ref().map_or(definitions, |context| context.source.as_str());
+    let hash = key_hash(text);
     let mut cache = poison_free(&MACROS);
-    if let Some(index) = cache.find(definitions, hash) {
+    if let Some(index) = cache.find(text, hash) {
         let entry = cache.entries.swap_remove(index);
         let registry = entry.registry.clone();
         cache.entries.push(entry);
@@ -229,9 +238,28 @@ pub fn macro_registry(definitions: &str) -> Arc<MacroRegistry> {
     // definitions themselves it is simply a candidate whose earlier definitions
     // analyze_macros still reuses, one definition at a time.
     let previous = cache.entries.last().map(|entry| entry.registry.clone());
-    let registry = Arc::new(analyze_macros(definitions, previous.as_deref()));
-    cache.retain(definitions, hash, &registry);
+    let mut registry = analyze_macros(text, previous.as_deref());
+    if let Some(context) = &reduced { retarget(&mut registry, context, definitions); }
+    let registry = Arc::new(registry);
+    cache.retain(text, hash, &registry);
     registry
+}
+
+/// Move a registry analyzed from reduced text back into the caller's coordinates.
+///
+/// A definition keeps its own text -- that part is copied verbatim -- while its offset and the
+/// text before it are taken from `definitions`, so `definition_prefix` stays exactly the text
+/// from the start of the prefix through the definition, which is where
+/// `definition_raw_ranges` locates a fragment and where `document::annotate` expects it.
+fn retarget(registry: &mut MacroRegistry, context: &context::Context, definitions: &str) {
+    for def in registry.entries.iter_mut() {
+        let (start, end) = (def.definition_start, def.definition_start + def.input.len());
+        let (Some(start), Some(end)) = (context.original(start), context.original(end)) else { continue };
+        def.definition_start = start;
+        def.context = Arc::new(definitions[..start].to_string());
+        def.input = definitions[start..end].to_string();
+        def.source = def.input.clone();
+    }
 }
 struct ParseContext<'a> {
     params: &'a [String],

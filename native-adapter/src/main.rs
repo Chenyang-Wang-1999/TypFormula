@@ -7,7 +7,7 @@ use typst::{Library, LibraryExt, World};
 use typst::comemo::Track;
 use typst::diag::{FileError, FileResult};
 use typst::engine::{Engine, Route, Sink, Traced};
-use typst::foundations::{Bytes, Content, Datetime, Duration, Packed, SequenceElem, StyleChain, StyledElem};
+use typst::foundations::{Bytes, Content, Datetime, Duration, StyleChain, StyledElem};
 use typst::introspection::{EmptyIntrospector, Locator};
 use typst::math::{EquationElem, MathSize};
 use typst::math::ir::{MathItem, MathKind, ScriptsItem, resolve_equation};
@@ -25,6 +25,12 @@ struct Request { #[serde(default="default_path")] path: String, expression: Stri
     #[serde(default)] context: Option<AttachmentContext> }
 #[derive(Deserialize)]
 struct AttachmentContext { source:String, start:usize, end:usize }
+/// Several expressions in one request. The editor asks about every font variant a document
+/// mentions at once, and one warm engine answers them all: as separate requests each one
+/// cost a process of its own. Each expression carries the path it is about, so the outer
+/// one is not read.
+#[derive(Deserialize)]
+struct Batch { expressions: Vec<Request> }
 
 struct FormulaWorld { library: LazyHash<Library>, fonts: typst_kit::fonts::FontStore, source: Source, overlays: std::collections::HashMap<String,String>, time: typst_kit::datetime::Time }
 fn font_store(system:bool)->typst_kit::fonts::FontStore {
@@ -35,6 +41,11 @@ fn font_store(system:bool)->typst_kit::fonts::FontStore {
     fonts.extend(typst_kit::fonts::embedded());
     if system { fonts.extend(typst_kit::fonts::system()); }
     fonts
+}
+/// The world an attachment or glyph request runs in: the editor's own math font and no
+/// system fonts, because the question is about math style, not about the document's text.
+fn math_world()->FormulaWorld {
+    FormulaWorld { library: LazyHash::new(Library::default()), fonts:font_store(false), source:Source::detached(String::new()), overlays:Default::default(), time:typst_kit::datetime::Time::system() }
 }
 impl World for FormulaWorld {
     fn library(&self) -> &LazyHash<Library> { &self.library }
@@ -93,25 +104,50 @@ fn diagnostics(errors: typst::ecow::EcoVec<typst::diag::SourceDiagnostic>) -> St
     errors.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join("\n")
 }
 
-// A module is document content, not a math body. In particular, blank lines
-// outside the equation become ParbreakElem, which math IR treats as External.
-// Extract only the equation, carrying the styles of its enclosing wrappers.
-// Do not search inside equations or arbitrary content: those may contain scripts
-// belonging to the base or attachments rather than the requested outer branch.
-fn collect_equations<'a>(
-    content: &'a Content,
-    styles: StyleChain<'a>,
-    arenas: &'a Arenas,
-    out: &mut Vec<(&'a Packed<EquationElem>, StyleChain<'a>)>,
-) {
-    if let Some(equation) = content.to_packed::<EquationElem>() {
-        out.push((equation, styles));
-    } else if let Some(sequence) = content.to_packed::<SequenceElem>() {
-        for child in &sequence.children { collect_equations(child, styles, arenas, out); }
-    } else if let Some(styled) = content.to_packed::<StyledElem>() {
-        let parent = arenas.bump.alloc(styles);
-        collect_equations(&styled.child, parent.chain(&styled.styles), arenas, out);
+// Every equation reachable from the document content, in document order, with the style chain
+// each one sits in. The walk follows **fields**, not just sequences: `#columns(2)[…]`,
+// `#grid(…)`, `#slide[…]` and list items hold their content in fields, and a document-level
+// `#show` puts the whole document into one -- which is why a slide deck's formulas used to
+// come back as "适配请求缺少公式". Typst's own IDE walks content the same way
+// (`typst-ide/src/utils.rs`: `content.fields().iter()`).
+//
+// Equations are collected but not searched: what is inside one belongs to its base or its
+// attachments, not to the branch being asked about.
+fn collect_equations(content: &Content) -> (Vec<Content>, Vec<Option<usize>>) {
+    let mut nodes: Vec<Content> = vec![];
+    let mut parents: Vec<Option<usize>> = vec![];
+    let mut stack = vec![(content.clone(), None)];
+    while let Some((node, parent)) = stack.pop() {
+        let index = nodes.len();
+        let equation = node.is::<EquationElem>();
+        nodes.push(node.clone());
+        parents.push(parent);
+        if equation { continue; }
+        let fields = node.fields();
+        let mut children = vec![];
+        for (_, value) in fields.iter() { push_contents(value, &mut children); }
+        for child in children.into_iter().rev() { stack.push((child, Some(index))); }
     }
+    (nodes, parents)
+}
+fn push_contents(value: &typst::foundations::Value, out: &mut Vec<Content>) {
+    use typst::foundations::Value;
+    match value {
+        Value::Content(content) => out.push(content.clone()),
+        Value::Array(items) => { for item in items.iter() { push_contents(item, out); } }
+        Value::Dict(dict) => { for (_, item) in dict.iter() { push_contents(item, out); } }
+        _ => {}
+    }
+}
+/// The style chain of one node, built down the ancestor path of the walk above.
+fn styles_at<'a>(nodes: &'a [Content], parents: &[Option<usize>], at: usize, root: StyleChain<'a>, arenas: &'a Arenas) -> StyleChain<'a> {
+    let mut path = vec![]; let mut index = Some(at);
+    while let Some(current) = index { path.push(current); index = parents[current]; }
+    let mut styles = root;
+    for index in path.into_iter().rev() {
+        if let Some(styled) = nodes[index].to_packed::<StyledElem>() { styles = arenas.bump.alloc(styles).chain(&styled.styles); }
+    }
+    styles
 }
 /// Read the text of a **flat** math item: the substituted glyphs of one font variant.
 ///
@@ -138,7 +174,10 @@ fn collect_glyphs(item: &MathItem, out: &mut String) -> Result<(), String> {
     }
 }
 
-fn resolve(req: Request) -> Result<Value, String> {
+/// Answer one attachment or glyph request. Takes the world it runs in, so a server can
+/// keep one: the request's own document replaces the world's source, and the fonts, the
+/// library and the memoization behind them are built once instead of per request.
+fn resolve(req: &Request, world: &mut FormulaWorld) -> Result<Value, String> {
     let space = if req.display { " " } else { "" };
     let mut label="typformula-attachment-target".to_string();
     let document=if let Some(context)=&req.context {
@@ -149,10 +188,11 @@ fn resolve(req: Request) -> Result<Value, String> {
         source.replace_range(context.start..context.end,&format!("${space}{}{space}$<{label}>",req.expression));
         source
     } else {format!("{}\n${space}{}{space}$",req.definitions,req.expression)};
-    let source = Source::detached(format!("#set text(font: \"New Computer Modern Math\", size: 24pt)\n{document}"));
-    let source = Source::new(source_id(&req.path)?,source.text().into());
-    let world = FormulaWorld { library: LazyHash::new(Library::default()), fonts:font_store(false), source, overlays:Default::default(), time:typst_kit::datetime::Time::system() };
-    let world_ref: &dyn World = &world;
+    let text=format!("#set text(font: \"New Computer Modern Math\", size: 24pt)\n{document}");
+    let id=source_id(&req.path)?;
+    if world.source.id()!=id { world.source=Source::new(id,text.into()); } else { world.source.replace(&text); }
+    world.time=typst_kit::datetime::Time::system();
+    let world_ref: &dyn World = &*world;
     let traced = Traced::default();
     let mut sink = Sink::new();
     let module = typst_eval::eval(world_ref.track(), &world.library, traced.track(), sink.track_mut(), Route::default().track(), &world.source).map_err(diagnostics)?;
@@ -161,12 +201,15 @@ fn resolve(req: Request) -> Result<Value, String> {
     let base_styles = StyleChain::new(&world.library.styles);
     let styles = base_styles.chain(&size);
     let arenas = Arenas::default();
-    let mut equations = vec![];
-    collect_equations(&content, styles, &arenas, &mut equations);
-    let target=if req.context.is_some() {
-        equations.iter().find(|(equation,_)|equation.label().is_some_and(|l|l.resolve().as_str()==label))
-    } else {equations.last()};
-    let (equation, styles) = *target.ok_or("适配请求缺少公式")?;
+    let (nodes, parents) = collect_equations(&content);
+    // The label is what the caller put on the formula it asked about; without one (the shape
+    // the tests and the release self-check use) it is the last equation of the document.
+    let target = if req.context.is_some() {
+        nodes.iter().position(|node| node.to_packed::<EquationElem>().is_some_and(|equation| equation.label().is_some_and(|l|l.resolve().as_str()==label)))
+    } else { nodes.iter().rposition(|node| node.is::<EquationElem>()) };
+    let target = target.ok_or("适配请求缺少公式")?;
+    let equation = nodes[target].to_packed::<EquationElem>().ok_or("适配请求缺少公式")?;
+    let styles = styles_at(&nodes, &parents, target, styles, &arenas);
     let introspector = EmptyIntrospector;
     let mut engine = Engine { world: world_ref.track(), library: &world.library, introspector: Protected::new(introspector.track()), traced: traced.track(), sink: sink.track_mut(), route: Route::default() };
     let item = resolve_equation(equation, &mut engine, Locator::root(), &arenas, styles).map_err(diagnostics)?;
@@ -190,13 +233,34 @@ fn main() {
     if std::env::args().any(|a| a == "--server") {
         use std::io::{BufRead, Write};
         let mut world = render::world().expect("embedded font");
+        // The attachment and glyph requests run in a world of their own, built when the
+        // first one arrives: their document is not the one being rendered, and a session
+        // that never asks about an attachment never pays for it.
+        let mut math: Option<FormulaWorld> = None;
         let input = io::stdin();
         let mut input = input.lock();
         loop {
             let mut line = String::new();
             match input.by_ref().take(8*1024*1024+1).read_line(&mut line) { Ok(0) | Err(_) => break, _ => {} }
             if line.len() > 8*1024*1024 { break; }
-            let result = serde_json::from_str(&line).map_err(|e|e.to_string()).and_then(|req|render::render(req,&mut world));
+            let result = serde_json::from_str::<Value>(&line).map_err(|e|e.to_string()).and_then(|body| {
+                // Asking about one `expression` (or a list of them) is what an attachment or
+                // glyph request does; a render request carries the document and its ranges.
+                if body.get("expressions").is_some() {
+                    let batch=serde_json::from_value::<Batch>(body).map_err(|e|e.to_string())?;
+                    let world=math.get_or_insert_with(math_world);
+                    // One expression that does not resolve is that expression's answer, not
+                    // the batch's: the others still come back.
+                    let items:Vec<Value>=batch.expressions.iter().map(|query| resolve(query,world).unwrap_or_else(|error|json!({"error":error}))).collect();
+                    Ok(json!({"engine":"Typst math IR 59b5999","items":items}))
+                } else if body.get("expression").is_some() {
+                    let request=serde_json::from_value::<Request>(body).map_err(|e|e.to_string())?;
+                    resolve(&request,math.get_or_insert_with(math_world))
+                } else {
+                    let request=serde_json::from_value::<render::RenderRequest>(body).map_err(|e|e.to_string())?;
+                    render::render(request,&mut world)
+                }
+            });
             println!("{}",result.unwrap_or_else(|error|json!({"error":error})));
             let _ = io::stdout().flush();
             typst::comemo::evict(10);
@@ -207,7 +271,7 @@ fn main() {
         let mut body = String::new();
         io::stdin().take(8 * 1024 * 1024 + 1).read_to_string(&mut body).map_err(|e| e.to_string())?;
         if body.len() > 8 * 1024 * 1024 { return Err("请求过大".into()); }
-        resolve(serde_json::from_str(&body).map_err(|e| e.to_string())?)
+        resolve(&serde_json::from_str(&body).map_err(|e| e.to_string())?,&mut math_world())
     })();
     println!("{}", result.unwrap_or_else(|error| json!({"error":error})));
 }
@@ -216,17 +280,47 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn a_formula_inside_a_container_or_under_a_theme_is_still_found() {
+        // Two things used to make this unanswerable, both of them measured on a real slide
+        // deck: the equation search followed sequences only, so a formula inside `#columns`,
+        // `#grid` or a list item -- all of which keep their content in element *fields* -- was
+        // invisible, and a document-level `#show` puts the whole document into an element of
+        // its own. Every one of those queries came back as "适配请求缺少公式".
+        let formula = "$ sum_(j) $";
+        for (name, body) in [
+            ("plain", "\n$ sum_(j) $\n"),
+            ("columns", "\n#columns(2)[\n$ sum_(j) $\n]\n"),
+            ("grid", "\n#grid(columns: (1fr, 1fr),\n[$ sum_(j) $],\n[x]\n)\n"),
+            ("list item", "\n- $ sum_(j) $\n"),
+            ("block", "\n#block[\n  #set math.limits(inline: false)\n  $ sum_(j) $\n]\n"),
+            ("themed", ""),
+            ("themed and nested", ""),
+        ] {
+            let source = match name {
+                "themed" => format!("#show: doc => box(doc)\n\n{formula}\n"),
+                "themed and nested" => format!("#show: doc => box(doc)\n\n#block[\n  {formula}\n]\n"),
+                _ => body.to_owned(),
+            };
+            let start = source.find(formula).unwrap();
+            let context = AttachmentContext { source: source.clone(), start, end: start + formula.len() };
+            let result = resolve(&Request { path: "main.typ".into(), expression: "sum_(j)".into(), definitions: String::new(), display: true, glyphs: false, context: Some(context) }, &mut math_world())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(result["lower"], "limits", "{name}");
+            assert_eq!(result["upper"], Value::Null, "{name}");
+        }
+    }
+    #[test]
     fn attachments_keep_enclosing_scope_and_select_the_requested_equation() {
         let source="#[\n#let custom = math.op(\"custom\", limits: true)\n$ H_(\"int\") = & sum_(j) rme() \\\n= & x $\n$ z_2 $\n]";
         let start=source.find("$ H").unwrap();let end=source.find("$\n$ z").unwrap()+1;
         for (expression,display,expected) in [("sum_(j)",true,"limits"),("sum_(j)",false,"scripts"),("custom_(j)",true,"limits")] {
             let context=AttachmentContext{source:source.into(),start,end};
-            let result=resolve(Request{path:"main.typ".into(),expression:expression.into(),definitions:source[..start].into(),display,glyphs:false,context:Some(context)}).unwrap();
+            let result=resolve(&Request{path:"main.typ".into(),expression:expression.into(),definitions:source[..start].into(),display,glyphs:false,context:Some(context)},&mut math_world()).unwrap();
             assert_eq!(result["lower"],expected);
         }
     }
     fn query(expression: &str, display: bool) -> Value {
-        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display, glyphs: false, context:None }).unwrap()
+        resolve(&Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display, glyphs: false, context:None },&mut math_world()).unwrap()
     }
     #[test]
     fn typst_decides_both_defaults_and_explicit_overrides() {
@@ -241,7 +335,7 @@ mod tests {
     fn lim_branch_ignores_document_blank_lines_but_keeps_its_math_styles() {
         for definitions in ["", "\n\n", "#let unrelated = 1\n\n"] {
             for display in [true, false] {
-                let result = resolve(Request { path:"main.typ".into(), expression: "lim_(x -> oo)".into(), definitions: definitions.into(), display, glyphs: false, context:None }).unwrap();
+                let result = resolve(&Request { path:"main.typ".into(), expression: "lim_(x -> oo)".into(), definitions: definitions.into(), display, glyphs: false, context:None },&mut math_world()).unwrap();
                 assert_eq!(result["lower"], if display { "limits" } else { "scripts" });
             }
         }
@@ -249,9 +343,9 @@ mod tests {
     #[test]
     fn empty_slots_still_get_a_position_and_definitions_are_evaluated() {
         assert_eq!(query("sum_()", true)["lower"], "limits");
-        let custom = resolve(Request { path:"main.typ".into(), expression: "my_1".into(), definitions: "#let my = math.op(\"my\", limits: true)".into(), display: true, glyphs: false, context:None }).unwrap();
+        let custom = resolve(&Request { path:"main.typ".into(), expression: "my_1".into(), definitions: "#let my = math.op(\"my\", limits: true)".into(), display: true, glyphs: false, context:None },&mut math_world()).unwrap();
         assert_eq!(custom["lower"], "limits");
-        assert!(resolve(Request { path:"main.typ".into(), expression: "unknown_name_1".into(), definitions: String::new(), display: true, glyphs: false, context:None }).is_err());
+        assert!(resolve(&Request { path:"main.typ".into(), expression: "unknown_name_1".into(), definitions: String::new(), display: true, glyphs: false, context:None },&mut math_world()).is_err());
     }
     #[test]
     fn attachment_service_returns_only_placement_even_for_stretch() {
@@ -261,7 +355,7 @@ mod tests {
         assert!(long.get("base").is_none());
     }
     fn glyphs(expression: &str) -> Result<String, String> {
-        resolve(Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display: true, glyphs: true, context:None })
+        resolve(&Request { path:"main.typ".into(), expression: expression.into(), definitions: String::new(), display: true, glyphs: true, context:None },&mut math_world())
             .map(|value| value["glyphs"].as_str().unwrap_or_default().to_string())
     }
     /// A font variant is applied by substituting codepoints, and the substitution has

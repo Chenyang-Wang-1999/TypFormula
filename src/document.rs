@@ -73,6 +73,12 @@ impl Document {
     }
     pub fn equation_nodes(&self)->Vec<(Equation,SyntaxNode)> { self.equation_index().as_ref().clone() }
     pub fn activate_equation(&mut self,range:Equation,node:&SyntaxNode)->Result<(),String> {
+        // TODO: this prefix is the whole of what stands before the formula. Reducing it to the
+        // part the formula can see (`typformula_core::context`) would make the macro registry's
+        // cache survive prose edits, but the view hands `definitions` and the definition
+        // offsets to the host, which maps them back into the document by assuming they are the
+        // real prefix (`self.source[..range.start]`, see `Locator` in `document.rs`). The
+        // reduction needs an offset mapping alongside it before that can change.
         let definitions=&self.source[..range.start];
         let parsed=typst::parse_formula_node(node,definitions)?;
         self.editor=Editor::default();self.editor.root=parsed.root;self.editor.definitions=definitions.into();self.editor.display=range.display;self.active=Some(range);Ok(())
@@ -155,7 +161,15 @@ impl Document {
         response["active_formula"] = json!(0);
         response["active_range"] = self.active.as_ref().map_or(Value::Null, |r| json!({"start":r.start,"end":r.end,"display":r.display}));
         response["equations"] = json!(self.equations().iter().map(|e|json!({"start":e.start,"end":e.end,"display":e.display})).collect::<Vec<_>>());
-        response["formula_definitions"] = json!(self.editor.definitions); response["blocks"] = json!(blocks);
+        response["formula_definitions"] = json!(self.editor.definitions);
+        // The identity the frontend keys a fragment's image and an attachment's placement by
+        // (`typformula_core::context`). The page's copy comes from `desktop::project`, and both
+        // have to agree or the box would ask the engine for what the page already has.
+        if let Some(active)=&self.active {
+            if let Some(context)=typformula_core::context::context_in(&self.syntax,&[(active.start,active.end)]) {
+                response["formula_context"] = json!(context.digest());
+            }
+        } response["blocks"] = json!(blocks);
         response["render"] = json!({"source":self.source,"raw":raw,"formulas":formulas}); response
     }
 }
@@ -223,7 +237,6 @@ fn align(canonical: &str, source: &str) -> Vec<usize> {
 }
 fn step(text: &str, at: usize) -> usize { at + text[at..].chars().next().map_or(0, char::len_utf8) }
 fn whitespace(text: &str, at: usize) -> bool { text[at..].chars().next().is_some_and(char::is_whitespace) }
-
 fn locate_edit(view: &Value, root: &MathData, locator: &Locator, text: &str) -> Option<(usize, usize)> {
     let cursor = serde_json::from_value::<Cursor>(view["edit"].clone()).ok()?;
     let mut copy = root.clone();

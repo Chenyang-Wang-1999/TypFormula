@@ -686,7 +686,7 @@ class MathCanvas(QWidget):
         for node in self.owner.view_nodes(state['view']):
             if node.get('kind')=='unknown':node['_string_mode']=state.get('string_mode',False)
         mark_active_path(state['view'],state.get('cursor',{}).get('slices',[]))
-        self.owner.prepare_view(state["view"],state.get("formula_definitions",""),state.get("display",False))
+        self.owner.prepare_view(state["view"],state.get("formula_context") or state.get("formula_definitions",""),state.get("display",False))
         self.state=state;self.box=self.owner.typesetter.layout(state["view"])
         self.resize(int(self.box.width+12),int(self.box.height+12))
         self.update()

@@ -5,6 +5,22 @@ use serde_json::{Value, json};
 use typst_syntax::{SyntaxKind, SyntaxNode};
 use std::io::{self, BufRead, Write};
 
+/// Whether the `#let` at `at..end` binds a formula that can be expanded structurally.
+///
+/// The registry is built from the part of the document that this definition can see rather
+/// than from everything before it (`typformula_core::context`), which is both smaller and --
+/// unlike a growing prefix -- the same text after an unrelated edit, so a scan of a long
+/// document stops rebuilding it once per definition. The offset the registry reports is an
+/// offset in that text, which is why the definition's own offset is asked for here.
+fn expandable_binding(source:&str,at:usize,end:usize)->bool {
+    let reduced=typformula_core::context::context(source,&[(at,end)]);
+    let (text,definition_start)=match &reduced {
+        Some(context) => (context.source.as_str(),context.ranges[0].0),
+        None => (&source[..end.min(source.len())],at),
+    };
+    typst::macro_registry(text).entries.iter().any(|d| d.definition_start==definition_start && d.expandable)
+}
+
 pub fn analyze(document: &mut Document) -> Value {
     let (blocked,mut styles)=scan_syntax(document,true);
     let saved_editor=std::mem::take(&mut document.editor);
@@ -63,7 +79,7 @@ fn scan_syntax(document:&Document,classify:bool)->(Vec<(usize,usize,&'static str
                 // macro is **called**, and the call site's own view carries it together
                 // with the range in the definition it came from (`view::Projector` writes
                 // `definitions`/`origin`/`source_range` for exactly that).
-                let expandable = typst::macro_registry(&source[..end]).entries.iter().any(|d| d.definition_start == at && d.expandable);
+                let expandable = expandable_binding(source,at,end);
                 let reason = if expandable { "位于 let 定义体中，按设计保留源码模式（定义体是宏模板）" }
                              else { "位于不可展开的 let 定义中，按设计保留源码模式" };
                 blocked.push((at,end,reason));
@@ -81,6 +97,13 @@ fn scan_syntax(document:&Document,classify:bool)->(Vec<(usize,usize,&'static str
 fn project(document:&mut Document,equation:crate::document::Equation,node:&SyntaxNode,blocked:&[(usize,usize,&'static str)])->Value {
     let covering=blocked.iter().find(|&&(a,b,_)|a<=equation.start && equation.end<=b);
     let mut item=json!({"start":equation.start,"end":equation.end,"display":equation.display,"editable":covering.is_none()});
+    // The identity of this formula's context (`typformula_core::context`). The frontend keys a
+    // fragment's image and an attachment's placement by it, so an edit outside that context
+    // keeps them, which the whole prefix it used to key by never did. The document's own tree
+    // is already parsed incrementally, so this costs a walk and not a parse per formula.
+    if let Some(context)=typformula_core::context::context_in(document.syntax(),&[(equation.start,equation.end)]) {
+        item["context"]=json!(context.digest());
+    }
     if let Some((_,_,reason))=covering {item["reason"]=json!(reason);}
     else {match document.activate_equation(equation.clone(),node) {
         Ok(())=>{let response=document.response();item["view"]=response["view"].clone();item["render"]=response["render"].clone();document.editor=Default::default();document.active=None;},
@@ -96,7 +119,7 @@ pub fn analyze_formula(document:&mut Document,start:usize)->Option<Value> {
         if target<at||target>=at+node.len(){return None;}
         if node.kind()==SyntaxKind::LetBinding {
             // Same rule as `scan_syntax`: a `#let` body is source, expandable or not.
-            let expandable=typst::macro_registry(&source[..at+node.len()]).entries.iter().any(|d|d.definition_start==at&&d.expandable);
+            let expandable=expandable_binding(source,at,at+node.len());
             return Some(if expandable { "位于 let 定义体中，按设计保留源码模式（定义体是宏模板）" }
                         else { "位于不可展开的 let 定义中，按设计保留源码模式" });
         }
