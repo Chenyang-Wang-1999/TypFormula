@@ -1,0 +1,111 @@
+{
+  "name": "typformula-document-protocol",
+  "protocol": 1,
+  "status": "草案：只定义接口与 fixture，尚无实现（见 TODO/重构前后端职责划分.typ 第 2、3 节）",
+  "transport": {
+    "framing": "UTF-8，一行一个 JSON 对象，\\n 结尾；同一行不允许有多余空白",
+    "request": {"id": "int", "verb": "string"},
+    "reply": "{\"id\": int, \"result\": object} 或 {\"id\": int, \"error\": error}",
+    "event": "{\"event\": string, \"revision\": int, ...}——后端主动推送，不带 id",
+    "limits": {"message_bytes": 8388608, "reply_bytes": 67108864}
+  },
+  "rules": {
+    "R1": "无会话：后端不保存当前公式、光标、草稿、历史；同一请求在同一源码上必得同一回复",
+    "R2": "请求自带上下文：光标与选区作为 session 参数收下；回复总是带变化后的源码（若变了）与新的显示树",
+    "R3": "只有 edit 会改变文档；其余动词是纯查询",
+    "R4": "位置一律 UTF-8 字节偏移；Qt 的 UTF-16 由前端换算，LSP 的 UTF-16 由后端换算",
+    "R5": "名字契约版本化：hello 给出能力表，前端启动时对账，不认识的名字报错",
+    "R6": "回复与事件同一条协议；编译在工作线程完成后以事件回包，事件带 revision，过期即丢",
+    "R7": "失败是数据：images 的值可以是 error 对象；failed 与 batch_error 与结果并列",
+    "R8": "错误带动作名与原因，不抛给用户"
+  },
+  "capabilities": {
+    "protocol": "int",
+    "app": "string",
+    "verbs": "[string]",
+    "document_ops": "[string]",
+    "formula_ops": "[string]",
+    "nav_ops": "[string]",
+    "view_kinds": "[string]",
+    "roles": "[string]",
+    "markers": "{[string]}",
+    "metrics": "metrics",
+    "limits": "limits"
+  },
+  "types": {
+    "cursor": {"slices": "[slice]", "pos": "int"},
+    "slice": {"atom": "int", "cell": "int"},
+    "session": {"cursor": "cursor", "anchor": "cursor?", "draft": "draft?", "display": "bool?"},
+    "draft": {"text": "string", "caret": "int"},
+    "intent": {"op": "string", "text": "string?", "source": "string?", "axis": "string?", "cursor": "cursor?", "draft": "draft?", "name": "string?", "display": "bool?"},
+    "nav_op": {"kind": "string", "direction": "string?", "word": "bool?", "extend": "bool?", "cursor": "cursor?", "index": "int?"},
+    "candidate": {"label": "string", "detail": "string?", "replacement": "string?"},
+    "view": {
+      "kind": "string", "text": "string?", "role": "string?", "children": "[view]",
+      "columns": "int?", "row_lengths": "[int]?", "marker": "string?", "border": "string?",
+      "is_mat": "bool?", "is_list": "bool?", "active": "bool?", "selected": "bool?",
+      "display_glyph": "string?", "style_name": "string?",
+      "cursor": "cursor?", "edit": "cursor?",
+      "image_id": "string?", "glyph_id": "string?", "attachment_id": "string?"
+    },
+    "formula": {"id": "string", "view_version": "int", "range": "range", "display": "bool", "editable": "bool", "reason": "string?", "context": "string?", "entry": "cursor", "view": "view"},
+    "style": {"kind": "string", "start": "int", "end": "int", "text": "string"},
+    "definition_block": {"start": "int", "end": "int", "text": "string", "count": "int"},
+    "analysis": {"revision": "int", "source": "string", "formulas": "[formula]", "styles": "[style]", "definition_blocks": "[definition_block]"},
+    "edit_result": {"revision": "int", "source": "string", "source_changed": "bool", "styles": "[style]", "definition_blocks": "[definition_block]", "changed": "[formula]", "removed": "[string]", "cursor": "cursor?", "anchor": "cursor|null?", "selected_source": "string?", "message": "string"},
+    "image": {"svg": "string?", "error": "string?", "width": "number?", "height": "number?", "baseline": "number?", "page": "int?", "x": "number?", "y": "number?", "base_font_size_pt": "number?", "base_font_height_pt": "number?", "base_font_baseline_pt": "number?", "environment_font_size_pt": "number?"},
+    "placement": {"placement": "string"},
+    "page": {"svg": "string", "hash": "string"},
+    "package": {"name": "string", "version": "string"},
+    "export_result": {"kind": "string", "pages": "[page]?", "pdf": "string?"},
+    "diagnostic": {"severity": "string?", "message": "string", "start": "int", "end": "int"},
+    "hover": {"text": "string", "start": "int", "end": "int"},
+    "location": {"path": "string", "start": "int", "end": "int"},
+    "text_edit": {"start": "int", "end": "int", "text": "string"},
+    "token": {"start": "int", "end": "int", "role": "string"},
+    "lsp_result": {"diagnostics": "[diagnostic]?", "items": "[candidate]?", "hover": "hover?", "locations": "[location]?", "edits": "[text_edit]?", "tokens": "[token]?"},
+    "metrics": {"script_up_em": "number", "script_down_em": "number", "slot_scale_permille": "{{int}}"},
+    "error": {"verb": "string", "message": "string", "detail": "string?"},
+    "limits": {"message_bytes": "int", "reply_bytes": "int", "projection_nodes": "int"}
+  },
+  "verbs": {
+    "hello": {"request": {"protocol": "int"}, "reply": "capabilities"},
+    "set_source": {"request": {"source": "string"}, "reply": {"revision": "int", "source": "string"}},
+    "analyze": {"request": {"revision": "int|null", "ranges": "[range]?"}, "reply": "analysis"},
+    "edit": {"request": {"target": "range", "intent": "intent", "session": "session?"}, "reply": "edit_result"},
+    "navigate": {"request": {"target": "range", "session": "session", "op": "nav_op"}, "reply": {"cursor": "cursor", "anchor": "cursor|null", "selected_source": "string", "left": "string?"}},
+    "command": {"request": {"target": "range", "draft": "draft", "op": "string"}, "reply": {"candidates": "[candidate]", "message": "string"}},
+    "visible": {"request": {"revision": "int", "ranges": "[range]", "retry": "[string]?"}, "reply": {"accepted": "bool", "revision": "int"}},
+    "export": {"request": {"kind": "string", "overlays": "{string}?"}, "reply": "export_result"},
+    "lsp": {"request": {"method": "string", "revision": "int", "position": "int?", "query": "string?"}, "reply": "lsp_result"},
+    "packages": {"request": {"action": "string", "query": "string?", "spec": "string?"}, "reply": {"items": "[package]?", "installed": "string?"}}
+  },
+  "events": {
+    "render": {"revision": "int", "images": "{image}", "glyphs": "{string}", "placements": "{placement}", "failed": "{string}", "batch_error": "string?", "dropped": "[string]?"},
+    "diagnostics": {"revision": "int", "diagnostics": "[diagnostic]"}
+  },
+  "enums": {
+    "edit.document_ops": ["replace_source", "insert_source"],
+    "edit.formula_ops": ["insert_text", "backspace", "delete", "paste", "insert_command", "insert_symbol", "grow_grid", "shrink_grid", "edit_raw", "set_display", "select_all"],
+    "edit.axes": ["row", "column"],
+    "nav.kinds": ["move", "set_cursor", "home", "end", "cell_start", "cell_end", "entry", "cell_index", "select_all"],
+    "nav.directions": ["left", "right", "up", "down"],
+    "export.kinds": ["pdf", "svg"],
+    "lsp.methods": ["diagnostics", "completion", "hover", "definition", "formatting", "semanticTokens"],
+    "packages.actions": ["local", "search", "install"]
+  },
+  "fixtures": {
+    "step": {"step": "int（文件内从 1 连续递增）", "note": "string?", "send": "request?", "expect": "reply?（对上一次 send 的回复，子集匹配）", "paths": "{any}?（对上一次回复的深路径断言）", "recv": "event?", "expect_drop": "bool?"},
+    "match": "对象递归子集；数组长度必须相等，元素逐个递归；值 \"?\" 表示「存在即可，不看值」",
+    "paths": "键是相对回复对象的点路径（数组用 [i]），值是期望值（同样的子集规则）；校验器先按 schema 解析该路径的类型，路径不存在即失败",
+    "refs": "请求里的字符串若以 $ 开头，表示引用上一次回复里的路径（例如 $result.changed[0].range）。回放器按实际回复解析；校验器只检查路径在 schema 里存在",
+    "expect_drop": "这一步收到的事件应被前端丢弃；校验器要求它的 revision 严格小于当前 revision",
+    "id_coverage": "事件 images / glyphs / placements 的每一个键，都必须在同一文件更早的步骤里作为字面值出现过"
+  },
+  "forbidden": {
+    "verbs": ["activate_formula", "deactivate_formula", "state", "geometry", "preview_result", "preview_results", "lsp_completions", "set_definitions", "set_display", "clear", "import"],
+    "routes": ["/api/render", "/api/attachments", "/api/glyphs", "/api/status"],
+    "fields": ["pending", "stops", "_raw_key", "raw_key", "_context", "glyph_pending", "render_request", "reparsed_range", "active_range", "macros", "formula_definitions"],
+    "why": "这些名字属于旧协议（会话动作、前端自算的缓存键、几何回传）。出现即说明旧接线漏进了新协议；fixture 由 tools/check_protocol.py 检查。"
+  }
+}

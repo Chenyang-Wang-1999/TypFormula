@@ -1,5 +1,4 @@
 use ecow::eco_format;
-use typst_library::World;
 use typst_library::diag::{At, SourceResult};
 use typst_library::foundations::{Content, NativeElement, Symbol, SymbolElem, Value};
 use typst_library::math::{
@@ -180,24 +179,6 @@ trait ExprExt {
 
 impl ExprExt for ast::Expr<'_> {
     fn eval_display(&self, vm: &mut Vm) -> SourceResult<Content> {
-        let content = self.eval(vm)?.display().spanned(self.span());
-        if !vm.world().editor_math_origin(self.span()) {
-            return Ok(content);
-        }
-        // TypFormula source provenance: zero-size existing math tags, not a
-        // box (which would change atom classes, spacing, or stretch behaviour).
-        // These markers are not queryable and never become visible SVG nodes.
-        use typst_library::introspection::{Location, MetadataElem, Tag, TagElem, TagFlags};
-        let key = typst_utils::hash128(&("typformula-origin-v1", self.span()));
-        let location = Location::new(key);
-        let mut marker = MetadataElem::new(Value::Str("typformula-origin-v1".into()))
-            .pack().spanned(self.span());
-        marker.set_location(location);
-        let flags = TagFlags { introspectable: false, tagged: false };
-        Ok(Content::sequence([
-            TagElem::packed(Tag::Start(marker, flags)),
-            content,
-            TagElem::packed(Tag::End(location, key, flags)),
-        ]))
+        Ok(self.eval(vm)?.display().spanned(self.span()))
     }
 }

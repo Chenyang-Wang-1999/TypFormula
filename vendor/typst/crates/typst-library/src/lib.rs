@@ -95,10 +95,6 @@ pub trait World: Send + Sync {
     /// If this function returns `None`, Typst's `datetime` function will
     /// return an error.
     fn today(&self, offset: Option<Duration>) -> Option<Datetime>;
-
-    /// Opt-in editor provenance. Default worlds retain normal compilation.
-    /// Tracked per span, so enabling a target participates in cache validation.
-    fn editor_math_origin(&self, _span: typst_syntax::Span) -> bool { false }
 }
 
 macro_rules! world_impl {
@@ -130,10 +126,6 @@ macro_rules! world_impl {
 
             fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
                 self.deref().today(offset)
-            }
-
-            fn editor_math_origin(&self, span: typst_syntax::Span) -> bool {
-                self.deref().editor_math_origin(span)
             }
         }
     };

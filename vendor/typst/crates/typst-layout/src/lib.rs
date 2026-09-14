@@ -22,6 +22,3 @@ pub use self::flow::{layout_fragment, layout_frame};
 pub use self::introspect::PagedIntrospector;
 pub use self::pages::{layout_document, layout_document_for_bundle};
 pub use self::rules::register;
-
-// TypFormula editor bridge
-

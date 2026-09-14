@@ -59,6 +59,10 @@ typformula/
 │   ├── symbols.json            40 项符号名 → 显示字形
 │   ├── desktop-settings.json   桌面端默认设置（字号、字体、缩放）
 │   └── README.md               字符显示映射的语义
+├── protocol/                   前后端接口的可执行定义（第 3 步的产物，**尚未实现**）
+│   ├── spec.md                 规则 R1–R8、十个动词、事件、能力表来源、fixture 格式与约定
+│   ├── schema.json             机器可读：类型、动词、事件、枚举、fixture 约定、禁用名字
+│   └── fixtures/               合成数据：8 段对话 51 步（握手、加载、正文编辑、公式编辑、导航、命令草稿、取图事件、失败）
 ├── tests/                      host 与内核的集成测试（`cargo test`）
 │   ├── round_trip.rs           每个可存进树的原子都必须往返（回写是唯一没有安全网的义务）
 │   ├── stored_kinds.rs         真正会被存进树的 `Kind` 恰好是哪 12 个
@@ -75,12 +79,13 @@ typformula/
 │   ├── desktop.rs              `--desktop-core` 协议
 │   ├── services.rs             服务路由；含对着真 Tinymist 钉住实时预览返回形状的用例
 │   └── workspace.rs            路径解析
-├── tools/                      用真实 release 二进制取证据的脚本
+├── tools/                      用真实 release 二进制取证据的脚本；`check_protocol.py` 例外（纯协议自检，不需要构建）
 │   ├── build_release.py        Windows 便携版构建、PyInstaller 打包、自检、ZIP/SHA256
 │   ├── release_entry.py        打包入口（正常启动或 --self-test）
 │   ├── requirements-release.txt  独立打包环境依赖
 │   ├── test_release.py         打包路径与输入校验测试
 │   ├── kind_inventory.py       线上实测：每个 Kind 的 view JSON + 排布名双向对照（不一致则退出码 1）
+│   ├── check_protocol.py       协议自检：schema 自洽 + fixture 合法 + 能力表覆盖 + 旧协议名字没漏进来
 │   └── engine_boxes.py         用真实适配器量公式盒子的宽高与基线
 ├── docs/
 │   ├── architecture.md         分层、名字处理、两棵树、Kind/View 的判据（先读这篇）
@@ -120,6 +125,7 @@ typformula/
 - 矩阵逐行补空块至矩形，补出的格子参与显示、导航和回写；Multiline 对齐行仍保留各行列数。正在编辑的空上下标显示 `empty-cell` 和光标，未使用的另一侧显示为 `absent`。
 - 宏定义块的草稿只在 Enter 确认后写回源码并触发更新。正文与源码栏的 LSP 功能在 `language.py` / `window.py` 中接线。
 - 编辑与编译请求走私有 JSON 管道；可选实时预览由 Tinymist 提供本地 HTTP/WebSocket 服务，前端用 QtWebEngine 显示。`/api/*` 是管道路由名，不是 host 的 HTTP 服务。
+- **接口重构在设计阶段**：`protocol/`（`spec.md` + `schema.json` + `fixtures/`）是*目标*协议与合成数据，`tools/check_protocol.py` 只自检它，**没有任何实现**；当前实现仍是本文上面描述的那一套。职责划分与迁移顺序见 `TODO/重构前后端职责划分.typ`。
 
 ### 常用命令
 
@@ -129,4 +135,5 @@ cargo build --offline --locked --release --bin typformula --target-dir target/se
 cargo test --offline --locked --release --manifest-path native-adapter/Cargo.toml --target-dir target/adapter
 $env:QT_QPA_PLATFORM='offscreen'; python -m unittest desktop.test_desktop
 python tools/kind_inventory.py                                   # 前后端排布名双向对照
+python tools/check_protocol.py                                   # 目标协议与 fixture 自检（不需要后端）
 ```
