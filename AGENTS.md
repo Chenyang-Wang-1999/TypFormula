@@ -13,7 +13,7 @@ typformula/
 │   ├── document.rs             文档所有权：源码是唯一权威 + 一个活动公式会话；`document::annotate` 给每个 Raw 算源码区间（`Locator`）
 │   ├── desktop.rs              `--desktop-core` 的协议：`analyze`/`analyze_formula`/`scan`（含 `style_expressions`），一行一个 JSON 动作
 │   ├── rpc.rs                  `--stdio` 的协议：`dispatch` 把请求路由到 services/lsp/packages/preview
-│   ├── services.rs             Tinymist 会话（语言方法**与实时预览**共用）、公式/附件/字形适配器子进程、整页预览与 PDF；`ask_adapter` 是三条适配器请求的公共入口
+│   ├── services.rs             Tinymist 会话（语言方法**与实时预览**共用）、取图/整页/PDF 的 `render_adapter` 与附件/字形共用的 `math_adapter` 两个常驻适配器子进程；`ask_adapter` 是附件与字形两条请求的公共入口，取图自己拿 `render_adapter`
 │   ├── packages.rs             @preview 包索引检索、下载、解压到 Typst 缓存
 │   └── workspace.rs            工作区内路径解析（拒绝越界）
 ├── crates/core/                编辑内核（crate `typformula-core`）：typst-syntax、serde/serde_json、unicode-segmentation
@@ -30,7 +30,7 @@ typformula/
 │                               注册期存下的模板也是显示树（`ViewTemplate`，洞与边是它的**变体**）
 ├── desktop/                    Qt 前端（PyQt5，源码运行或 PyInstaller 便携版）
 │   ├── __main__.py             入口：注册随附字体、装异常钩子、开窗口
-│   ├── window.py               主窗口：源码/编辑区投影、公式会话驱动、Raw 取图调度、源码栏、大纲、预览、菜单
+│   ├── window.py               主窗口：完整源码与撤销/重做栈（文档权威）、源码/编辑区投影、公式会话驱动、Raw 取图调度、源码栏、大纲、预览、菜单
 │   ├── editor.py               编辑区控件：自定义公式对象、投影与光标映射、行号、语法高亮
 │   ├── definitions.py          文档内紧凑宏定义块：高亮源码、方向键进入、Enter 提交、Esc 取消
 │   ├── language.py             正文与源码栏的 Tinymist 悬停、符号说明、定义跳转
