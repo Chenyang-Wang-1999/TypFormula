@@ -2480,6 +2480,22 @@ Editor 现在在 clear/insertText/setCharFormat 等 Qt 文档操作前，发布�
 
 验证：`cargo test --offline --locked` 18 个测试目标全过（`source_modes` 17→18）；桌面离屏 **143/143**（140 + 新增 3 条：宏框边缘方向键离开并保留文本且多行仍可内部移动、失焦点击离开并保留编辑、文字框方向键回到上一级而公式不退出）。`python tools/kind_inventory.py` 退出码 0（23 个线名双向对齐）。改了内核，故按 AGENTS.md 重建了 `target/server/release/typformula.exe`；`native-adapter/` 未改动，未重跑那套。
 
+### 2026-09-15：模板把正文交给 `context` 时，limits 的判定退到顶层并说出来
+
+用户报告：编辑器打开 `brute-force-SGBZ-amoeba/application/benchmark-2D-Hatano-Nelson.typ` 时，`$ lim_(x) $` 的下标落在右下角而不是正下方，问为什么。
+
+**一、先排除两个看起来像的答案。** 用 release 后端 + release 适配器直连（`--desktop-core` 取分析、`--stdio` 发 `/api/attachments`）：那行公式（当时在 880..891）的 `display=True`、视图节点的 `attachment="lim_(x)"` 都对，只有放置查询回 `{"error":"适配请求缺少公式"}`。逐项只换上下文：裸 `$ lim_(x) $`、`#import` zhaji + 公式、`#show: doc => box(doc)` 都答 `limits`；换成 `#show: doc => context { doc }`、`#let note(body) = context { body }` 或 zhaji 的 `#show: note.with(...)`，立刻回到"适配请求缺少公式"。所以既不是行内/行间判错，也不是前端缺 limits 规则。
+
+**二、根因是 `context` 的求值时机。** zhaji 的 `note` 在默认 `mode: "lesson"` 下返回的不是正文，而是 `context { if __is_book.get() { body } else { …set document/set page…; body } }`（lib.typ 末段）。Typst 里 `context` 在求值期只产生一个 `ContextElem`，内部只有闭包，正文要到 realization 才被调用（`vendor/typst/crates/typst-library/src/foundations/context.rs:63-82` 的 `CONTEXT_RULE`）；而适配器选目标公式靠 `collect_equations()` 沿**已求值** content 的 `fields()` 走，`ContextElem` 的字段是个 `Func`，于是带标签的公式根本不在树里（`native-adapter/src/main.rs` 的 `collect_equations` 与 `target.ok_or(...)`）。
+
+**三、前端把"没有答案"画成了"引擎答了 scripts"。** 请求失败时 `window.py` 的 `attached` 写 `placements[key] = {}` 且**不上报、不重试**（字形路径同位置会 `report`），而 `mathview.py` 对空 placement 的分支与真正答 `scripts` 完全一样——于是下标落在右下角，界面上没有任何可读的原因。页面投影与编辑框共用这份缓存，两处都错；Tinymist 预览和片段取图走整篇编译，所以预览里是对的，这正对应用户看到的现象。影响面是所有"把正文交给 `context`"的模板，不只是 `lim`。
+
+**四、改动。** 适配器把 `resolve` 拆成策略 + `answer`：只有"定位不到带标签的公式"（`MISSING_FORMULA`）且带 context 的放置请求才退到顶层，用**裸表达式**按原显示模式重问一次，答案仍由引擎给出，只是不再带文档作用域，因此回包里带 `fallback` 让前端说明；只有文档定义的名字（`#let my = math.op("my", limits: true)`）在顶层解析不了，此时两个失败一起报出。前端新增 `Window.report_placement`，`fallback` 与真正的请求失败都说到底部状态栏。曾想过"先带精简后的前缀重问一次"，实测无用：前缀若能求值就不算隐藏（`my_1` + `#let my = …` 答 `limits`），前缀若真是隐藏者，重问得到 `unclosed delimiter`，或再次缺公式。
+
+**五、牙齿。** 把兜底条件改成恒假：适配器用例报 `called Result::unwrap() on an Err value: "适配请求缺少公式"`，桌面用例报 `AssertionError: None != 'limits'`（placement 为空）。只把 `fallback` 标记去掉、兜底留着：桌面用例报 `AssertionError: '按引擎默认规则' not found in ''`，说明状态栏那条断言也不是摆设。
+
+**六、验证。** 适配器 **25/25**（新增 1 条：`context` 隐藏公式时按顶层回答并带标记、显示模式仍决定答案、只有文档定义的名字仍失败）；桌面离屏 **144/144**（新增 1 条：`#show: doc => context { doc }` 下 `lim` 得 `limits`、状态栏说明原因、正下方比右侧窄）。真实文件实测：当前文档的 7 个附件全部拿到答案，`sum_(i , j)` 行间 `limits`，行内 `c_(i , j)`、`J_(x 1)` 等 `scripts`，行间 `J_(alpha 1)` 仍是 `scripts`——三条都对，且都带 `fallback`。改的是适配器与前端，故按 AGENTS.md 重建了 `target/adapter/release/typformula-layout.exe`；内核与 host 未改动。环境上又一次确认前一节记的那件事：sandbox 为 `workspace-write` 时桌面套件在 `setUp` 就红（Qt 命名管道被拒），判据仍是**未经改动的既有用例以同样方式失败**，换到非受限模式后全绿。
+
 
 
 

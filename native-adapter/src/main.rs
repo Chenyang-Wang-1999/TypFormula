@@ -174,10 +174,49 @@ fn collect_glyphs(item: &MathItem, out: &mut String) -> Result<(), String> {
     }
 }
 
+/// The one failure the fallback covers: the document was evaluated and produced content, but
+/// the equation the caller labeled is not in it.
+///
+/// A template that returns `context { ... }` defers its body to realization -- `zhaji`'s `note`
+/// does exactly that in its default lesson mode -- so a walk over evaluated content cannot see
+/// the equation at all, and the caller would otherwise draw its scripts beside the base.
+const MISSING_FORMULA: &str = "适配请求缺少公式";
+/// What an answer says when it came from that fallback and not from the document's own scope.
+///
+/// It travels with the value because the frontend has to say it: a placement the document could
+/// have overridden (`#set math.limits`) must not be presented as the document's own answer.
+const FALLBACK: &str = "公式位于模板的 context 块内，取不到文档上下文";
+/// Answer one attachment or glyph request, out of the top level when the document hides the
+/// equation from the content walk.
+///
+/// The placement is still the engine's answer -- the bare expression, in the display mode that
+/// was asked for -- and it says it is a fallback, because the document's own scope was not part
+/// of the question. Keeping the reduced prefix instead was measured and does not help: a prefix
+/// that can still evaluate the formula is a prefix that does not hide it, and the hiding ones
+/// come back as `unclosed delimiter` or miss the equation all over again.
+fn resolve(req: &Request, world: &mut FormulaWorld) -> Result<Value, String> {
+    let error = match answer(req, world) {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    // Only a missing equation is retried, and only for a placement: a document diagnostic or a
+    // branch that is not a single script is a real answer about the expression, a second opinion
+    // would hide it, and a glyph answer is about the spelling rather than about the document.
+    if error != MISSING_FORMULA || req.context.is_none() || req.glyphs { return Err(error); }
+    let bare = Request { path: req.path.clone(), expression: req.expression.clone(), definitions: String::new(), display: req.display, glyphs: false, context: None };
+    match answer(&bare, world) {
+        Ok(mut value) => {
+            if let Value::Object(fields) = &mut value { fields.insert("fallback".into(), json!(FALLBACK)); }
+            Ok(value)
+        }
+        // A name only the document defined (`#let my = math.op(...)`) fails here too.
+        Err(bare) => Err(format!("{error}；退到顶层重问仍失败：{bare}")),
+    }
+}
 /// Answer one attachment or glyph request. Takes the world it runs in, so a server can
 /// keep one: the request's own document replaces the world's source, and the fonts, the
 /// library and the memoization behind them are built once instead of per request.
-fn resolve(req: &Request, world: &mut FormulaWorld) -> Result<Value, String> {
+fn answer(req: &Request, world: &mut FormulaWorld) -> Result<Value, String> {
     let space = if req.display { " " } else { "" };
     let mut label="typformula-attachment-target".to_string();
     let document=if let Some(context)=&req.context {
@@ -207,8 +246,8 @@ fn resolve(req: &Request, world: &mut FormulaWorld) -> Result<Value, String> {
     let target = if req.context.is_some() {
         nodes.iter().position(|node| node.to_packed::<EquationElem>().is_some_and(|equation| equation.label().is_some_and(|l|l.resolve().as_str()==label)))
     } else { nodes.iter().rposition(|node| node.is::<EquationElem>()) };
-    let target = target.ok_or("适配请求缺少公式")?;
-    let equation = nodes[target].to_packed::<EquationElem>().ok_or("适配请求缺少公式")?;
+    let target = target.ok_or(MISSING_FORMULA)?;
+    let equation = nodes[target].to_packed::<EquationElem>().ok_or(MISSING_FORMULA)?;
     let styles = styles_at(&nodes, &parents, target, styles, &arenas);
     let introspector = EmptyIntrospector;
     let mut engine = Engine { world: world_ref.track(), library: &world.library, introspector: Protected::new(introspector.track()), traced: traced.track(), sink: sink.track_mut(), route: Route::default() };
@@ -308,6 +347,33 @@ mod tests {
             assert_eq!(result["lower"], "limits", "{name}");
             assert_eq!(result["upper"], Value::Null, "{name}");
         }
+    }
+    /// A template that returns `context { ... }` defers its body to realization, so the equation
+    /// is not in the evaluated content this walk reads -- measured on `zhaji`'s `note`, whose
+    /// default lesson mode is exactly that. The answer is still the engine's, to a question the
+    /// top level can answer: the bare expression, in the mode that was asked for, marked as a
+    /// fallback because a `#set math.limits` written in the document is no longer part of it.
+    #[test]
+    fn a_formula_hidden_by_a_context_block_is_answered_from_the_top_level_and_marked() {
+        let formula = "$ lim_(x) $";
+        let ask = |display| {
+            let source = format!("#show: doc => context {{ doc }}\n\n{formula}\n");
+            let start = source.find(formula).unwrap();
+            let context = AttachmentContext { source: source.clone(), start, end: start + formula.len() };
+            resolve(&Request { path: "main.typ".into(), expression: "lim_(x)".into(), definitions: "#show: doc => context { doc }".into(), display, glyphs: false, context: Some(context) }, &mut math_world()).unwrap()
+        };
+        let centered = ask(true);
+        assert_eq!(centered["lower"], "limits");
+        assert_eq!(centered["fallback"], FALLBACK);
+        assert_eq!(ask(false)["lower"], "scripts", "the mode the caller asked for still decides");
+        // A name only the document defined is still a failure: the fallback answers the engine's
+        // question, it does not invent a placement for something the top level cannot resolve.
+        let source = "#let my = math.op(\"my\", limits: true)\n#let wrap(body) = context { body }\n#show: wrap\n\n$ my_1 $\n";
+        let text = "$ my_1 $";
+        let start = source.find(text).unwrap();
+        let context = AttachmentContext { source: source.into(), start, end: start + text.len() };
+        let error = resolve(&Request { path: "main.typ".into(), expression: "my_1".into(), definitions: String::new(), display: true, glyphs: false, context: Some(context) }, &mut math_world()).unwrap_err();
+        assert!(error.starts_with(MISSING_FORMULA), "{error}");
     }
     #[test]
     fn attachments_keep_enclosing_scope_and_select_the_requested_equation() {

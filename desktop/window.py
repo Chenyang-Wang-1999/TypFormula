@@ -684,11 +684,26 @@ class Window(QMainWindow):
                 def attached(value,error,key=key):
                     if revision!=self.revision:return
                     self.typesetter.placements[key]=value if not error else {}
+                    self.report_placement(value,error)
                     self.typesetter.touch()
                     self.repaint_formulas()
                 context={'source':self.source,'start':formula['start'],'end':formula['end']}
                 self.services.request("/api/attachments",{"path":body["path"],"expression":expression,"definitions":definitions,"display":display,'context':context},attached,key="attachment:"+str(key))
         self.semantic_highlight()
+
+    def report_placement(self,value,error):
+        """Say it when a placement is not the document's own answer.
+
+        A request that fails leaves `placements[key]` empty, and an empty placement is drawn
+        exactly like the engine answering `scripts` -- so a formula whose limits the engine
+        knows the document wants used to sit at the right, with nothing to read. The adapter
+        answers out of the top level when the content walk cannot reach the equation (a
+        template that returns `context { ... }` defers its body to realization) and marks that
+        answer, so both cases are said here instead of being drawn silently. One key is asked
+        once per placement cache, so this does not repeat on every repaint.
+        """
+        if error:self.report("取上下限位置失败："+str(error))
+        elif isinstance(value,dict) and value.get("fallback"):self.report("上下限位置按引擎默认规则判定："+str(value["fallback"]))
 
     @staticmethod
     def view_nodes(view):

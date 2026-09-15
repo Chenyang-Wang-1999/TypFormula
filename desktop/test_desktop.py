@@ -140,6 +140,28 @@ class NativeTest(unittest.TestCase):
             values=[n for n in window.view_nodes(window.math_state['view']) if n['kind']=='macro' and n['text'] in ('rme','rmi')]
             self.assertEqual(len(values),1)
 
+    def test_a_template_that_defers_its_body_to_context_still_places_limits(self):
+        # `context { ... }` is realized after evaluation, so the content walk the placement
+        # query runs cannot see the equation -- the answer used to be "适配请求缺少公式" and the
+        # editor drew the script beside the base instead. It comes from the adapter's top-level
+        # fallback now, and the window says so rather than drawing it silently.
+        window=self.window
+        self.load('#show: doc => context { doc }\n\n$ lim_(x) $\n')
+        formula=window.analysis['formulas'][-1]
+        window.activate(formula['start']);window.background()
+        key=(window.formula_context(formula),'lim_(x)',True)
+        loop=QEventLoop();timer=QTimer()
+        timer.timeout.connect(lambda:loop.quit() if key in window.typesetter.placements else None)
+        deadline=QTimer();deadline.setSingleShot(True);deadline.timeout.connect(loop.quit)
+        timer.start(10);deadline.start(15000);loop.exec_();timer.stop();deadline.stop()
+        self.assertEqual(window.typesetter.placements.get(key,{}).get('lower'),'limits')
+        node=next(n for n in window.view_nodes(window.math_state['view']) if n.get('attachment')=='lim_(x)')
+        self.assertEqual(node['_placement']['lower'],'limits')
+        self.assertIn('按引擎默认规则',window.statusBar().currentMessage())
+        centered=window.typesetter.layout(node)
+        side=window.typesetter.layout(dict(node,_placement={}))
+        self.assertLess(centered.width,side.width,'下限排在正下方时比排在右侧窄')
+
     def test_multiline_sum_uses_engine_limits_in_scoped_document(self):
         window=self.window
         source='#[\n#let mathbf(x) = $bold(upright(#x))$\n#let rme = $upright(e)$\n#let rmi = $upright(i)$\n\n$ H_("int") = & g sum_(j) sigma_(x) (a rme^(i) + a^(dagger)) '+chr(92)+'\n= & x $\n]'

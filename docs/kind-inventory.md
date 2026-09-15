@@ -99,7 +99,7 @@ style 使用 `/api/glyphs`，definitions 固定为空；一次请求带上文档
 | line | Line：base、position | 位置按命令配置 above 决定 |
 | macro / 模板 / 草稿 | 无 | 编辑器专有，不对应独立引擎 item |
 
-附件服务只为公式顶层及 Multiline 对齐单元格顶层获取 limits/scripts 判定，分式、脚标内部等更深层尚未覆盖。请求携带完整公式上下文，适配器在保留封闭作用域的内存源码中求值；前端仍自行计算侧挂移位与盒子布局，并非直接复制引擎的全部坐标。
+附件服务只为公式顶层及 Multiline 对齐单元格顶层获取 limits/scripts 判定，分式、脚标内部等更深层尚未覆盖。请求携带完整公式上下文，适配器在保留封闭作用域的内存源码中求值；前端仍自行计算侧挂移位与盒子布局，并非直接复制引擎的全部坐标。模板把正文交给 `context` 时求值内容里看不到公式，这时退到顶层按裸表达式判定并在回包里带 `fallback`，前端在状态栏说明它不再带文档作用域。
 
 MathProperties 中的 cramped、lspace/rspace、spaced、ignorant 等尚未完整传给前端；class 是内核声明，只有按类跳词使用，不在 View 中。Shape 对账的 UNMODELLED 当前为 Group、Primes、SkewedFraction。
 
